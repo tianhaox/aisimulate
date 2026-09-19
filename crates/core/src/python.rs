@@ -3,6 +3,8 @@
 
 //! JSON-only PyO3 boundary for one materialized AISimulate replay execution.
 
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -14,7 +16,8 @@ use crate::replay::{
     POWER_DATA_COVERAGE_THRESHOLD, ReplayArtifactKvEventVisibility, ReplayArtifacts,
     ReplayEngineConfig, ReplayEngineFactory, ReplayOperationPowerDiagnostics,
     ReplayPhasePowerDiagnostics, ReplayPowerDiagnostics, ReplayRoleConfig, ReplayRuntimeInput,
-    ReplaySpec, ReplayTopology, Replayer, TracePowerStats,
+    ReplaySpec, ReplayTelemetryObserver, ReplayTelemetrySnapshot, ReplayTopology, Replayer,
+    TracePowerStats,
     loadgen::{
         ArrivalSpec, DelaySpec, DynamoRequestTrace, LengthSpec, SyntheticTraceSpec, Trace,
         WekaImportOptions, WekaNestedTimestampBasis, WekaResolvedTimestampBasis, WorkloadDriver,
@@ -255,12 +258,180 @@ impl AicTimingConfig {
 
 type PhaseEvidenceKey = (u32, u32, u32, u32, bool);
 
+// Byte accounting includes owned strings/vectors; allocator and hash table overhead
+// are additional. The 1 KiB minimum also bounds the resident entry count.
+#[derive(Clone)]
+struct PhaseCacheWeighter {
+    bounded: bool,
+}
+impl quick_cache::Weighter<PhaseEvidenceKey, TimingPhaseEvidence> for PhaseCacheWeighter {
+    fn weight(&self, _: &PhaseEvidenceKey, value: &TimingPhaseEvidence) -> u64 {
+        if !self.bounded {
+            return 1;
+        }
+        let source_bytes = |source: &TimingEvidenceSource| match source {
+            TimingEvidenceSource::Other(s) => s.capacity(),
+            _ => 0,
+        };
+        let bytes = std::mem::size_of::<PhaseEvidenceKey>()
+            + std::mem::size_of::<TimingPhaseEvidence>()
+            + value.operations.capacity() * std::mem::size_of::<TimingOperationEvidence>()
+            + value.source.as_ref().map(&source_bytes).unwrap_or(0)
+            + value
+                .operations
+                .iter()
+                .map(|op| op.name.capacity() + source_bytes(&op.source))
+                .sum::<usize>();
+        bytes.max(1024) as u64
+    }
+}
+type PhaseCache =
+    quick_cache::sync::Cache<PhaseEvidenceKey, TimingPhaseEvidence, PhaseCacheWeighter>;
+fn phase_cache(bounded: bool) -> PhaseCache {
+    use quick_cache::{DefaultHashBuilder, OptionsBuilder, sync::DefaultLifecycle};
+    let mut builder = OptionsBuilder::new();
+    let options = if bounded {
+        builder
+            .estimated_items_capacity(16384)
+            .weight_capacity(16 * 1024 * 1024)
+            .shards(1)
+            .hot_allocation(0.5)
+    } else {
+        builder.estimated_items_capacity(128).weight_capacity(128)
+    }
+    .build()
+    .expect("fixed timing cache options are valid");
+    PhaseCache::with_options(
+        options,
+        PhaseCacheWeighter { bounded },
+        DefaultHashBuilder::default(),
+        DefaultLifecycle::default(),
+    )
+}
+
+// Opt-in diagnostics only: never change prediction keys, values or cache policy.
+#[derive(Default, Clone, serde::Serialize)]
+struct CacheQueryCounters {
+    calls: u64,
+    hits: u64,
+    misses: u64,
+    first_misses: u64,
+    repeat_misses: u64,
+    hit_ns: u64,
+    miss_ns: u64,
+}
+
+struct TimingCacheProfile {
+    path: PathBuf,
+    instance: u64,
+    started: std::time::Instant,
+    phases: [CacheQueryCounters; 2],
+    by_batch: std::collections::BTreeMap<(bool, u32), CacheQueryCounters>,
+    seen_misses: std::collections::HashSet<PhaseEvidenceKey>,
+    evidence_ns: [u64; 2],
+    calls: u64,
+    bounded: bool,
+    cache_entries: usize,
+    cache_weight: u64,
+}
+
+impl TimingCacheProfile {
+    fn new(path: PathBuf, bounded: bool) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self {
+            path,
+            instance: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            started: std::time::Instant::now(),
+            phases: Default::default(),
+            by_batch: Default::default(),
+            seen_misses: Default::default(),
+            evidence_ns: [0, 0],
+            calls: 0,
+            bounded,
+            cache_entries: 0,
+            cache_weight: 0,
+        }
+    }
+
+    fn record(&mut self, key: PhaseEvidenceKey, hit: bool, elapsed_ns: u64) {
+        let first = !self.bounded && !hit && self.seen_misses.insert(key);
+        let update = |c: &mut CacheQueryCounters| {
+            c.calls += 1;
+            if hit {
+                c.hits += 1;
+                c.hit_ns += elapsed_ns;
+            } else {
+                c.misses += 1;
+                c.miss_ns += elapsed_ns;
+                if self.bounded {
+                    // Do not retain an unbounded history just to profile a bounded cache.
+                } else if first {
+                    c.first_misses += 1;
+                } else {
+                    c.repeat_misses += 1;
+                }
+            }
+        };
+        update(&mut self.phases[usize::from(key.4)]);
+        update(self.by_batch.entry((key.4, key.0)).or_default());
+        self.calls += 1;
+        if self.calls.is_multiple_of(100_000) {
+            self.publish(false);
+        }
+    }
+
+    fn publish(&self, final_snapshot: bool) {
+        let batches: Vec<_> = self.by_batch.iter().map(|((prefill, batch), counts)|
+            serde_json::json!({"prefill":prefill,"batch_size":batch,"counts":counts})).collect();
+        let row = serde_json::json!({"instance":self.instance, "pid":std::process::id(),
+            "final":final_snapshot, "elapsed_seconds":self.started.elapsed().as_secs_f64(),
+            "cache_capacity":if self.bounded {16384} else {128},
+            "cache_policy":if self.bounded {"bounded16k"} else {"legacy"},
+            "unique_tracking":!self.bounded,
+            "cache_weight_budget":if self.bounded {16*1024*1024} else {128},
+            "cache_weight_unit":if self.bounded {"accounted_bytes"} else {"entries"},
+            "cache_entries":self.cache_entries,"cache_weight":self.cache_weight, "decode":self.phases[0],"prefill":self.phases[1],
+            "evidence_ns":self.evidence_ns,"by_batch":batches});
+        let result = (|| -> Result<()> {
+            let mut bytes = serde_json::to_vec(&row)?;
+            bytes.push(b'\n');
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)?;
+            file.write_all(&bytes)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            eprintln!("timing cache profiling write failed: {error}");
+        }
+    }
+}
+
+impl Drop for TimingCacheProfile {
+    fn drop(&mut self) {
+        self.publish(true);
+    }
+}
+
 struct AicTimingModel {
     engine: Py<PyAny>,
     use_fpm_decode_totals: bool,
     fpm_decode_kv_ceiling: Option<u32>,
     evidence: Mutex<TimingEvidenceSummary>,
-    phase_cache: quick_cache::sync::Cache<PhaseEvidenceKey, TimingPhaseEvidence>,
+    phase_cache: PhaseCache,
+    profile: Option<Mutex<TimingCacheProfile>>,
+}
+
+impl Drop for AicTimingModel {
+    fn drop(&mut self) {
+        if let Some(profile) = &self.profile {
+            if let Ok(mut stats) = profile.lock() {
+                stats.cache_entries = self.phase_cache.len();
+                stats.cache_weight = self.phase_cache.weight();
+            }
+        }
+    }
 }
 
 impl AicTimingModel {
@@ -326,12 +497,19 @@ impl AicTimingModel {
         .map_err(|error| {
             anyhow!("AIC timing provider could not compile the requested engine: {error}")
         })?;
+        let bounded = match std::env::var("AIS_TIMING_CACHE_PRESET").as_deref() {
+            Ok("bounded16k") => true,
+            Ok("legacy") | Err(_) => false,
+            Ok(value) => anyhow::bail!("unknown AIS_TIMING_CACHE_PRESET: {value}"),
+        };
         Ok(Self {
             engine,
             use_fpm_decode_totals,
             fpm_decode_kv_ceiling,
             evidence: Mutex::new(TimingEvidenceSummary::default()),
-            phase_cache: quick_cache::sync::Cache::new(128),
+            phase_cache: phase_cache(bounded),
+            profile: std::env::var_os("AIS_TIMING_CACHE_PROFILE")
+                .map(|path| Mutex::new(TimingCacheProfile::new(path.into(), bounded))),
         })
     }
 
@@ -348,7 +526,9 @@ impl AicTimingModel {
             return Ok(TimingPhaseEvidence::default());
         }
         let key = (batch_size, isl, osl, prefix, prefill);
+        let started = self.profile.as_ref().map(|_| std::time::Instant::now());
         if let Some(phase) = self.phase_cache.get(&key) {
+            self.record_cache_profile(key, true, started);
             return Ok(phase);
         }
         let (context, generation) = Python::with_gil(|py| {
@@ -378,10 +558,30 @@ impl AicTimingModel {
         );
         let phase = phase_evidence_from_python(entries)?;
         self.phase_cache.insert(key, phase.clone());
+        self.record_cache_profile(key, false, started);
         Ok(phase)
     }
 
+    fn record_cache_profile(
+        &self,
+        key: PhaseEvidenceKey,
+        hit: bool,
+        started: Option<std::time::Instant>,
+    ) {
+        if let (Some(profile), Some(started)) = (&self.profile, started) {
+            let elapsed = started.elapsed().as_nanos() as u64;
+            if let Ok(mut stats) = profile.lock() {
+                if (stats.calls + 1).is_multiple_of(100_000) {
+                    stats.cache_entries = self.phase_cache.len();
+                    stats.cache_weight = self.phase_cache.weight();
+                }
+                stats.record(key, hit, elapsed);
+            }
+        }
+    }
+
     fn record_evidence(&self, phase: TimingPhaseEvidence, prefill: bool) -> Result<()> {
+        let started = self.profile.as_ref().map(|_| std::time::Instant::now());
         let mut evidence = self
             .evidence
             .lock()
@@ -390,6 +590,13 @@ impl AicTimingModel {
             evidence.prefill.try_accumulate(phase)?;
         } else {
             evidence.decode.try_accumulate(phase)?;
+        }
+        drop(evidence);
+        if let (Some(profile), Some(started)) = (&self.profile, started) {
+            let elapsed = started.elapsed().as_nanos() as u64;
+            if let Ok(mut stats) = profile.lock() {
+                stats.evidence_ns[usize::from(prefill)] += elapsed;
+            }
         }
         Ok(())
     }
@@ -1009,15 +1216,77 @@ fn build_runtime_input(
     ))
 }
 
+/// Observation storage is either an in-memory report or a bounded-memory JSONL stream.
+#[derive(Default)]
+struct JsonTelemetryState {
+    samples: Vec<ReplayTelemetrySnapshot>,
+    stream: Option<BufWriter<File>>,
+    sample_count: u64,
+    completed_requests: usize,
+}
+
+struct JsonTelemetryObserver(Arc<Mutex<JsonTelemetryState>>);
+
+impl ReplayTelemetryObserver for JsonTelemetryObserver {
+    fn on_sample(&mut self, snapshot: ReplayTelemetrySnapshot) -> Result<()> {
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| anyhow!("replay telemetry collector poisoned"))?;
+        state.completed_requests += snapshot.traffic.completed_requests;
+        state.sample_count += 1;
+        let completed = state.completed_requests;
+        if let Some(stream) = state.stream.as_mut() {
+            let compact = |rows: &[crate::replay::ReplaySchedulerMetricsSnapshot]| {
+                rows.iter()
+                    .map(|r| {
+                        [
+                            r.worker_id as u64,
+                            r.dp_rank as u64,
+                            r.active_blocks,
+                            r.inactive_blocks,
+                            r.total_blocks,
+                            r.running_requests,
+                            r.waiting_requests,
+                        ]
+                    })
+                    .collect::<Vec<_>>()
+            };
+            serde_json::to_writer(
+                &mut *stream,
+                &serde_json::json!({
+                    "schema": 1, "sampled_at_ms": snapshot.sampled_at_ms,
+                    "completed_requests": completed, "kind": snapshot.kind,
+                    "decode": compact(&snapshot.decode_scheduler_metrics),
+                    "prefill": compact(&snapshot.prefill_scheduler_metrics),
+                }),
+            )?;
+            stream.write_all(b"\n")?;
+            stream.flush()?;
+        } else {
+            state.samples.push(snapshot);
+        }
+        Ok(())
+    }
+}
+
 fn run_with_input(
     spec: ReplaySpec,
     factory: ReplayEngineFactory,
     input: Option<ReplayRuntimeInput>,
     capture_artifacts: bool,
+    telemetry_interval_ms: Option<f64>,
+    telemetry_samples: Arc<Mutex<JsonTelemetryState>>,
 ) -> crate::replay::ReplayResult<(crate::replay::ReplayReport, Option<ReplayArtifacts>)> {
     let replayer = match input {
         Some(input) => Replayer::new(spec, factory)?.with_runtime_input(input),
         None => Replayer::new(spec, factory)?,
+    };
+    let replayer = if let Some(interval) = telemetry_interval_ms {
+        replayer
+            .with_telemetry_observer(interval, Box::new(JsonTelemetryObserver(telemetry_samples)))?
+    } else {
+        replayer
     };
     if capture_artifacts {
         let (report, artifacts) =
@@ -1282,11 +1551,49 @@ fn scale_power_phase(
 }
 
 fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(payload).context("invalid AISimulate execution ReplaySpec")?;
+    let telemetry_interval_ms: Option<f64> = value
+        .as_object_mut()
+        .and_then(|object| object.remove("telemetry_sample_interval_ms"))
+        .map(serde_json::from_value)
+        .transpose()
+        .context("invalid telemetry sample interval")?;
+    let telemetry_output_path: Option<String> = value
+        .as_object_mut()
+        .and_then(|object| object.remove("telemetry_output_path"))
+        .map(serde_json::from_value)
+        .transpose()
+        .context("invalid telemetry output path")?;
+    if let Some(path) = telemetry_output_path.as_ref() {
+        ensure!(
+            telemetry_interval_ms.is_some() && !path.trim().is_empty(),
+            "telemetry output path requires an interval and a nonempty path"
+        );
+    }
     let (mut spec, mut traffic) =
-        match serde_json::from_str(payload).context("invalid AISimulate execution ReplaySpec")? {
+        match serde_json::from_value(value).context("invalid AISimulate execution ReplaySpec")? {
             ExecutionPayload::Configured { spec, traffic } => (spec, Some(*traffic)),
             ExecutionPayload::Legacy(spec) => (spec, None),
         };
+    if let Some(interval) = telemetry_interval_ms {
+        ensure!(
+            interval.is_finite() && interval > 0.0,
+            "telemetry sample interval must be finite and positive"
+        );
+    }
+    let stream = telemetry_output_path
+        .as_ref()
+        .map(|path| {
+            File::create_new(path)
+                .map(BufWriter::new)
+                .with_context(|| format!("creating telemetry output {path}"))
+        })
+        .transpose()?;
+    let telemetry_samples = Arc::new(Mutex::new(JsonTelemetryState {
+        stream,
+        ..JsonTelemetryState::default()
+    }));
     let agentic_input = traffic.as_ref().and_then(|traffic| {
         traffic
             .trace_format
@@ -1364,8 +1671,15 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
                 ReplayEngineFactory::new,
                 ReplayEngineFactory::with_timing_model,
             );
-            run_with_input(spec, factory, input, capture_artifacts)
-                .map(|(report, artifacts)| (report, artifacts, resolved_basis))
+            run_with_input(
+                spec,
+                factory,
+                input,
+                capture_artifacts,
+                telemetry_interval_ms,
+                Arc::clone(&telemetry_samples),
+            )
+            .map(|(report, artifacts)| (report, artifacts, resolved_basis))
         }
         ReplayTopology::Disaggregated { .. } => {
             let mut prefill = engine_config
@@ -1433,6 +1747,8 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
                 ),
                 input,
                 capture_artifacts,
+                telemetry_interval_ms,
+                Arc::clone(&telemetry_samples),
             )
             .map(|(report, artifacts)| (report, artifacts, resolved_basis))
         }
@@ -1516,6 +1832,26 @@ fn execute_json(payload: &str, capture_artifacts: bool) -> Result<String> {
                 .context("serializing AISimulate per-request report records")?,
         );
     }
+    if let Some(interval) = telemetry_interval_ms {
+        let samples = telemetry_samples
+            .lock()
+            .map_err(|_| anyhow!("replay telemetry collector poisoned"))?;
+        let object = report_json
+            .as_object_mut()
+            .context("replay report is not an object")?;
+        object.insert(
+            "telemetry_sample_interval_ms".into(),
+            serde_json::json!(interval),
+        );
+        object.insert("telemetry".into(), serde_json::to_value(&samples.samples)?);
+        if let Some(path) = telemetry_output_path.as_ref() {
+            object.insert("telemetry_output_path".into(), serde_json::json!(path));
+            object.insert(
+                "telemetry_stream_samples".into(),
+                serde_json::json!(samples.sample_count),
+            );
+        }
+    }
     let output = if let Some(artifacts) = artifacts {
         serde_json::json!({
             "report": report_json,
@@ -1541,9 +1877,28 @@ fn run_replay_with_artifacts_json(py: Python<'_>, payload: &str) -> PyResult<Str
         .map_err(|error| PyRuntimeError::new_err(format!("{error:#}")))
 }
 
+/// Prepare/reuse a Weka graph without executing model inference.
+#[pyfunction]
+fn prepare_weka_cache_json(py: Python<'_>, path: &str) -> PyResult<String> {
+    py.allow_threads(|| -> anyhow::Result<String> {
+        let start = std::time::Instant::now();
+        let (graph, basis) = load_weka_agentic_graph_with_options(
+            std::path::Path::new(path),
+            None,
+            Default::default(),
+        )?;
+        Ok(serde_json::to_string(&serde_json::json!({
+            "identity": graph.identity(), "resolved_basis": basis.as_str(),
+            "elapsed_seconds": start.elapsed().as_secs_f64(),
+        }))?)
+    })
+    .map_err(|error| PyRuntimeError::new_err(format!("{error:#}")))
+}
+
 /// AISimulate native runtime module.
 #[pymodule]
 fn _runtime(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(prepare_weka_cache_json, module)?)?;
     module.add_function(wrap_pyfunction!(run_replay_json, module)?)?;
     module.add_function(wrap_pyfunction!(run_replay_with_artifacts_json, module)?)?;
     crate::perfmodel::register_python(module)?;
@@ -1793,7 +2148,8 @@ mod tests {
             use_fpm_decode_totals,
             fpm_decode_kv_ceiling: None,
             evidence: Mutex::new(TimingEvidenceSummary::default()),
-            phase_cache: quick_cache::sync::Cache::new(128),
+            phase_cache: phase_cache(false),
+            profile: None,
         }
     }
 

@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -79,7 +79,7 @@ impl WekaNestedTimestampBasis {
 }
 
 /// Corpus-wide timestamp interpretation selected during preflight.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WekaResolvedTimestampBasis {
     Absolute,
@@ -203,6 +203,7 @@ impl WekaImporter {
         let file_count = snapshots.len();
         let mut canonical_rows =
             tempfile::NamedTempFile::new().context("creating Weka row spool")?;
+        let mut row_writer = BufWriter::with_capacity(1024 * 1024, canonical_rows.as_file_mut());
         for snapshot in &snapshots {
             for_each_source_trace(
                 File::open(&snapshot.file).context("reopening Weka source snapshot")?,
@@ -224,10 +225,9 @@ impl WekaImporter {
                     raw_zero_outputs += lowered.raw_zero_outputs;
                     requests += lowered.rows.len();
                     for row in lowered.rows {
-                        serde_json::to_writer(canonical_rows.as_file_mut(), &row)
+                        serde_json::to_writer(&mut row_writer, &row)
                             .context("writing preflighted Weka row spool")?;
-                        canonical_rows
-                            .as_file_mut()
+                        row_writer
                             .write_all(b"\n")
                             .context("writing preflighted Weka row delimiter")?;
                     }
@@ -236,10 +236,10 @@ impl WekaImporter {
                 },
             )?;
         }
-        canonical_rows
-            .as_file_mut()
+        row_writer
             .flush()
             .context("flushing preflighted Weka row spool")?;
+        drop(row_writer);
         canonical_rows
             .as_file_mut()
             .seek(SeekFrom::Start(0))
@@ -412,6 +412,28 @@ fn load_weka_agentic_graph_with_cache_status(
         }
     }
 
+    if path.is_file() {
+        let digest = compute_corpus_digest(path)?;
+        match read_disk_graph(path, &digest, options) {
+            Ok(Some((graph, resolved))) => {
+                assert_expected_block_size(&graph, expected_block_size)?;
+                let mut memory = cache
+                    .lock()
+                    .map_err(|_| anyhow!("Weka cache lock poisoned"))?;
+                memory.path_digests.insert(path_key, digest.clone());
+                memory.graphs.insert(
+                    (digest, options.nested_timestamp_basis),
+                    CachedWekaGraph {
+                        graph: graph.clone(),
+                        resolved_timestamp_basis: resolved,
+                    },
+                );
+                return Ok((graph, resolved, true));
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "ignoring invalid Weka disk cache"),
+        }
+    }
     let importer = WekaImporter::open_with_options(path, options)?;
     let header = importer.header().clone();
     let raw_digest = importer.raw_digest.clone();
@@ -420,6 +442,11 @@ fn load_weka_agentic_graph_with_cache_status(
     let mut builder = AgenticGraphBuilder::new(header)?;
     importer.for_each_row(|row| builder.push(row))?;
     let graph = builder.finish()?;
+    if path.is_file() {
+        if let Err(error) = write_disk_graph(path, options, &importer) {
+            tracing::warn!(%error, "could not persist Weka disk cache; replay remains available");
+        }
+    }
     let mut cache = cache
         .lock()
         .map_err(|_| anyhow!("Weka graph cache lock is poisoned"))?;
@@ -432,6 +459,93 @@ fn load_weka_agentic_graph_with_cache_status(
             resolved_timestamp_basis,
         });
     Ok((graph, resolved_timestamp_basis, false))
+}
+
+// Bump whenever lowering, graph identity, or the cache representation changes.
+const DISK_CACHE_VERSION: u32 = 1;
+#[derive(Serialize, Deserialize)]
+struct DiskGraphHeader {
+    version: u32,
+    raw_digest: String,
+    requested_basis: WekaNestedTimestampBasis,
+    resolved_basis: WekaResolvedTimestampBasis,
+    header: AgenticMooncakeHeader,
+    requests: usize,
+}
+
+fn disk_cache_path(path: &Path, options: WekaImportOptions) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(
+        ".ais-graph-v{}-{}.jsonl.zst",
+        DISK_CACHE_VERSION,
+        options.nested_timestamp_basis.as_str()
+    ));
+    PathBuf::from(name)
+}
+
+fn read_disk_graph(
+    path: &Path,
+    digest: &str,
+    options: WekaImportOptions,
+) -> Result<Option<(AgenticTrace, WekaResolvedTimestampBasis)>> {
+    let cache_path = disk_cache_path(path, options);
+    if !cache_path.exists() {
+        return Ok(None);
+    }
+    let decoder = zstd::stream::read::Decoder::new(File::open(cache_path)?)?;
+    let mut reader = BufReader::with_capacity(1024 * 1024, decoder);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let header: DiskGraphHeader = serde_json::from_str(&line)?;
+    if header.version != DISK_CACHE_VERSION
+        || header.raw_digest != digest
+        || header.requested_basis != options.nested_timestamp_basis
+    {
+        return Ok(None);
+    }
+    let mut builder = AgenticGraphBuilder::new(header.header)?;
+    let mut count = 0;
+    for row in serde_json::Deserializer::from_reader(reader).into_iter::<AgenticMooncakeRow>() {
+        builder.push(row?)?;
+        count += 1;
+    }
+    if count != header.requests {
+        bail!("Weka disk cache row count mismatch");
+    }
+    Ok(Some((builder.finish()?, header.resolved_basis)))
+}
+
+fn write_disk_graph(
+    path: &Path,
+    options: WekaImportOptions,
+    importer: &WekaImporter,
+) -> Result<()> {
+    let target = disk_cache_path(path, options);
+    let mut temp = tempfile::NamedTempFile::new_in(target.parent().unwrap_or(Path::new(".")))?;
+    let writer = BufWriter::with_capacity(1024 * 1024, temp.as_file_mut());
+    let mut encoder = zstd::stream::write::Encoder::new(writer, 3)?;
+    // Repeated long prefixes often exceed the default compression window.
+    encoder.window_log(23)?;
+    encoder.include_checksum(true)?;
+    serde_json::to_writer(
+        &mut encoder,
+        &DiskGraphHeader {
+            version: DISK_CACHE_VERSION,
+            raw_digest: importer.raw_digest.clone(),
+            requested_basis: options.nested_timestamp_basis,
+            resolved_basis: importer.nested_timestamp_basis,
+            header: importer.header.clone(),
+            requests: importer.requests,
+        },
+    )?;
+    encoder.write_all(b"\n")?;
+    std::io::copy(&mut BufReader::new(importer.rows.reopen()?), &mut encoder)?;
+    let mut writer = encoder.finish()?;
+    writer.flush()?;
+    drop(writer);
+    temp.as_file().sync_all()?;
+    temp.persist(target)?;
+    Ok(())
 }
 
 fn assert_expected_block_size(
@@ -3004,6 +3118,47 @@ mod tests {
             .unwrap_or_else(|| panic!("clamped-negative: missing join edge in {rows:#?}"));
         assert_eq!(join.trigger, AgenticDependencyTrigger::Completion);
         assert_eq!(join.delay_ms, 0.0);
+    }
+
+    #[test]
+    fn disk_cache_roundtrip_rejects_stale_and_corrupt_data() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("trace.json");
+        write_trace(&path, serde_json::json!([request(0.0, 8, 1, &[1, 2])]));
+        let options = WekaImportOptions::default();
+        let importer = WekaImporter::open(&path).unwrap();
+        let mut builder = AgenticGraphBuilder::new(importer.header.clone()).unwrap();
+        importer.for_each_row(|row| builder.push(row)).unwrap();
+        let expected = builder.finish().unwrap();
+        write_disk_graph(&path, options, &importer).unwrap();
+        let disk = read_disk_graph(&path, &importer.raw_digest, options)
+            .unwrap()
+            .unwrap()
+            .0;
+        assert_eq!(expected.identity(), disk.identity());
+        assert!(
+            read_disk_graph(&path, "changed", options)
+                .unwrap()
+                .is_none()
+        );
+        let different_basis = WekaImportOptions {
+            nested_timestamp_basis: WekaNestedTimestampBasis::Absolute,
+        };
+        assert!(
+            read_disk_graph(&path, &importer.raw_digest, different_basis)
+                .unwrap()
+                .is_none()
+        );
+        std::fs::write(disk_cache_path(&path, options), b"truncated").unwrap();
+        assert!(read_disk_graph(&path, &importer.raw_digest, options).is_err());
+        // Invalid disk data must rebuild from the source, not fail the replay.
+        let rebuilt = load_weka_agentic_graph(&path, Some(4)).unwrap();
+        assert_eq!(expected.identity(), rebuilt.identity());
+        assert!(
+            read_disk_graph(&path, &importer.raw_digest, options)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

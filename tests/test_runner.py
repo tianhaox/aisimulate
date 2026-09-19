@@ -755,20 +755,20 @@ def test_runner_preserves_withheld_power_without_raw_report():
     assert report.metadata["power"]["publication_status"] == "withheld"
 
 
-def test_engine_runner_rejects_unsupported_telemetry_before_runtime_invocation():
+def test_engine_runner_rejects_stale_runtime_that_omits_requested_telemetry():
     runtime = RecordingRuntime()
     runner = EngineReplayRunnerFactory(runtime=runtime).create(worker_id=7)
 
     with pytest.raises(
         InvalidRunnerError,
-        match="JSON runtime does not yet expose replay telemetry",
+        match="Native runtime did not return telemetry",
     ):
         runner.run(
             _spec(),
             output_requirements=ReplayOutputRequirements(capture_telemetry=True),
         )
 
-    assert runtime.execution_spec_json is None
+    assert runtime.execution_spec["telemetry_sample_interval_ms"] == 1000.0
 
 
 @pytest.mark.parametrize(
@@ -1287,3 +1287,20 @@ def test_runner_rejects_overflowing_ordinary_metric():
 
     with pytest.raises(InvalidRunnerError, match="output_throughput_tok_s.*not finite"):
         _normalize_engine_replay_report({"output_throughput_tok_s": 10**400}, include_native_report=False)
+
+
+def test_runner_exports_requested_telemetry_without_explicit_raw_report():
+    class TelemetryRuntime(RecordingRuntime):
+        def run_replay_json(self, execution_spec_json):
+            report = json.loads(super().run_replay_json(execution_spec_json))
+            report["telemetry"] = [{"sampled_at_ms": 12.5}]
+            return json.dumps(report)
+
+    runtime = TelemetryRuntime()
+    report = EngineReplayRunnerFactory(runtime=runtime).create(0).run(
+        _spec(), output_requirements=ReplayOutputRequirements(
+            capture_telemetry=True, telemetry_sample_interval_ms=12.5,
+        ),
+    )
+    assert runtime.execution_spec["telemetry_sample_interval_ms"] == 12.5
+    assert report.metadata["native_report"]["telemetry"] == [{"sampled_at_ms": 12.5}]

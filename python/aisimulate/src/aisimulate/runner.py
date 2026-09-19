@@ -337,8 +337,11 @@ class EngineReplayRunner:
         output_requirements: ReplayOutputRequirements | None = None,
     ) -> ReplayReport:
         output_requirements = output_requirements or ReplayOutputRequirements()
-        if output_requirements.capture_telemetry:
-            raise InvalidRunnerError("EngineReplayRunner's JSON runtime does not yet expose replay telemetry")
+        if output_requirements.capture_telemetry and (
+            spec.backend_deployment.encoder is not None
+            or spec.backend_deployment.deployment_mode in {"afd", "afd+pd"}
+        ):
+            raise InvalidRunnerError("Replay telemetry requires a native aggregated or disaggregated engine")
         self.capabilities.require_compatible(spec)
         encoder = spec.backend_deployment.encoder
         if encoder is None and spec.workload.get("images") is not None:
@@ -407,6 +410,10 @@ class EngineReplayRunner:
             record_per_request=output_requirements.capture_per_request,
             memory_diagnostics=memory_diagnostics,
         )
+        if output_requirements.capture_telemetry:
+            execution_spec["telemetry_sample_interval_ms"] = output_requirements.telemetry_sample_interval_ms
+            if output_requirements.telemetry_output_path is not None:
+                execution_spec["telemetry_output_path"] = output_requirements.telemetry_output_path
         execution_spec_json = json.dumps(
             execution_spec,
             allow_nan=False,
@@ -421,6 +428,8 @@ class EngineReplayRunner:
             raise InvalidRunnerError("AISimulate engine replay runtime returned invalid report JSON") from exc
         if not isinstance(report, Mapping):
             raise InvalidRunnerError("AISimulate engine replay runtime report must be a JSON object")
+        if output_requirements.capture_telemetry and not isinstance(report.get("telemetry"), list):
+            raise InvalidRunnerError("Native runtime did not return telemetry; rebuild the AISimulate extension")
         resolved_basis = report.get("weka_nested_timestamp_basis")
         if isinstance(resolved_basis, str):
             logger.info(
@@ -436,6 +445,7 @@ class EngineReplayRunner:
                 output_requirements.include_raw_report
                 or output_requirements.capture_per_request
                 or output_requirements.capture_memory_diagnostics
+                or output_requirements.capture_telemetry
             ),
         )
         if encoder is not None:

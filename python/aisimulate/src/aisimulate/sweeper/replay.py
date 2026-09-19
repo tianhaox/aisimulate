@@ -149,8 +149,15 @@ class ReplayOutputRequirements:
     capture_telemetry: bool = False
     telemetry_sample_interval_ms: float = 1000.0
     capture_memory_diagnostics: bool = False
+    telemetry_output_path: str | None = None
 
     def __post_init__(self) -> None:
+        if self.telemetry_output_path is not None and (
+            not self.capture_telemetry
+            or not isinstance(self.telemetry_output_path, str)
+            or not self.telemetry_output_path.strip()
+        ):
+            raise ValueError("telemetry_output_path requires capture_telemetry and a nonempty path")
         interval = self.telemetry_sample_interval_ms
         if self.capture_telemetry and (
             isinstance(interval, bool)
