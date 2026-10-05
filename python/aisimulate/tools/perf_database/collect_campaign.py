@@ -69,7 +69,7 @@ CONTAINER_OUT = "/out"
 class Shard:
     op: str
     name: str
-    case_filter: str | None = None
+    case_filter: tuple[str, ...] = ()  # one or more substrings; collect.py --case-filter is repeatable with OR semantics
 
     @property
     def key(self) -> str:
@@ -88,7 +88,10 @@ def load_plan(path: Path) -> Plan:
     shards = []
     seen: set[str] = set()
     for raw in doc["shards"]:
-        s = Shard(op=str(raw["op"]), name=str(raw.get("name", "all")), case_filter=raw.get("case_filter") or None)
+        cf = raw.get("case_filter") or ()
+        if isinstance(cf, str):
+            cf = (cf,)
+        s = Shard(op=str(raw["op"]), name=str(raw.get("name", "all")), case_filter=tuple(str(x) for x in cf))
         if s.key in seen:
             raise ValueError(f"duplicate shard {s.key}")
         seen.add(s.key)
@@ -154,8 +157,8 @@ def collector_argv(plan: Plan, shard: Shard) -> list[str]:
         f"{CONTAINER_OUT}/.ckpt",
         "--resume",
     ]
-    if shard.case_filter:
-        argv += ["--case-filter", shard.case_filter]
+    for fragment in shard.case_filter:  # several fragments = OR (collect.py appends them)
+        argv += ["--case-filter", fragment]
     assert "--keep-csv" not in argv
     return argv
 
