@@ -169,13 +169,13 @@ def test_vllm_nvfp4_uses_modelopt_only_for_the_glm53flash_checkpoint(monkeypatch
 @pytest.mark.parametrize(
     "version,accepted",
     [
-        ("0.31.0", True),
-        ("0.30.0", True),  # the collector default lanes
-        ("0.28.0", True),
-        ("0.29.0", True),
+        ("0.31.0", True),  # gemm / moe family pins (2026-10-30)
+        ("0.30.0", False),  # 0.30.0 collectors -> git history
+        ("0.28.0", False),
+        ("0.29.0", False),
         ("0.31.1", False),
         ("0.32.0", False),
-        ("0.24.0", True),
+        ("0.24.0", False),
     ],
 )
 def test_vllm_collectors_admit_exactly_the_audited_releases(path, version, accepted):

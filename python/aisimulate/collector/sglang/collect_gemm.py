@@ -37,21 +37,10 @@ helpers, SM filters, and perf logging.
 # per layer_permissions.md); the caveat is for data consumers: fp8_block
 # gemm rows collected at 0.5.14 and at 0.5.17 are NOT cross-version
 # comparable, because they time different kernels for the identical
-# (m, n, k) inputs. 0.5.15/0.5.16 stay excluded: never verified, and
-# version_resolver's __compat__ grammar (AND-of-comparators only, no OR) has
-# no way to express a true two-point set either -- this bounded range with
-# the two untested base releases carved out via != is the closest
-# expressible approximation, NOT an exact {0.5.14, 0.5.17} gate (CORRECTED
-# 2026-08-18, code review): `_check_compat`'s `!=` only excludes the literal
-# point version, so 0.5.15.post1/0.5.15rc1/0.5.16.post2-style variants of
-# the excluded releases still satisfy this specifier (see
-# tests/unit/collector/test_version_resolver.py's TestExactVersionSet for
-# the honest, probed semantics). This is an accepted, narrow gap: the
-# framework_manifest digest-pinned gate is the true version enforcement
-# upstream and only ever supplies exactly 0.5.14 or 0.5.17 in a sanctioned
-# run, so the leak is unreachable there.
-# 0.5.21 added 2026-10-01 (H20/sm90 collector port: op_smoke + path gates in the v0.5.21 image;
-# findings hopper_sglang_collector_port_0514_to_0521_2026_10_01). Releases in between are unvalidated and excluded.
+# (m, n, k) inputs.
+# 0.5.21 since 2026-10-01 (H20/sm90 collector port: op_smoke + path gates in the v0.5.21 image;
+# findings hopper_sglang_collector_port_0514_to_0521_2026_10_01).
+# One release per file (owner policy 2026-09-20); earlier code is `git log -- <this file>` away.
 # SGLang 0.5.20 (GLM-5.3-Flash model pin; audited 2026-09-30 against tag
 # commit 94602c9c2b7c): serving changed WHICH kernels this module's raw
 # calls map to (bf16 CuTe DSL/split-K dispatch, JIT per-token fp8 quant,
@@ -61,9 +50,8 @@ helpers, SM filters, and perf logging.
 # there). That is a whole-implementation fork selected by the installed
 # version at the bottom of this module, not a per-call shim; it lives here
 # instead of a registry VersionRoute because tools/perf_database/
-# changed_ops.py fails closed on versioned registry entries. 0.5.18/0.5.19
-# are not audited and stay excluded (same != caveat as above).
-__compat__ = "sglang>=0.5.14,<=0.5.21,!=0.5.15,!=0.5.16,!=0.5.18,!=0.5.19"
+# changed_ops.py fails closed on versioned registry entries.
+__compat__ = "sglang==0.5.21"
 
 import os
 import random

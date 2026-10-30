@@ -10,11 +10,10 @@ from __future__ import annotations
 
 # 0.5.21 added 2026-10-01 (H20/sm90 collector port: op_smoke + path gates in the v0.5.21 image;
 # findings hopper_sglang_collector_port_0514_to_0521_2026_10_01).
-# The file-level range spans the audited routes; each architecture is
-# additionally gated to its own audited releases by _ARCHITECTURE_COMPAT:
-# DeepSeek-V4 on 0.5.14 and 0.5.21 (the 0.5.21 port uses the native
-# DeepseekV4Config), GLM only on 0.5.20.
-__compat__ = "sglang>=0.5.14,<=0.5.21,!=0.5.15,!=0.5.16,!=0.5.17,!=0.5.18,!=0.5.19"
+# Each architecture is additionally gated by _ARCHITECTURE_COMPAT
+# (DeepSeek-V4 on 0.5.21 via the native DeepseekV4Config).
+# One release per file (owner policy 2026-09-20); earlier code is `git log -- <this file>` away.
+__compat__ = "sglang==0.5.21"
 
 import argparse
 import copy
@@ -59,7 +58,7 @@ GLM5NEXT_ARCHITECTURE = "Glm5NextForConditionalGeneration"
 # Per-architecture audited SGLang releases; anything else raises
 # MhcRuntimeNotAuditedError (a classified failure) instead of running.
 _ARCHITECTURE_COMPAT = {
-    DSV4_ARCHITECTURE: "sglang>=0.5.14,<=0.5.21,!=0.5.15,!=0.5.16,!=0.5.17,!=0.5.18,!=0.5.19,!=0.5.20",
+    DSV4_ARCHITECTURE: "sglang==0.5.21",
     GLM5NEXT_ARCHITECTURE: "sglang==0.5.20",
 }
 

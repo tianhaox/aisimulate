@@ -49,12 +49,12 @@ def test_glm_pin_rejects_other_runtimes(backend, wrong_version, expected):
 @pytest.mark.parametrize(
     "backend,version,model_path",
     [
-        ("vllm", "0.30.0", None),
-        ("vllm", "0.30.0", "zai-org/GLM-5.2-FP8"),
-        ("vllm", "0.27.1", "Qwen/Qwen3.8-2.4T-A95B"),
+        ("vllm", "0.31.0", None),  # gemm family pin
+        ("vllm", "0.31.0", "zai-org/GLM-5.2-FP8"),
+        ("vllm", "0.31.0", "Qwen/Qwen3.8-2.4T-A95B"),  # Qwen3.8 pins folded 2026-10-30
         ("sglang", "0.5.21", None),
         ("sglang", "0.5.21", "zai-org/GLM-5.2-FP8"),
-        ("sglang", "0.5.17", "Qwen/Qwen3.8-2.4T-A95B"),
+        ("sglang", "0.5.21", "Qwen/Qwen3.8-2.4T-A95B"),
     ],
 )
 def test_other_models_keep_their_runtime(backend, version, model_path):
