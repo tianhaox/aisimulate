@@ -14,3 +14,6 @@ framework_specific_op_cases:
   sglang:
     dsv41_module:
       cases: all
+  vllm:
+    dsv41_layer_step:
+      cases: all

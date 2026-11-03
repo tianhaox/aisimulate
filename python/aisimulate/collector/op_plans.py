@@ -1745,6 +1745,57 @@ def _sglang_dsv41_rows(case: Dsv41Case, sm_version: int | None, runner: str | No
     ]
 
 
+# --- DeepSeek-V4.1 decode step through vLLM's engine: dsv41_layer_step (vLLM) --------
+
+
+class Dsv41StepCase(NamedTuple):
+    """One decode-step measurement: batch and KV length on a model of ``layers`` layers, with
+    CUDA graphs (``graph``, as serving runs) or ``eager``."""
+
+    batch_size: int
+    kv_len: int
+    layers: int
+    mode: str
+    tp_size: int
+    model_path: str
+
+    __str__ = __repr__ = _list_form
+
+
+def _dsv41_layer_step_sweep() -> dict:
+    sweep = get_base_common_case_values("dsv41_layer_step")
+    if not sweep:
+        raise ValueError("missing the dsv41_layer_step sweep (cases/base_ops/dsv41_layer_step.yaml)")
+    return sweep
+
+
+def _expand_dsv41_layer_step() -> list[Dsv41StepCase]:
+    """Every (layer count, mode) engine of each checkpoint and TP, then its (batch, KV length) points."""
+    sweep = _dsv41_layer_step_sweep()
+    return [
+        Dsv41StepCase(batch, kv_len, layers, mode, tp_size, model_path)
+        for model_path in sweep["model_paths"]
+        for tp_size in sweep["tensor_parallel_sizes"]
+        for layers in sweep["layer_counts"]
+        for mode in sweep["modes"]
+        for batch in sweep["batch_sizes"]
+        for kv_len in sweep["kv_lengths"]
+    ]
+
+
+def _vllm_dsv41_layer_step_rows(cases: list[Dsv41StepCase], sm_version: int | None) -> list[tuple[list, tuple]]:
+    """One engine per (checkpoint, TP, layer count, mode): its [batch, kv_len] points and the
+    decode steps each point times."""
+    steps = int(_dsv41_layer_step_sweep()["decode_steps"])
+    engines: dict[tuple, list[Dsv41StepCase]] = {}
+    for case in cases:
+        engines.setdefault((case.model_path, case.tp_size, case.layers, case.mode), []).append(case)
+    return [
+        ([model, tp_size, layers, mode, [[c.batch_size, c.kv_len] for c in members], steps], tuple(members))
+        for (model, tp_size, layers, mode), members in engines.items()
+    ]
+
+
 # --- mHC: mhc_module ---------------------------------------------------------------
 
 _DSV4_ARCHITECTURE = "DeepseekV4ForCausalLM"
@@ -2150,6 +2201,13 @@ OP_PLANS: dict[str, OpPlan] = {
         dtype_field="execution_profile",
         group_fields=Dsv41Case._fields,
         rows={"sglang": _sglang_dsv41_rows},
+    ),
+    "dsv41_layer_step": OpPlan(
+        Dsv41StepCase,
+        _expand_dsv41_layer_step,
+        dtype_field="mode",
+        group_fields=("model_path", "tp_size", "layers", "mode"),
+        batch_rows={"vllm": _vllm_dsv41_layer_step_rows},
     ),
     "glm5_mqa_logits_module": _glm5_sparse_plan("mqa"),
     "glm5_topk_module": _glm5_sparse_plan("topk"),

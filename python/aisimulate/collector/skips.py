@@ -63,6 +63,10 @@ SKIPS: list[dict] = [
     # DeepSeek-V4 attention runs only on FlashMLA (SM90, SM10x) and SM100+ paths;
     # on SM89 serving fails the same way.
     {"op": _DSV4_ATTENTION_OPS, "sm": [80, 86, 89]},
+    # vLLM serves DeepSeek-V4.1 attention only on FlashMLA sparse (SM90) and the SM100
+    # family's FlashMLA paths (vllm/models/deepseek_v41/nvidia/flashmla.py, sparse_mla.py
+    # @v0.33.0), so the decode-step probe cannot boot below SM90.
+    {"backend": "vllm", "op": "dsv41_layer_step", "sm": [80, 86, 89]},
     # compute_scale times FP8 quantization, which needs SM89 or newer.
     {"op": "compute_scale", "sm": [80, 86]},
     # FP8 tensor cores start at Ada (SM89).

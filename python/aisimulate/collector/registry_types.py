@@ -69,6 +69,7 @@ class PerfFile(str, Enum):
     MSA_GENERATION_MODULE = "msa_generation_module_perf.txt"
     MHC_MODULE = "mhc_module_perf.txt"
     DSV41_MODULE = "dsv41_module_perf.txt"
+    DSV41_LAYER_STEP = "dsv41_layer_step_perf.txt"
     # DeepSeek-V4 module-level data — one OpEntry per (attn_kind, mode) pair,
     # mirroring the existing aic_dev "1 OpEntry = 1 file" convention.
     DSV4_CSA_CONTEXT_MODULE = "dsv4_csa_context_module_perf.txt"

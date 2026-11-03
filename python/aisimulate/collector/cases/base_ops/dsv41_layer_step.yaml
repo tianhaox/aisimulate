@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+schema_version: 1
+op: dsv41_layer_step
+description: >-
+  Validation probe, not a table the perf model reads: one DeepSeek-V4.1 decode
+  step through vLLM's own engine (dummy weights, the first N layers), with CUDA
+  graphs as serving runs it and eager. The step-time difference between two
+  layer counts is the per-layer decode cost; graph against eager bounds the
+  launch overhead an eager component table carries.
+common_case_values:
+  dsv41_layer_step:
+    model_paths: [deepseek-ai/DeepSeek-V4.1-Flash]
+    tensor_parallel_sizes: [1]
+    # Layers 4-7 are ratio-2 KV-reuse layers with no Engram (compress_ratios,
+    # kv_source_layer_ids, engram_layer_ids of the checkpoint config).
+    layer_counts: [4, 8]
+    modes: [graph, eager]
+    batch_sizes: [1, 8, 32]
+    kv_lengths: [1024, 4096]
+    decode_steps: 32
