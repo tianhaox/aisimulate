@@ -472,9 +472,11 @@ topology_policy:
   # (flashinfer trtllm-gen refuses 64 < heads < 128; finding sm100_probe_failures_recheck_2026_10_04 (i));
   # at tp2 the per-rank head count is 48 and the serving path exists. The tp1 cell stays a
   # recorded framework gap; the representative identity for the collector comes from tp2.
-  # `sms` scopes the entry: sm90 keeps tp1 (passes there). Owner runs this on the B200 box.
+  # sm90 too: on an 80 GB H100 (sglang 0.5.23) loading the tp1 dummy OOMs in the MXFP4
+  # expert upcast (mxfp4.py process_weights_after_loading: a 19.7 GB alloc with 5 GB free);
+  # tp1 passed only on the 141 GB H200.
   - repo: moonshotai/Kimi-K3
     backend: sglang
     tp: 2
-    sms: [100]
+    sms: [90, 100]
   note: topology is ALWAYS recorded in records.runtime (tp/ep/dp/a2a) even when kernels match.
