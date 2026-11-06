@@ -209,8 +209,8 @@ def run_mamba2_context_benchmark(
     This benchmarks:
     1. causal_conv1d_fn - Conv1D for context phase
     2. mamba_chunk_scan_combined - SSM scan (the one entry point serving calls;
-       it routes to FlashInfer's SSD on SM100-family parts itself,
-       ssd_combined.py:469-497)
+       Triton SSD on every SM by default, FlashInfer's SSD only under
+       TRTLLM_USE_MAMBA_FI_SSD=1: ssd_combined.py:51-70, 469-497)
 
     Together these represent the core compute of a Mamba2 layer
     (excluding in_proj/out_proj GEMMs which use existing GEMM model).

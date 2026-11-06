@@ -72,10 +72,10 @@ import os
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+    from sglang.kernels.ops.attention.fla.kda import chunk_kda
+    from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
     )
-    from sglang.kernels.ops.attention.fla.kda import chunk_kda
     from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_fn, causal_conv1d_update
 
 import torch
@@ -157,8 +157,12 @@ def run_kda_context_benchmark(
 ):
     """
     Benchmark KDA context (prefill) kernels: the 3-way Q/K/V causal conv
-    sequence and the chunked delta-rule scan (chunk_kda), mirroring
-    kda_backend.forward_extend at the kimi-k3 branch.
+    sequence and the delta-rule scan, mirroring kda_backend.forward_extend.
+    On SM100/SM103 serving runs Kimi-K3 prefill on FlashInfer's recurrent KDA
+    (kda_backend.py:74-96 flashinfer_kda_prefill_default: lower bound set, Triton
+    linear-attention backend, default prefill graphs) except a batch whose every
+    sequence extends one token, which stays on Triton chunk_kda
+    (effective_extend_kernel :405-418); elsewhere chunk_kda.
     """
     device = torch.device(device)
     torch.cuda.set_device(device)
@@ -171,6 +175,14 @@ def run_kda_context_benchmark(
 
     conv_weight = torch.randn(conv_channels, d_conv, dtype=dtype, device=device)
     q_conv_weight, k_conv_weight, v_conv_weight = conv_weight.split([proj_size] * 3, dim=0)
+    flashinfer_prefill = None
+    if torch.cuda.get_device_capability() in ((10, 0), (10, 3)):
+        # serving's kernel object (kernels/kda_flashinfer_prefill.py:70); no Triton fallback
+        from sglang.srt.layers.attention.linear.kernels.kda_flashinfer_prefill import (
+            FlashInferKDAPrefillKernel,
+        )
+
+        flashinfer_prefill = FlashInferKDAPrefillKernel()
     successful_points = 0
     failed_points = 0
     failures: list[str] = []
@@ -185,7 +197,7 @@ def run_kda_context_benchmark(
             q = k = v = recurrent_state = seq_lens_cpu = state_indices = None
             try:
                 # Same int32 token-offset overflow class as the GDN conv kernel
-                # (causal_conv1d_triton.py:373-379). Although the conv runs per
+                # (causal_conv1d_triton.py:398-405). Although the conv runs per
                 # Q/K/V block (proj_size channels), each block is a strided view
                 # over the full 3-block mixed_qkv buffer, so the kernel's int32
                 # pointer arithmetic spans total_tokens * conv_channels elements.
@@ -202,7 +214,7 @@ def run_kda_context_benchmark(
                     raise ValueError(
                         "SGLang causal_conv1d Triton kernel int32 token-offset overflow: "
                         f"total_tokens={total_tokens} * conv_channels={conv_channels} >= 2**31 "
-                        "(causal_conv1d_triton.py:373-379; per-block views stride "
+                        "(causal_conv1d_triton.py:398-405; per-block views stride "
                         "across the whole 3-block buffer)"
                     )
                 num_warmups = 3
@@ -213,7 +225,7 @@ def run_kda_context_benchmark(
                 has_initial_state = torch.zeros(batch_size, dtype=torch.bool, device=device)
                 # KDA pool layout is [slots, K-1, dim]; serving transposes to
                 # [slots, dim, K-1] before splitting per Q/K/V block
-                # (kda_backend.py:573,599).
+                # (kda_backend.py:1021-1041,1021-1041).
                 conv_pool = torch.zeros(batch_size, d_conv - 1, conv_channels, dtype=dtype, device=device)
                 conv_states = conv_pool.transpose(-1, -2)
                 q_conv_state, k_conv_state, v_conv_state = conv_states.split([proj_size] * 3, dim=-2)
@@ -285,7 +297,25 @@ def run_kda_context_benchmark(
                 k = torch.randn(1, total_tokens, num_k_heads, head_k_dim, dtype=dtype, device=device)
                 v = torch.randn(1, total_tokens, num_v_heads, head_v_dim, dtype=dtype, device=device)
 
+                use_flashinfer = flashinfer_prefill is not None and total_tokens > batch_size
+                scan_kernel_source = "flashinfer_recurrent_kda" if use_flashinfer else "chunk_kda"
+
                 def run_kda_scan():
+                    if use_flashinfer:
+                        flashinfer_prefill.extend(
+                            q,
+                            k,
+                            v,
+                            a,
+                            beta,
+                            ssm_states=recurrent_state,
+                            cache_indices=state_indices,
+                            query_start_loc=cu_seqlens,
+                            A_log=a_log,
+                            dt_bias=dt_bias,
+                            lower_bound=KDA_LOWER_BOUND,
+                        )
+                        return
                     chunk_kda(
                         q=q,
                         k=k,
@@ -299,6 +329,9 @@ def run_kda_context_benchmark(
                         A_log=a_log,
                         dt_bias=dt_bias,
                         lower_bound=KDA_LOWER_BOUND,
+                        # serving passes the raw beta and the kernel applies the sigmoid
+                        # (kda_backend.py:1158; Kimi-K3 no longer pre-applies it)
+                        beta_is_raw=True,
                     )
 
                 with benchmark_with_power(
@@ -314,7 +347,7 @@ def run_kda_context_benchmark(
                         version=sglang_version,
                         device_name=torch.cuda.get_device_name(device),
                         op_name="kda",
-                        kernel_source="chunk_kda",
+                        kernel_source=scan_kernel_source,
                         perf_filename=perf_filename,
                         power_stats=results["power_stats"],
                     ):
@@ -620,7 +653,7 @@ def _resolve_verify_kernel(head_k_dim: int, head_v_dim: int, draft_tokens: int):
             return None
     except ModuleNotFoundError:
         return None
-    from sglang.kernels.ops.kimi_k3.kda_decode_mtp import fused_kda_decode_mtp_dspark
+    from sglang.kernels.ops.attention.kda_decode_mtp import fused_kda_decode_mtp_dspark
 
     return fused_kda_decode_mtp_dspark
 
@@ -928,7 +961,7 @@ def run_kda_verify_benchmark(
 #     ONE packed causal_conv1d_update (:729-736) and — because lower_bound is
 #     set, the packed T=1 kernel is skipped (:739-742) — the
 #     fused_sigmoid_gating_delta_rule_update(is_kda=True, lower_bound) decode
-#     (:775-788 -> kda_triton.py:125-157).
+#     (:775-788 -> kda_triton.py:129-161).
 #   - configs/glm5_next.py:264-272 + configs/mamba_utils.py:299-321  pool
 #     layouts: conv [slots, d_conv-1, 3P] (bf16), temporal [slots, H, V, K]
 #     (fp32).
@@ -954,7 +987,7 @@ GLM5_NEXT_KDA_ARCHITECTURE = "Glm5NextForConditionalGeneration"
 # replicates; any other installed release raises KdaRuntimeNotAuditedError (a
 # classified failure) instead of timing a possibly different kernel path.
 _KDA_ARCHITECTURE_COMPAT = {
-    KIMI_K3_KDA_ARCHITECTURE: "sglang==0.5.21",
+    KIMI_K3_KDA_ARCHITECTURE: "sglang==0.5.23",
     # GLM-5.3-Flash (0.5.20 only) retired its route is git history
     # (main at c540ff90a). On 0.5.21 serving fuses the unquantized
     # qkvbfg/bfg projections (strided views), so the GLM path needs a port
@@ -1166,7 +1199,7 @@ def run_glm5_next_kda_generation(
     """GLM-5.3-Flash decode: packed q|k|v causal_conv1d_update row and the
     bounded-gate fused_sigmoid_gating_delta_rule_update row
     (kda_backend.forward_decode, non-packed branch)."""
-    from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+    from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
     )
     from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update
@@ -1333,10 +1366,10 @@ def run_kda_torch(
         contextlib.redirect_stdout(_devnull_file),
         contextlib.redirect_stderr(_devnull_file),
     ):
-        from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+        from sglang.kernels.ops.attention.fla.kda import chunk_kda
+        from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
             fused_sigmoid_gating_delta_rule_update,
         )
-        from sglang.kernels.ops.attention.fla.kda import chunk_kda
         from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_fn, causal_conv1d_update
 
     sglang_version = _get_version("sglang")
