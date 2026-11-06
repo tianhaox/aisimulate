@@ -318,6 +318,17 @@ families:
               SILENTLY IGNORES unknown params.agg keys — so the expressible rescue is gpu-memory-utilization 0.6
               via extra_cli_args (A/B 2026-09-19; replaces the backend-level extra_cli_args,
               hence benchmark-mode is repeated). Real deployments of the default config hit the same OOM.'
+      moonshotai/Kimi-K3:
+        cli_extra_args:
+          vllm:
+            args:
+            - --generator-set
+            - params.agg.extra_cli_args=["--benchmark-mode","agg","--no-enable-flashinfer-autotune"]
+            fact: 'vllm 0.32.0/SM100: startup FlashInfer autotune of the dummy (empty cache, 21 token buckets,
+              kernel_warmup.py:342-380) outran the probe timeout twice (1500 s, then 3600 s, 2026-11-06).
+              Autotune picks tactics inside FlashInfer kernels (MoE, GEMM, attention); vLLM runs KDA on
+              FlashKDA / vLLM / FLA kernels, so the linear-attention gates are unaffected. A gate on a
+              FlashInfer-backed op of this checkpoint needs the autotuned run.'
       zai-org/GLM-5.3:
         dummy_overrides:
           family: glm

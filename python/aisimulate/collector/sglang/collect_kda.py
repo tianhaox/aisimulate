@@ -185,6 +185,9 @@ def run_kda_context_benchmark(
         )
 
         flashinfer_prefill = FlashInferKDAPrefillKernel()
+        # FlashInfer binds a wrapper's workspace to the stream of its first run and
+        # refuses a capture on another (kda_prefill.py _bind_workspace @flashinfer v0.7.2).
+        flashinfer_stream = torch.cuda.Stream(device)
     successful_points = 0
     failed_points = 0
     failures: list[str] = []
@@ -362,6 +365,7 @@ def run_kda_context_benchmark(
                     num_warmups=num_warmups,
                     num_runs=num_runs,
                     repeat_n=1,
+                    capture_stream=flashinfer_stream if use_flashinfer else None,
                 ) as results:
                     if not log_perf(
                         item_list=[{**common_log_data, "latency": results["latency_ms"]}],

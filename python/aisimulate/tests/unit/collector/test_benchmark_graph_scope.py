@@ -8,7 +8,7 @@ import logging
 import os
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
@@ -57,9 +57,9 @@ def trace_benchmark(
             self.resets += 1
 
     @contextmanager
-    def capture(graph):
-        events.append("capture:begin")
-        state["stream"] = "capture"
+    def capture(graph, stream=None):
+        events.append("capture:begin" if stream is None else f"capture:begin:{stream}")
+        state["stream"] = stream or "capture"
         fault("capture_begin")
         yield
         events.append("capture:end")
@@ -75,8 +75,16 @@ def trace_benchmark(
         events.append(f"stream:set:{stream}")
         state["stream"] = stream
 
+    @contextmanager
+    def use_stream(stream):
+        prior, state["stream"] = state["stream"], stream
+        try:
+            yield
+        finally:
+            state["stream"] = prior
+
     def kernel():
-        events.append("kernel")
+        events.append(f"kernel:{state['stream']}" if state["stream"] not in ("caller", "capture") else "kernel")
         fault("initial_warmup")
         if state["stream"] == "capture":
             fault("capture_body")
@@ -98,6 +106,7 @@ def trace_benchmark(
         graph=capture,
         current_stream=current_stream,
         set_stream=set_stream,
+        stream=use_stream,
         synchronize=lambda: events.append("synchronize"),
         empty_cache=lambda: events.append("empty_cache"),
         Event=Event,
@@ -120,6 +129,7 @@ def trace_benchmark(
     node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "benchmark_with_power")
     namespace = {
         "contextmanager": contextmanager,
+        "nullcontext": nullcontext,
         "get_device_module": lambda device=None: cuda,
         "logging": logging,
         "os": os,
@@ -271,3 +281,14 @@ def test_only_vllm_mla_module_binds_explicit_graph_cleanup():
     assert namespace["benchmark_with_power"](kernel_func=kernel, num_runs=30) == "native-context"
     assert calls == [{"explicit_graph_cleanup": True, "kernel_func": kernel, "num_runs": 30}]
     assert namespace["_benchmark_with_power"] is shared_benchmark
+
+
+def test_a_capture_stream_carries_the_eager_warmups_and_the_capture(monkeypatch):
+    """A kernel bound to the stream of its first launch (FlashInfer recurrent KDA) warms and is
+    captured on one stream; replays and the caller's stream stay as they were."""
+    observed = trace_benchmark(monkeypatch, capture_stream="kda")
+    assert observed["error"] is None
+    events = observed["events"]
+    assert events.count("kernel:kda") == 3  # two eager warmups + the capture body
+    assert "kernel" not in events and "capture:begin:kda" in events
+    assert observed["stream"] == "caller"
