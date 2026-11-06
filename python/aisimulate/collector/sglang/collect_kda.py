@@ -162,7 +162,9 @@ def run_kda_context_benchmark(
     (kda_backend.py:74-96 flashinfer_kda_prefill_default: lower bound set, Triton
     linear-attention backend, default prefill graphs) except a batch whose every
     sequence extends one token, which stays on Triton chunk_kda
-    (effective_extend_kernel :405-418); elsewhere chunk_kda.
+    (effective_extend_kernel :405-418); elsewhere chunk_kda. Serving captures
+    prefill in a breakable CUDA graph by default, so the FlashInfer lane times
+    the RecurrentKDAPrefillWrapper plan/run path that graph uses.
     """
     device = torch.device(device)
     torch.cuda.set_device(device)
@@ -299,23 +301,43 @@ def run_kda_context_benchmark(
 
                 use_flashinfer = flashinfer_prefill is not None and total_tokens > batch_size
                 scan_kernel_source = "flashinfer_recurrent_kda" if use_flashinfer else "chunk_kda"
+                if use_flashinfer:
+                    # Serving captures every prefill forward in a breakable CUDA graph by
+                    # default (cuda_graph_config.py:90-94 default_prefill_backend; max_bs is
+                    # the chunked-prefill budget, memory_hook.py:235-238), so the KDA scan runs
+                    # through FlashInfer's plan/run wrapper and its non-persistent schedule
+                    # (kda_prefill_graph.py:154-166 -> kda_flashinfer_prefill_graph.py:51-91),
+                    # not recurrent_kda: plan outside the capture, warm once eagerly.
+                    if flashinfer_prefill.prefill_graph_wrapper_cls is None:
+                        raise RuntimeError("FlashInfer lacks RecurrentKDAPrefillWrapper: serving breaks the graph")
+                    flashinfer_graph = flashinfer_prefill.prefill_graph_wrapper_cls(device)
+                    flashinfer_graph.plan(cu_seqlens.to(torch.int64))
 
                 def run_kda_scan():
                     if use_flashinfer:
-                        flashinfer_prefill.extend(
-                            q,
-                            k,
-                            v,
-                            a,
-                            beta,
-                            ssm_states=recurrent_state,
-                            cache_indices=state_indices,
-                            query_start_loc=cu_seqlens,
+                        flashinfer_graph.run(
+                            q=q,
+                            k=k,
+                            v=v,
+                            g=a,
+                            beta=beta,
                             A_log=a_log,
                             dt_bias=dt_bias,
+                            initial_state=recurrent_state,
+                            ssm_state_indices=state_indices,
+                            output_final_state=False,
+                            use_qk_l2norm_in_kernel=True,
+                            use_gate_in_kernel=True,
                             lower_bound=KDA_LOWER_BOUND,
+                            beta_is_logit=True,
+                            output=torch.empty_like(q),
                         )
                         return
+                    # Deviation: serving's breakable prefill graph launches these kernels over
+                    # fixed grids sized by the token bucket (kda_prefill_graph.py:118-127), whose
+                    # padded programs return at once; this times the exact grid, so it reads at
+                    # most a few launch-tail percent low on small prefills. Retire by building
+                    # KDAPrefillGraphMetadata for the case's bucket.
                     chunk_kda(
                         q=q,
                         k=k,

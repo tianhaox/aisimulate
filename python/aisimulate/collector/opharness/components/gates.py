@@ -187,14 +187,20 @@ def verdict_dir(sm: str, fw: str, version: str) -> Path:
     return probe_driver.ROOT / "results" / "pathdiff" / sm / f"{fw}-{version}"
 
 
-def _trace(results: list[Path], name: str, version: str) -> Path | None:
-    """The trace of shard ``name`` among the result dirs, from a run at ``version`` when one
-    says so (a trace from another release fails the runtime check and grades invalid)."""
-    found = [f for d in results for f in sorted(Path(d).rglob(f"{SHARD_OP}__{name}/probe_trace_case.json"))]
-    for f in found:
-        if (json.loads(f.read_text()).get("result") or {}).get("framework_version") in (version, None):
+def _trace(results: list[Path], name: str, backend: str, version: str) -> Path | None:
+    """The ``backend`` trace of shard ``name`` among the result dirs (shard names repeat across
+    backends), from a run at ``version`` when one says so (a trace from another release fails the
+    runtime check and grades invalid)."""
+    found = []
+    for d in results:
+        for f in sorted(Path(d).rglob(f"{SHARD_OP}__{name}/probe_trace_case.json")):
+            doc = json.loads(f.read_text())
+            if (doc.get("args") or {}).get("backend") == backend:
+                found.append((f, (doc.get("result") or {}).get("framework_version")))
+    for f, ran in found:
+        if ran in (version, None):
             return f
-    return found[0] if found else None
+    return found[0][0] if found else None
 
 
 def grade(
@@ -220,7 +226,7 @@ def grade(
             out.write_text(json.dumps(record, indent=1))
             verdicts[key] = "platform-floor"
             continue
-        files = [_trace(results, name, version) for name, _ in _cases(g)]
+        files = [_trace(results, name, backend, version) for name, _ in _cases(g)]
         if not all(files):
             verdicts[key] = "missing-trace"
             continue

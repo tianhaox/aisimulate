@@ -6,6 +6,7 @@ charset. A gate whose case is planned on no
 SM grades nothing (the GLM-5 DSA module capture once timed 128 heads, a cell no plan holds)."""
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -135,3 +136,18 @@ def test_a_no_serving_floor_names_an_sm_where_the_gate_exists(gates):
         if not gates._matches(g["backend"], g["op"], int(sm.removeprefix("sm")), g["select"])
     ]
     assert dead == []
+
+
+def test_a_gate_reads_only_its_own_backends_trace(gates, tmp_path):
+    """Shard names repeat across backends: grading vLLM once read a TRT-LLM trace of the same
+    shard from another result dir."""
+    name = "gdn_ctx_Qwen3.5-0.8B"
+    for backend, version in (("trtllm", "1.4.0rc2"), ("vllm", "0.31.0"), ("vllm", "0.32.0")):
+        shard = tmp_path / f"{backend}-{version}" / f"{gates.SHARD_OP}__{name}"
+        shard.mkdir(parents=True)
+        doc = {"args": {"backend": backend}, "result": {"framework_version": version}}
+        (shard / "probe_trace_case.json").write_text(json.dumps(doc))
+    dirs = sorted(tmp_path.iterdir())
+    assert gates._trace(dirs, name, "vllm", "0.32.0").parent.parent.name == "vllm-0.32.0"
+    assert gates._trace(dirs, name, "vllm", "0.33.0").parent.parent.name.startswith("vllm-")
+    assert gates._trace(dirs[:1], name, "vllm", "0.32.0") is None
