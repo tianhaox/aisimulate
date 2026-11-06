@@ -45,12 +45,11 @@ def test_every_gate_names_one_planned_case(gates, gate_id):
 
 
 def test_shard_plans_parse_as_pipeline_plans(gates, tmp_path):
-    (plan,) = gates.shard_plans("sm100", "sglang").values()
-    assert plan["backend"] == "sglang" and plan["shards"]
-    assert all(
-        s["op"] == "probe.trace_case" and s["case_filter"].startswith("backend=sglang,op=") for s in plan["shards"]
-    )
-    assert len({s["name"] for s in plan["shards"]}) == len(plan["shards"])
+    plans = gates.shard_plans("sm100", "sglang")
+    shards = [s for plan in plans.values() for s in plan["shards"]]
+    assert {plan["backend"] for plan in plans.values()} == {"sglang"} and shards
+    assert all(s["op"] == "probe.trace_case" and s["case_filter"].startswith("backend=sglang,op=") for s in shards)
+    assert len({s["name"] for s in shards}) == len(shards)
 
 
 def test_a_gate_runs_at_the_release_its_op_is_collected_with(gates):
@@ -58,11 +57,16 @@ def test_a_gate_runs_at_the_release_its_op_is_collected_with(gates):
     were traced in the default image and graded against default-release serving records. Each
     (backend, release) is its own job; an also case shares its gate's release."""
     plans = gates.shard_plans("sm90", "vllm")
-    assert set(plans) == {("vllm", "0.30.0"), ("vllm", "0.31.0")}
-    gemm = {s["name"] for s in plans[("vllm", "0.31.0")]["shards"]}
+    gemm_release = gates.op_version("vllm", "gemm")
+    assert gemm_release != gates.op_version("vllm", "dsa_context_module")  # true while the families differ
+    assert set(plans) == {("vllm", gates.gate_version(g)) for g in gates.gates_in_scope("vllm", "sm90")}
+    gemm = {s["name"] for s in plans[("vllm", gemm_release)]["shards"]}
     assert "gemm_fp8block_DeepSeek-V3.2" in gemm and "dsa_ctx_bf16_DeepSeek-V3.2" not in gemm
     for g in gates.load()["gates"]:
         assert {gates.op_version(g["backend"], op) for op in gates._ops(g)} == {gates.gate_version(g)}, g["gate"]
+    # the pipeline runs a shard plan on the default image unless told otherwise: every release
+    # a gate runs at has a pinned image to name at trigger time
+    assert all("@sha256:" in gates.release_image(b, v) for b, v in plans)
 
 
 def test_one_op_is_planned_across_the_frameworks(gates, tmp_path):

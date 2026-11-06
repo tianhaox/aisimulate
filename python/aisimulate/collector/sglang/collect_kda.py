@@ -65,7 +65,7 @@ Output:
 # is additionally gated at runtime by _KDA_ARCHITECTURE_COMPAT, raising
 # KdaRuntimeNotAuditedError otherwise.
 # One release per file; earlier code is `git log -- <this file>` away.
-__compat__ = "sglang==0.5.21"
+__compat__ = "sglang==0.5.23"
 
 import gc
 import os

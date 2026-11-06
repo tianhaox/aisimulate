@@ -57,7 +57,7 @@ Output:
 # additionally gated at runtime by _KDA_ARCHITECTURE_COMPAT, raising
 # KdaRuntimeNotAuditedError otherwise.
 # One release per file; earlier code is `git log -- <this file>` away.
-__compat__ = "vllm==0.31.0"
+__compat__ = "vllm==0.32.0"
 
 import gc
 import os

@@ -59,7 +59,7 @@ Input/output projection GEMMs remain covered by the GEMM collector.
 # 1968047). Existing framework construction/dispatch is unchanged. Invalid
 # model/quant shapes continue to raise and remain recorded failures; this is
 # API compatibility, not a claim that every Cartesian shape is supported.
-__compat__ = "vllm==0.30.0"
+__compat__ = "vllm==0.32.0"
 
 import gc
 import os
