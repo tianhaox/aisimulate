@@ -20,39 +20,49 @@ import runpy
 import sys
 from pathlib import Path
 
-# collector.helper.TRACE_TIMED_RANGE: benchmark_with_power's timed region while tracing
-# (this file runs as a script in a measurement child and imports nothing from collector)
+# collector.helper.TRACE_TIMED_RANGE / TRACE_MEASURED_RANGE: benchmark_with_power's timed region
+# and, inside it, the timed runs alone, while tracing (this file runs as a script in a
+# measurement child and imports nothing from collector)
 TIMED_RANGE = "ais::timed"
+MEASURED_RANGE = "ais::measured"
 
 
-def kernel_names(prof) -> tuple[list[str], bool]:
-    """The CUDA kernels the profiler saw, and whether they are only the timed ones.
+def kernel_names(prof) -> tuple[list[str], bool, list[str] | None]:
+    """The CUDA kernels the profiler saw, whether they are only the timed ones, and the kernels
+    of the timed runs alone (None when no timed run completed).
 
     Device events only, as the serving probes take them: a custom op that launches its kernel
     with no aten op in between (deep_gemm, the ``_C`` extensions) carries self device time on
     the CPU side, so a device-time filter returned ``vllm::fp8_gemm_nt_op`` and ``_C::rms_norm``
     as kernels. When the run timed through benchmark_with_power, only kernels starting inside
     its timed range count: the module build and the cache fill before it are not the measured
-    path. GPU-side user annotations and memcpy/memset are not kernels."""
+    path. The measured set leaves out the warmups' one-time work too (JIT, autotune inputs):
+    every kernel in it is paid on each timed call. GPU-side user annotations and memcpy/memset
+    are not kernels."""
     from torch.autograd import DeviceType
 
     events = prof.events()
-    windows = [
-        (e.time_range.start, e.time_range.end)
-        for e in events
-        if e.name == TIMED_RANGE and e.device_type == DeviceType.CPU
-    ]
+
+    def windows(name):
+        return [
+            (e.time_range.start, e.time_range.end) for e in events if e.name == name and e.device_type == DeviceType.CPU
+        ]
+
+    def inside(spans):
+        return sorted({e.name for e in kernels if any(lo <= e.time_range.start <= hi for lo, hi in spans)})
+
     kernels = [
         e
         for e in events
         if e.device_type == DeviceType.CUDA
         and not getattr(e, "is_user_annotation", False)
-        and e.name != TIMED_RANGE
+        and e.name not in (TIMED_RANGE, MEASURED_RANGE)
         and not e.name.startswith(("Memcpy", "Memset"))
     ]
-    if windows:
-        kernels = [e for e in kernels if any(lo <= e.time_range.start <= hi for lo, hi in windows)]
-    return sorted({e.name for e in kernels}), bool(windows)
+    timed, measured = windows(TIMED_RANGE), windows(MEASURED_RANGE)
+    if not timed:
+        return sorted({e.name for e in kernels}), False, None
+    return inside(timed), True, inside(measured) if measured else None
 
 
 def main() -> None:
@@ -80,7 +90,7 @@ def main() -> None:
             torch.cuda.synchronize()
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     record = {"mode": mode, "status": status, "error": None if failure is None else repr(failure)[:500]}
-    record["kernels"], record["timed"] = kernel_names(prof)
+    record["kernels"], record["timed"], record["measured"] = kernel_names(prof)
     (Path(out_dir) / f"child_{os.getpid()}.json").write_text(json.dumps(record))
     if failure is not None:
         raise failure

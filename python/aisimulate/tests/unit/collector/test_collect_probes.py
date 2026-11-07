@@ -170,6 +170,7 @@ def test_traced_child_runs_the_code_and_records_its_kernels(monkeypatch, tmp_pat
     assert done.value.code == 0 and marker.read_text() == "ok"
     (record,) = [json.loads(p.read_text()) for p in (tmp_path / "kernels").glob("child_*.json")]
     assert record["kernels"] == ["sparse_mla_kernel"] and record["timed"] is False and record["status"] == 0
+    assert record["measured"] is None
 
 
 def test_only_kernels_inside_the_timed_range_count(monkeypatch, tmp_path):
@@ -188,7 +189,31 @@ def test_only_kernels_inside_the_timed_range_count(monkeypatch, tmp_path):
     ]
     _fake_torch(monkeypatch, events)
     prof = types.SimpleNamespace(events=lambda: events)
-    assert _traced_child.kernel_names(prof) == (["fmhaSm100fKernel"], True)
+    assert _traced_child.kernel_names(prof) == (["fmhaSm100fKernel"], True, None)
+
+
+def test_the_measured_range_keeps_only_the_timed_runs(monkeypatch, tmp_path):
+    """The warmups' one-time work (an autotuner's random inputs) is timed-range work the row never
+    pays per call; the measured range inside it keeps the replayed kernels alone."""
+    from collector import helper
+    from collector.probes import _traced_child
+
+    assert helper.TRACE_MEASURED_RANGE == _traced_child.MEASURED_RANGE
+    events = [
+        _Event(helper.TRACE_TIMED_RANGE, "cpu", start=10.0, end=20.0),
+        _Event("distribution_elementwise_grid_stride_kernel", start=11.0),  # warmup: autotune inputs
+        _Event("fmhaSm100fKernel", start=12.0),
+        _Event(helper.TRACE_MEASURED_RANGE, "cpu", start=15.0, end=19.0),
+        _Event(helper.TRACE_MEASURED_RANGE, start=15.5, end=18.0, annotation=True),
+        _Event("fmhaSm100fKernel", start=16.0),
+    ]
+    _fake_torch(monkeypatch, events)
+    prof = types.SimpleNamespace(events=lambda: events)
+    assert _traced_child.kernel_names(prof) == (
+        ["distribution_elementwise_grid_stride_kernel", "fmhaSm100fKernel"],
+        True,
+        ["fmhaSm100fKernel"],
+    )
 
 
 @pytest.mark.parametrize("child_timed, expect", [(True, ["child_attn"]), (False, ["child_attn", "parent_gemm"])])
@@ -203,6 +228,7 @@ def test_trace_case_includes_the_kernels_of_measurement_children(monkeypatch, tm
         child_dir = Path(os.environ[helper.TRACE_CHILD_DIR_ENV])
         child_dir.mkdir(parents=True, exist_ok=True)
         record = {"kernels": ["child_attn"], "timed": child_timed, "status": 0}
+        record["measured"] = ["child_attn"] if child_timed else None
         (child_dir / "child_1.json").write_text(json.dumps(record))
 
     entry = types.SimpleNamespace(perf_filename="mla_perf.txt", extra_perf_filenames=(), run_kwargs=None)
@@ -212,6 +238,7 @@ def test_trace_case_includes_the_kernels_of_measurement_children(monkeypatch, tm
     monkeypatch.delenv(helper.TRACE_CHILD_DIR_ENV, raising=False)
     out = trace_case.run({"backend": "sglang", "op": "mla_context_module"}, tmp_path)
     assert out["kernels"] == expect and out["timed_only"] is child_timed and out["measurement_children"] == 1
+    assert out["measured_kernels"] == (["child_attn"] if child_timed else None)
     assert helper.TRACE_CHILD_DIR_ENV not in os.environ  # restored after the probe
 
 

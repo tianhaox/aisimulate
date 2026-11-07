@@ -66,8 +66,10 @@ pipeline (the `aisim-campaign` skill). Nothing generated is committed.
   profiler, its measurement child processes included, keeping the kernels of
   `benchmark_with_power`'s timed region). `gates.py grade --sm <sm> [--op <op>] --results
   <job result dirs>` grades each gate against the serving record of its repo, kv, prompt
-  length and release on the same SM, on the kernels of the roles and phase its op decides,
-  and writes the verdicts to `results/pathdiff/<sm>/<backend>-<version>/`. A gate exists on
+  length and release on the same SM, on the kernels of the roles and phase its op decides;
+  every other kernel of the timed runs alone (the trace's `measured_kernels`, warmups left
+  out) must be one serving launches under its role, or the gate diverges with `aux_drift`.
+  It writes the verdicts to `results/pathdiff/<sm>/<backend>-<version>/`. A gate exists on
   an SM where its case is planned; `no_serving` marks an SM where the model cannot be
   served, which gets a `platform-floor` verdict.
 - **SM.** A campaign's SM is its system's (`src/aisimulate_core/systems/<system>.yaml`);

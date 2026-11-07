@@ -16,9 +16,11 @@ decides per SM (a pinned dispatch, a KV pool) is what a collection would run. Th
 once through the backend registry's run function under ``torch.profiler``, binding what
 collect.py binds, with its perf files in a discarded scratch directory. The result lists
 the CUDA kernels the row times (``timed_only``: inside benchmark_with_power; otherwise the
-whole run): the collector side of an opharness path gate. A collector that times its
-points in a child process (``helper.trace_child_argv``) runs that child under the profiler
-too, and its kernels are included (``measurement_children`` counts them).
+whole run) and ``measured_kernels``, those of the timed runs alone (None when the row did
+not time through benchmark_with_power): the collector side of an opharness path gate. A
+collector that times its points in a child process (``helper.trace_child_argv``) runs that
+child under the profiler too, and its kernels are included (``measurement_children`` counts
+them).
 """
 
 from __future__ import annotations
@@ -170,7 +172,7 @@ def run(args: dict[str, str], out_dir: Path) -> dict:
                 error = f"{type(exc).__name__}: {exc}"[:500]
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
-        own, own_timed = kernel_names(prof)
+        own, own_timed, own_measured = kernel_names(prof)
         child_records = [json.loads(f.read_text()) for f in sorted(children.glob("child_*.json"))]
     finally:
         for name, value in saved.items():
@@ -181,9 +183,15 @@ def run(args: dict[str, str], out_dir: Path) -> dict:
         shutil.rmtree(scratch, ignore_errors=True)
     # a process that timed through benchmark_with_power gave its timed kernels; when any did,
     # the processes that timed nothing (a parent that only spawned the measurement) are setup
-    traced = [(own, own_timed), *((r["kernels"], r.get("timed", False)) for r in child_records)]
-    timed = any(t for _, t in traced)
-    kernels = sorted(set().union(*(set(k) for k, t in traced if t or not timed)))
+    traced = [
+        (own, own_timed, own_measured),
+        *((r["kernels"], r.get("timed", False), r.get("measured")) for r in child_records),
+    ]
+    timed = any(t for _, t, _ in traced)
+    kernels = sorted(set().union(*(set(k) for k, t, _ in traced if t or not timed)))
+    # the timed runs alone, only when every process that timed completed its runs
+    runs = [m for _, t, m in traced if t]
+    measured = sorted(set().union(*map(set, runs))) if timed and None not in runs else None
     return {
         "backend": backend,
         "framework_version": version,
@@ -194,6 +202,7 @@ def run(args: dict[str, str], out_dir: Path) -> dict:
         "row": str(row),
         "kernels": kernels,
         "timed_only": timed,
+        "measured_kernels": measured,
         "measurement_children": len(child_records),
         "error": error,
         "failed": error is not None or not kernels,

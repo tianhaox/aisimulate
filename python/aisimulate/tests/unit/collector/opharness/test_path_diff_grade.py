@@ -1,9 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """path_diff.grade — the verdict rule as a pure function, graded on the gate's
-TARGET ROLES (review 2026-09-25 P1): auxiliary kernel overlap never carries a
-verdict, a role the collector ran must exist on the serving side, kernel drift
-inside a role stays red, and serving evidence is selected by PHASE.
+TARGET ROLES (review 2026-09-25 P1): auxiliary kernel overlap never proves a
+gate, a role the collector ran must exist on the serving side, kernel drift
+inside a role stays red, serving evidence is selected by PHASE, and auxiliary
+work in the timed runs that serving never does fails the gate (2026-11-08).
 """
 
 import importlib.util
@@ -42,6 +43,11 @@ _LABELS = {
     "vllm::scaled_fp8_quant_kernel": ("vllm_kernel", "quant"),
     "per_token_group_quant_8bit_kernel": ("sgl_kernel", "quant"),
     "reshape_and_cache_kernel_flash": ("framework_native", "kvcache"),
+    "deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl": ("deepgemm", "gemm"),
+    "deep_gemm::pack_fp32_into_ue8m0": ("deepgemm", "quant"),
+    "triton_per_fused__to_copy_abs_ceil_clamp_div_exp2_log2_max_view_0": ("framework_native", "activation"),
+    "triton_": ("infra", "infra"),
+    "vllm::per_token_group_quant_8bit_packed_kernel": ("vllm_kernel", "quant"),
 }
 
 
@@ -49,8 +55,9 @@ def role_of(k):
     return _LABELS.get(k)
 
 
-def grade(col, srv, roles, cap_error=None):
-    return path_diff.grade(sorted(col), set(srv), roles, cap_error, role_of)
+def grade(col, srv, roles, cap_error=None, measured=None, srv_every=None):
+    every = None if srv_every is None else set(srv_every)
+    return path_diff.grade(sorted(col), set(srv), roles, cap_error, role_of, measured, every)
 
 
 def test_subset_semantics_collector_one_op_serving_whole_model():
@@ -118,7 +125,7 @@ def test_gemm_tile_differences_outside_the_target_role_never_count():
         ("attention",),
     )
     assert g["verdict"] == "aligned"
-    assert g["aux_collector_only_roles"] == []  # gemm exists on both sides, just other tiles
+    assert g["aux_drift"] is None  # no timed-run kernels recorded: auxiliary work unchecked
 
 
 def test_unscoped_gate_grades_every_non_glue_role_the_collector_ran():
@@ -200,3 +207,46 @@ def test_a_capture_with_kernels_the_vocabulary_cannot_name_never_passes():
     # a drift stays a drift: the unlabeled kernels are listed beside it
     g = grade(["kernel_unified_attention", "blackwell_gdn_cubin"], ["flash::FlashAttnFwdSm90"], ("attention",))
     assert g["verdict"] == "diverged" and g["unlabeled_kernels"] == ["blackwell_gdn_cubin"]
+
+
+# ----------------------------------------------------------- auxiliary work
+
+
+_B200_GEMM = "deep_gemm::sm100_fp8_fp4_gemm_1d1d_impl"
+_INDUCTOR_QUANT = "triton_per_fused__to_copy_abs_ceil_clamp_div_exp2_log2_max_view_0"
+_SCALE_PACK = "deep_gemm::pack_fp32_into_ue8m0"
+_SERVING_QUANT = "vllm::per_token_group_quant_8bit_packed_kernel"
+
+
+def test_auxiliary_work_serving_never_does_fails_the_gate():
+    # vLLM B200 fp8_block, 2026-11-07: the timed runs carried an inductor activation quant and a
+    # DeepGEMM scale pack; serving runs one CUDA quant. The gemm matched, so the old rule passed it.
+    col = [_INDUCTOR_QUANT, _SCALE_PACK, _B200_GEMM]
+    srv = [_B200_GEMM, _SERVING_QUANT, "triton_"]  # "triton_" is a substring, but of another role
+    assert grade(col, srv, ("gemm",))["verdict"] == "aligned"  # nothing measured: unchecked
+    g = grade(col, srv, ("gemm",), measured=col)
+    assert g["verdict"] == "diverged"
+    assert g["aux_drift"] == {"activation": [_INDUCTOR_QUANT], "quant": [_SCALE_PACK]}
+    assert g["kernel_drift"] is None and g["missing_roles"] == []  # the gemm itself is aligned
+
+
+def test_auxiliary_kernels_serving_runs_keep_the_gate_aligned():
+    col = [_SERVING_QUANT, _B200_GEMM]
+    g = grade(col, [_B200_GEMM, _SERVING_QUANT], ("gemm",), measured=col)
+    assert g["verdict"] == "aligned" and g["aux_drift"] == {}
+
+
+def test_an_auxiliary_kernel_may_come_from_any_serving_phase():
+    # the gate's phase scopes its own op's kernels; a quant serving runs only in decode is still
+    # work serving does
+    col = ["flash::FlashAttnFwdSm90", "vllm::scaled_fp8_quant_kernel"]
+    srv_prefill = ["flash::FlashAttnFwdSm90"]
+    g = grade(col, srv_prefill, ("attention",), measured=col, srv_every=[*srv_prefill, "vllm::scaled_fp8_quant_kernel"])
+    assert g["verdict"] == "aligned" and g["aux_drift"] == {}
+
+
+def test_only_the_timed_runs_are_checked_for_auxiliary_work():
+    # an autotuner's warmup work sits in the timed range, not in the runs the row averages
+    col = [_INDUCTOR_QUANT, _B200_GEMM]
+    g = grade(col, [_B200_GEMM], ("gemm",), measured=[_B200_GEMM])
+    assert g["verdict"] == "aligned" and g["aux_drift"] == {}
