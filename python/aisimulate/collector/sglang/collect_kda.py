@@ -13,7 +13,8 @@ kda_backend.py @ kimi-k3 branch).
 Context (prefill/extend) phase (kda_backend.forward_extend):
     - causal_conv1d_fn x3: separate Q, K, V causal convolutions
       (kernel_source "causal_conv1d_fn_qkv3": one row = the 3-call sequence)
-    - chunk_kda: chunked delta-rule scan with raw per-K gates
+    - chunk_kda: the delta-rule scan with raw per-K gates (FlashInfer's recurrent
+      KDA on SM100/SM103 for multi-token prefills, see run_kda_context_benchmark)
 
 Generation (decode) phase (kda_backend.forward_decode):
     - causal_conv1d_update: packed single-step conv over 3P channels
@@ -165,6 +166,10 @@ def run_kda_context_benchmark(
     (effective_extend_kernel :405-418); elsewhere chunk_kda. Serving captures
     prefill in a breakable CUDA graph by default, so the FlashInfer lane times
     the RecurrentKDAPrefillWrapper plan/run path that graph uses.
+
+    Deviation: every scan row is labeled "chunk_kda" whichever kernel serving
+    picked, so the SDK reads one curve per backend (sdk/models/kimi_k3.py); the
+    chunk_kda row of collector/kernel_source_backends.yaml names both kernels.
     """
     device = torch.device(device)
     torch.cuda.set_device(device)
@@ -303,7 +308,6 @@ def run_kda_context_benchmark(
                 v = torch.randn(1, total_tokens, num_v_heads, head_v_dim, dtype=dtype, device=device)
 
                 use_flashinfer = flashinfer_prefill is not None and total_tokens > batch_size
-                scan_kernel_source = "flashinfer_recurrent_kda" if use_flashinfer else "chunk_kda"
                 if use_flashinfer:
                     # Serving captures every prefill forward in a breakable CUDA graph by
                     # default (cuda_graph_config.py:90-94 default_prefill_backend; max_bs is
@@ -373,7 +377,7 @@ def run_kda_context_benchmark(
                         version=sglang_version,
                         device_name=torch.cuda.get_device_name(device),
                         op_name="kda",
-                        kernel_source=scan_kernel_source,
+                        kernel_source="chunk_kda",
                         perf_filename=perf_filename,
                         power_stats=results["power_stats"],
                     ):
