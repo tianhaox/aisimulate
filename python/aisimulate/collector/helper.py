@@ -1017,25 +1017,57 @@ def _flashinfer_autotune_api():
     return autotune, AutoTuner
 
 
+def flashinfer_tuning_bucket(num_tokens: int, max_tuned_tokens: int | None = None) -> int | None:
+    """The token count serving's FlashInfer warm-up tuned the tactic it runs at ``num_tokens`` for.
+
+    FlashInfer's MoE and FP4 GEMM ops map a runtime token count up to the next bucket of
+    its hybrid list at lookup (``map_to_hybrid_bucket_uncapped``, flashinfer 0.7.0.post1
+    fused_moe/utils.py:276-291, the ``map_to_tuning_buckets`` of mm_fp4,
+    gemm/gemm_base.py:7887-7915). The MoE ops clamp that bucket to their
+    tune_max_num_tokens (fused_moe/shared/tuning.py:304-308, core.py:938-946), which
+    this function does not model: it matches them only for counts up to that clamp.
+    Serving warm-up profiles the hybrid list up to
+    ``max_tuned_tokens`` (``get_hybrid_num_tokens_buckets``, fused_moe/utils.py:195-242,
+    which appends that maximum; both functions are unchanged at 0.7.2, which SGLang
+    0.5.23 pins). Returns ``None`` when ``num_tokens`` maps past the
+    profiled list: serving has no tuned entry there and runs the op's fallback tactic.
+    ``max_tuned_tokens=None`` means serving profiles every count the caller times.
+    Callers pass the result to :func:`flashinfer_autotuned` and time ``num_tokens``.
+    """
+    from flashinfer.fused_moe.utils import get_hybrid_num_tokens_buckets, map_to_hybrid_bucket_uncapped
+
+    bucket = map_to_hybrid_bucket_uncapped(int(num_tokens))
+    if max_tuned_tokens is None or bucket in get_hybrid_num_tokens_buckets(int(max_tuned_tokens)):
+        return bucket
+    return None
+
+
 @contextmanager
 def flashinfer_autotuned(num_tokens: int, tune_fn: Callable[[], None], *, label: str = ""):
     """Time FlashInfer-backed kernels on the tactic FlashInfer's autotuner picks, as serving does.
 
-    vLLM (``enable_flashinfer_autotune``, default on for Blackwell) and SGLang (warm-up
-    autotune, plus the extend bucket) both run FlashInfer kernels on
-    autotuned tactics. Without this context the collector times FlashInfer's *untuned*
+    vLLM (``enable_flashinfer_autotune``, on from O1, SM90 and newer) and SGLang (decode
+    warm-up autotune up to the decode CUDA-graph batch size; the extend pass is opt-in)
+    run FlashInfer kernels on autotuned tactics. Without this context the collector times FlashInfer's *untuned*
     fallback: tile = clamp(next_pow2(num_tokens * top_k / local_num_experts), 8, 128) and
     the first config of an unstable ``std::sort`` over the kernel manifest -- a value that
     moved between FlashInfer 0.6.12 and 0.6.18 and broke every SM100
     nvfp4 MoE EP sweep whose average tokens per local expert exceeded 128 (vLLM 0.30.0 /
     SGLang 0.5.21 campaign tables).
 
-    ``tune_fn()`` runs once inside ``autotune(True, tuning_buckets=(num_tokens,))`` so
-    every FlashInfer op it reaches is profiled at exactly this token count (with the
-    caller's real routing, so the EP-local expert load is what gets tuned). The ``with``
-    body then runs under ``autotune(False, ...)`` with the same bucket: lookups hit the
-    entries just profiled, nothing is profiled inside the body (CUDA-graph capture safe),
-    and an op the tuner has no entry for keeps FlashInfer's fallback exactly as before.
+    ``num_tokens`` is the bucket to profile: serving's bucket for the timed count
+    (:func:`flashinfer_tuning_bucket`), which may exceed the count ``tune_fn`` runs.
+    ``tune_fn()`` runs once inside ``autotune(True, tuning_buckets=(num_tokens,))``, so
+    every FlashInfer op it reaches is profiled at that bucket. The tuner does not profile
+    the caller's tensors: it re-creates every input with a dynamic token dimension at the
+    bucket size through the op's tensor initializers and reuses only the static ones
+    (flashinfer 0.7.0.post1 autotuner/autotuner.py:3339-3359). Routing logits are
+    therefore synthetic; only the TRT-LLM-gen MoE ops given precomputed top-k ids tile the
+    caller's ids (fused_moe/backends/trtllm/sm100_runner.py:173-191). The ``with`` body
+    then runs under ``autotune(False, ...)`` with the same single bucket, which every
+    token count maps to: lookups hit the entries just profiled, nothing is profiled inside
+    the body (CUDA-graph capture safe), and an op the tuner has no entry for keeps
+    FlashInfer's fallback exactly as before.
 
     The tuning pass runs under :func:`flashinfer_autotune_budget` (default 1 warm-up, 3
     timed launches, 1 ms delay per tactic instead of FlashInfer's 3 / 10 / 5 ms; see

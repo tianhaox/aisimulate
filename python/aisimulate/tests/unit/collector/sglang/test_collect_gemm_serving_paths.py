@@ -13,6 +13,8 @@ raises ``NameError``.
 
 import ast
 import contextlib
+import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -493,7 +495,14 @@ def _run_gemm_namespace(events: list, logged: list, **overrides):
     return namespace
 
 
-def _nvfp4_overrides(events: list, *, autotune_enabled=True):
+def _fake_tuning_bucket(m, max_tuned_tokens=None):
+    """helper.flashinfer_tuning_bucket for the token counts these tests use: FlashInfer's
+    hybrid ceil (48 -> 64, 600 -> 768), None past the tuned list."""
+    bucket = {1: 1, 48: 64, 64: 64, 600: 768}[m]
+    return bucket if max_tuned_tokens is None or bucket <= max_tuned_tokens else None
+
+
+def _nvfp4_overrides(events: list, *, autotune_enabled=True, decode_max_tokens=512):
     v2 = {"active": False}
 
     @contextlib.contextmanager
@@ -535,6 +544,8 @@ def _nvfp4_overrides(events: list, *, autotune_enabled=True):
         "flashinfer_mm_fp4": flashinfer_mm_fp4,
         "flashinfer_autotune_v2": flashinfer_autotune_v2,
         "flashinfer_autotuned": flashinfer_autotuned,
+        "flashinfer_tuning_bucket": _fake_tuning_bucket,
+        "_decode_autotune_max_tokens": lambda: decode_max_tokens,
         "get_fp4_gemm_runner_backend": lambda: runner,
     }
 
@@ -548,7 +559,7 @@ def test_nvfp4_is_timed_on_the_tactic_tuned_inside_serving_autotune_scope():
     assert events[0] == "serving_config"
     assert events[1] == ("autotuned", 64, "gemm nvfp4 n=256 k=512")
     # The tuning pass runs mm_fp4 inside autotune_v2(mode="tune", persistent_cache=False),
-    # as SGLang's warm-up does, at exactly this token count.
+    # as SGLang's warm-up does, at the bucket mm_fp4 maps this token count to (64 is one).
     assert events[2] == ("autotune_v2", {"mode": "tune", "persistent_cache": False, "tuning_buckets": (64,)})
     assert ("mm_fp4", "cute-dsl", True) in events[3 : events.index("benchmark")]
     # The timed calls run after the tuning pass, outside the v2 context.
@@ -557,6 +568,53 @@ def test_nvfp4_is_timed_on_the_tactic_tuned_inside_serving_autotune_scope():
     )
     (row,) = logged
     assert row["kernel_source"] == "sglang_flashinfer_cutedsl_nvfp4"
+
+
+def test_nvfp4_tunes_at_the_bucket_serving_maps_m_to():
+    events, logged = [], []
+    namespace = _run_gemm_namespace(events, logged, **_nvfp4_overrides(events))
+
+    namespace["run_gemm"]("nvfp4", 48, 256, 512, perf_filename="gemm_perf.txt")
+
+    # mm_fp4 maps m=48 up to the 64 bucket; the warm-up profiled 64, so 48 runs 64's tactic.
+    assert events[1] == ("autotuned", 64, "gemm nvfp4 n=256 k=512")
+    assert events[2] == ("autotune_v2", {"mode": "tune", "persistent_cache": False, "tuning_buckets": (64,)})
+    assert logged[0]["item_list"][0]["m"] == 48
+
+
+def test_nvfp4_above_the_decode_warmup_runs_untuned_like_serving():
+    events, logged = [], []
+    namespace = _run_gemm_namespace(events, logged, **_nvfp4_overrides(events, decode_max_tokens=512))
+
+    namespace["run_gemm"]("nvfp4", 600, 256, 512, perf_filename="gemm_perf.txt")
+
+    # 600 maps to the 768 bucket, past the decode warm-up's 512: no tuned entry in serving.
+    assert not any(isinstance(event, tuple) and event[0] in ("autotuned", "autotune_v2") for event in events)
+    assert ("mm_fp4", "cute-dsl", False) in events
+    assert logged[0]["kernel_source"] == "sglang_flashinfer_cutedsl_nvfp4"
+
+
+@pytest.mark.parametrize(
+    ("gpu_mem_mib", "expected"),
+    [
+        (None, 160),
+        (16 * 1024, 8),
+        (32 * 1024, 48),
+        (48 * 1024, 32),
+        (80 * 1024, 256),
+        (97_887, 256),  # RTX PRO 6000 Blackwell, tp_size 1
+        (183_359, 512),  # B200
+        (288 * 1024, 512),  # B300
+    ],
+)
+def test_decode_autotune_ceiling_follows_sglang_memory_defaults(monkeypatch, gpu_mem_mib, expected):
+    namespace = _run_gemm_namespace([], [])
+    common = types.ModuleType("sglang.srt.utils.common")
+    common.get_device_memory_capacity = lambda: gpu_mem_mib
+    for name in ("sglang", "sglang.srt", "sglang.srt.utils"):
+        monkeypatch.setitem(sys.modules, name, sys.modules.get(name) or types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "sglang.srt.utils.common", common)
+    assert namespace["_decode_autotune_max_tokens"]() == expected
 
 
 def test_nvfp4_kda_path_is_labelled_kda():

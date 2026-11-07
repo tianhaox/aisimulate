@@ -69,7 +69,13 @@ from types import SimpleNamespace
 
 import torch
 import vllm.envs as envs
-from collector.helper import benchmark_with_power, flashinfer_autotuned, get_sm_version, log_perf
+from collector.helper import (
+    benchmark_with_power,
+    flashinfer_autotuned,
+    flashinfer_tuning_bucket,
+    get_sm_version,
+    log_perf,
+)
 from collector.op_plans import plan_cases
 from collector.vllm.utils import setup_distributed, with_exit_stack
 from vllm._custom_ops import scaled_fp4_quant as _scaled_fp4_quant
@@ -82,7 +88,9 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
     CompressedTensorsConfig as _CompressedTensorsConfig,
 )
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import per_block_cast_to_fp8
+from vllm.utils.flashinfer import has_flashinfer
 from vllm.version import __version__ as vllm_version
 
 FP8_BLOCK_SHAPE = (128, 128)
@@ -305,13 +313,28 @@ def run_gemm(exit_stack, gemm_type, m, n, k, *, perf_filename, device="cuda:0"):
     # every FlashInfer op on SM90 and newer (warmup/kernel_warmup.py:261-268;
     # enable_flashinfer_autotune is on from O1, config/vllm.py:286-328) and skips
     # fp4_gemm only when the SM100/SM103 cute-dsl NVFP4 kernel is selected, whose
-    # fallback is already the heuristic (:295-311). The SM120 FlashInfer CUTLASS
-    # NVFP4 rows are therefore tuned. Kernels the FlashInfer tuner does not own
-    # (F.linear, vLLM CUTLASS, DeepGEMM, Marlin) are unaffected.
-    if kernel_source == "FlashInferCuteDslNvFp4LinearKernel":
+    # fallback is already the heuristic (:295-311). The only tuner-owned op these
+    # rows reach is that fp4_gemm under the SM120 FlashInferCutlassNvFp4LinearKernel
+    # (nvfp4/flashinfer.py:185-260 -> flashinfer mm_fp4, backend "cutlass" with the
+    # 128x4 scale layout, utils/flashinfer.py:1079-1115); the SM90 FlashInfer
+    # block-FP8 swap-AB GEMM runs a fixed heuristic (flashinfer 0.7.0.post1
+    # gemm/gemm_base.py:10005-10219), and F.linear, vLLM CUTLASS, DeepGEMM and
+    # Marlin are not FlashInfer's. Warmup profiles the hybrid token buckets up to
+    # max_num_batched_tokens (kernel_warmup.py:334-374) and mm_fp4 maps a runtime
+    # m up to the next bucket (gemm_base.py:7887-7915), so tune at that bucket
+    # and time m on its tactic. Serving never runs a single linear above
+    # max_num_batched_tokens, so every m of the grid has a tuned bucket.
+    tune_m = None
+    if (
+        kernel_source != "FlashInferCuteDslNvFp4LinearKernel"
+        and has_flashinfer()
+        and current_platform.has_device_capability(90)
+    ):
+        tune_m = flashinfer_tuning_bucket(m)
+    if tune_m is None:
         autotuned = contextlib.nullcontext()
     else:
-        autotuned = flashinfer_autotuned(m, kernel_func, label=kernel_source)
+        autotuned = flashinfer_autotuned(tune_m, kernel_func, label=kernel_source)
 
     with (
         autotuned,

@@ -63,7 +63,13 @@ try:
 except ImportError:
     HAS_FLASHINFER_FP4 = False
 
-from collector.helper import benchmark_with_power, flashinfer_autotuned, get_sm_version, log_perf
+from collector.helper import (
+    benchmark_with_power,
+    flashinfer_autotuned,
+    flashinfer_tuning_bucket,
+    get_sm_version,
+    log_perf,
+)
 from sglang.kernels.fused_op import (
     clear_fused_op_trace,
     disable_fused_op_trace,
@@ -127,6 +133,37 @@ def _ensure_serving_gemm_config() -> None:
     initialize_fp4_gemm_config()
     unquant.initialize_bf16_gemm_config()
     _SERVING_GEMM_CONFIG_READY = True
+
+
+def _decode_autotune_max_tokens() -> int:
+    """The largest token count SGLang's default warm-up tunes FlashInfer ops at.
+
+    Warm-up runs one decode-shaped dummy forward at the decode CUDA-graph max
+    batch size under autotune (base_runner.py:279-285,
+    decode_cuda_graph_runner.py:704-716, flashinfer_autotune.py:354-362); the
+    extend-shaped pass at the prefill token ceiling is opt-in
+    (SGLANG_FLASHINFER_AUTOTUNE_EXTEND, srt/environ.py:1282;
+    flashinfer_autotune.py:412-443). FlashInfer profiles mm_fp4 at the hybrid
+    buckets up to that dummy's m (flashinfer 0.7.2 autotuner/autotuner.py:
+    3282-3285, gemm/gemm_base.py:9073-9101). The default batch size follows GPU memory
+    (srt/arg_groups/memory_hook.py:89-180, MiB from
+    srt/utils/common.py:990-1017) for the tp_size 1 of the ServerArgs
+    _ensure_serving_gemm_config publishes.
+    """
+    from sglang.srt.utils.common import get_device_memory_capacity
+
+    gpu_mem = get_device_memory_capacity()
+    if gpu_mem is None:
+        return 160
+    if gpu_mem < 20 * 1024:
+        return 8
+    if gpu_mem < 35 * 1024:
+        return 48
+    if gpu_mem < 60 * 1024:
+        return 32
+    if gpu_mem < 160 * 1024:
+        return 256
+    return 512
 
 
 def cdiv(a: int, b: int) -> int:
@@ -466,12 +503,21 @@ def run_gemm(gemm_type, batch_size, N, K, *, perf_filename, device="cuda:0"):  #
             # (flashinfer_autotune.py:354-362), where FlashInfer's default tactic
             # races the candidates; the tuning pass here enters the same v2
             # context. mm_fp4 is the only tuner-owned op in gemm_op: fp4_quantize
-            # and the KDA kernel run unchanged.
-            def tune_fn():
-                with flashinfer_autotune_v2(mode="tune", persistent_cache=False, tuning_buckets=(M,)):
-                    kernel_func()
+            # and the KDA kernel run unchanged. The warm-up dummy covers the
+            # hybrid buckets up to the decode batch size
+            # (_decode_autotune_max_tokens), and mm_fp4 maps a runtime M up to
+            # the next bucket (flashinfer 0.7.2 gemm/gemm_base.py:9073-9101,
+            # fused_moe/utils.py:309-324), so M is timed on that
+            # bucket's tactic. Past the last tuned bucket serving has no entry
+            # and runs mm_fp4's fallback tactic, so those rows are timed untuned.
+            tune_m = flashinfer_tuning_bucket(M, _decode_autotune_max_tokens())
+            if tune_m is not None:
 
-            tune = flashinfer_autotuned(M, tune_fn, label=f"gemm nvfp4 n={N} k={K}")
+                def tune_fn():
+                    with flashinfer_autotune_v2(mode="tune", persistent_cache=False, tuning_buckets=(tune_m,)):
+                        kernel_func()
+
+                tune = flashinfer_autotuned(tune_m, tune_fn, label=f"gemm nvfp4 n={N} k={K}")
 
         # Use benchmark_with_power context manager
         nvtx_tag = f"{gemm_type}_m{M}_n{N}_k{K}"

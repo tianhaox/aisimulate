@@ -21,7 +21,12 @@ pytestmark = pytest.mark.unit
 SOURCE = Path(__file__).resolve().parents[3] / "collector" / "vllm" / "collect_gemm.py"
 
 
-def _run_timing_block(gemm_type, result, *, capture_error=None, kernel_source="test-selected-kernel"):
+def _fake_tuning_bucket(m, max_tuned_tokens=None):
+    """helper.flashinfer_tuning_bucket for the m values below: FlashInfer's hybrid ceil."""
+    return {1: 1, 48: 64, 257: 512, 4097: 8192}[m]
+
+
+def _run_timing_block(gemm_type, result, *, capture_error=None, kernel_source="test-selected-kernel", m=1, sm=120):
     tree = ast.parse(SOURCE.read_text(), filename=str(SOURCE))
     run = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_gemm")
     start = next(i for i, n in enumerate(run.body) if isinstance(n, ast.FunctionDef) and n.name == "kernel_func")
@@ -49,10 +54,13 @@ def _run_timing_block(gemm_type, result, *, capture_error=None, kernel_source="t
         "torch": SimpleNamespace(device=lambda d: d, cuda=SimpleNamespace(get_device_name=lambda d: "test GPU")),
         "benchmark_with_power": benchmark_with_power,
         "flashinfer_autotuned": flashinfer_autotuned,
+        "flashinfer_tuning_bucket": _fake_tuning_bucket,
+        "has_flashinfer": lambda: True,
+        "current_platform": SimpleNamespace(has_device_capability=lambda capability: sm >= capability),
         "log_perf": lambda **kwargs: calls["published"].append(kwargs),
         "device": "cuda:0",
         "gemm_type": gemm_type,
-        "m": 1,
+        "m": m,
         "n": 768,
         "k": 7168,
         "x": x,
@@ -144,20 +152,37 @@ def test_vllm_config_carries_the_layer_quant_config(qc):
 
 
 @pytest.mark.parametrize(
-    ("kernel_source", "tuned"),
+    ("kernel_source", "sm", "tuned"),
     [
-        ("FlashInferCutlassNvFp4LinearKernel", True),
-        ("CutlassFP8ScaledMMLinearKernel", True),
-        ("FlashInferCuteDslNvFp4LinearKernel", False),
+        ("FlashInferCutlassNvFp4LinearKernel", 120, True),
+        ("CutlassFP8ScaledMMLinearKernel", 90, True),
+        ("FlashInferCuteDslNvFp4LinearKernel", 100, False),
+        # Warmup autotunes on SM90 and newer only (kernel_warmup.py:261-268).
+        ("CutlassFP8ScaledMMLinearKernel", 89, False),
     ],
 )
-def test_flashinfer_autotune_follows_serving_skip_rule(kernel_source, tuned):
+def test_flashinfer_autotune_follows_serving_skip_rule(kernel_source, sm, tuned):
     # Serving tunes every FlashInfer op except fp4_gemm under the cute-dsl kernel
     # (vllm warmup/kernel_warmup.py _flashinfer_autotune_skip_ops); the tuner leaves
     # kernels it does not own untouched, so only the cute-dsl lane skips the pass.
     run, calls, _ = _run_timing_block(
-        "nvfp4", {"used_cuda_graph": True, "latency_ms": 1.0, "power_stats": None}, kernel_source=kernel_source
+        "nvfp4", {"used_cuda_graph": True, "latency_ms": 1.0, "power_stats": None}, kernel_source=kernel_source, sm=sm
     )
     run()
     assert calls["autotuned"] == ([(1, kernel_source)] if tuned else [])
     assert len(calls["published"]) == 1
+
+
+@pytest.mark.parametrize(("m", "bucket"), [(1, 1), (48, 64), (257, 512), (4097, 8192)])
+def test_flashinfer_autotune_tunes_the_bucket_mm_fp4_maps_m_to(m, bucket):
+    # Warmup profiles the hybrid buckets and mm_fp4 maps a runtime m up to the next
+    # one, so m is timed on that bucket's tactic; the row keeps m.
+    run, calls, _ = _run_timing_block(
+        "nvfp4",
+        {"used_cuda_graph": True, "latency_ms": 1.0, "power_stats": None},
+        kernel_source="FlashInferCutlassNvFp4LinearKernel",
+        m=m,
+    )
+    run()
+    assert calls["autotuned"] == [(bucket, "FlashInferCutlassNvFp4LinearKernel")]
+    assert calls["published"][0]["item_list"][0]["m"] == m
