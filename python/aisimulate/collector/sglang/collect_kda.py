@@ -166,7 +166,8 @@ def run_kda_context_benchmark(
     (effective_extend_kernel :405-418); elsewhere chunk_kda. SGLang turns the
     prefill CUDA graph off for every KDA model but GLM-5.3-Flash
     (arg_groups/cuda_graph_hook.py:185-191), so Kimi-K3 runs serving's eager
-    FlashInferKDAPrefillKernel.extend, and the FlashInfer lane times that call.
+    FlashInferKDAPrefillKernel.extend, and the FlashInfer lane times that call
+    eagerly.
 
     Deviation: every scan row is labeled "chunk_kda" whichever kernel serving
     picked, so the SDK reads one curve per backend (sdk/models/kimi_k3.py); the
@@ -191,10 +192,6 @@ def run_kda_context_benchmark(
         )
 
         flashinfer_prefill = FlashInferKDAPrefillKernel()
-        # recurrent_kda keeps one workspace per stream and refuses a capture whose
-        # workspace was not warmed on that stream (kda_prefill.py _get_stream_workspace,
-        # _bind_workspace @flashinfer v0.7.2): warm and capture on one stream.
-        flashinfer_stream = torch.cuda.Stream(device)
     successful_points = 0
     failed_points = 0
     failures: list[str] = []
@@ -313,9 +310,10 @@ def run_kda_context_benchmark(
 
                 def run_kda_scan():
                     if use_flashinfer:
-                        # Deviation: serving runs this call eagerly and plans it on the host
-                        # each time (cu_seqlens read back, sequence order); the graph replay
-                        # here times its kernels only.
+                        # Timed eagerly, as serving runs it: a CUDA graph capture needs an
+                        # explicit RecurrentKDAPrefillWorkspace, which restricts FlashInfer to
+                        # its graph-safe schedules (no persistent M128 on B200/GB200,
+                        # kda_prefill.py RecurrentKDAPrefillWorkspace @flashinfer v0.7.2).
                         flashinfer_prefill.extend(
                             q,
                             k,
@@ -354,7 +352,7 @@ def run_kda_context_benchmark(
                     num_warmups=num_warmups,
                     num_runs=num_runs,
                     repeat_n=1,
-                    capture_stream=flashinfer_stream if use_flashinfer else None,
+                    use_cuda_graph=not use_flashinfer,
                 ) as results:
                     if not log_perf(
                         item_list=[{**common_log_data, "latency": results["latency_ms"]}],

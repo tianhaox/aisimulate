@@ -31,7 +31,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterable
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -429,7 +429,6 @@ def benchmark_with_power(
     *,
     explicit_graph_cleanup: bool = False,
     num_eager_warmups: int | None = None,
-    capture_stream=None,
 ):
     """
     Context manager that handles warmup, graph capture, timing, and power monitoring.
@@ -457,9 +456,6 @@ def benchmark_with_power(
                          replay warmups stay at num_warmups. Set lower when the
                          kernel already ran (a dry run) and the measurement is
                          graph-based; eager measurements should keep the default.
-        capture_stream: CUDA stream for the eager warmups and the capture (default:
-                         warm on the current stream, capture on torch's side stream).
-                         Set it for a kernel bound to the stream of its first launch.
 
     Yields:
         dict with keys:
@@ -503,42 +499,38 @@ def benchmark_with_power(
         phase_seconds[name] = phase_seconds.get(name, 0.0) + (now - _phase_start)
         _phase_start = now
 
-    # A kernel whose workspace binds to the stream of its first launch (FlashInfer
-    # recurrent KDA, kda_prefill.py _bind_workspace @flashinfer v0.7.2) warms and is
-    # captured on capture_stream, as serving's graph runner does on its own stream.
-    with dev_mod.stream(capture_stream) if capture_stream is not None else nullcontext():
-        if measure_power:
-            # Estimate single iteration time with warmup
-            start_warmup = dev_mod.Event(enable_timing=True)
-            end_warmup = dev_mod.Event(enable_timing=True)
+    if measure_power:
+        # Estimate single iteration time with warmup
+        start_warmup = dev_mod.Event(enable_timing=True)
+        end_warmup = dev_mod.Event(enable_timing=True)
 
-            estimate_runs = max(eager_warmups, 1)
-            dev_mod.synchronize()
-            start_warmup.record()
-            for _ in range(estimate_runs):
-                kernel_func()
-            end_warmup.record()
-            dev_mod.synchronize()
+        estimate_runs = max(eager_warmups, 1)
+        dev_mod.synchronize()
+        start_warmup.record()
+        for _ in range(estimate_runs):
+            kernel_func()
+        end_warmup.record()
+        dev_mod.synchronize()
 
-            single_iter_time = start_warmup.elapsed_time(end_warmup) / estimate_runs / 1000.0  # seconds
+        single_iter_time = start_warmup.elapsed_time(end_warmup) / estimate_runs / 1000.0  # seconds
 
-            # Adaptive duration: use shorter duration for very fast kernels to reduce memory pressure
-            target_duration = power_min_duration
-            if single_iter_time < 0.0001:  # < 0.1ms
-                target_duration = min(power_min_duration, 0.3)
-            actual_num_runs = max(num_runs, int(target_duration / (single_iter_time * repeat_n)) + 1)
-            actual_num_runs = min(actual_num_runs, 3000)
+        # Adaptive duration: use shorter duration for very fast kernels to reduce memory pressure
+        target_duration = power_min_duration
+        if single_iter_time < 0.0001:  # < 0.1ms
+            target_duration = min(power_min_duration, 0.3)
+        actual_num_runs = max(num_runs, int(target_duration / (single_iter_time * repeat_n)) + 1)
+        actual_num_runs = min(actual_num_runs, 3000)
 
-            if actual_num_runs > 1000:
-                logging.getLogger(__name__).warning(
-                    f"Kernel is very fast ({single_iter_time * 1000:.3f}ms), running {actual_num_runs} iterations"
-                )
-        else:
-            # Normal warmup
-            dev_mod.synchronize()
-            for _ in range(eager_warmups):
-                kernel_func()
-            dev_mod.synchronize()
+        if actual_num_runs > 1000:
+            logging.getLogger(__name__).warning(
+                f"Kernel is very fast ({single_iter_time * 1000:.3f}ms), running {actual_num_runs} iterations"
+            )
+    else:
+        # Normal warmup
+        dev_mod.synchronize()
+        for _ in range(eager_warmups):
+            kernel_func()
+        dev_mod.synchronize()
 
     _close_phase("eager_warmup")
 
@@ -557,13 +549,12 @@ def benchmark_with_power(
             graph_cls = torch.cuda.CUDAGraph if is_cuda else torch.xpu.XPUGraph
             graph_ctx = torch.cuda.graph if is_cuda else torch.xpu.graph
             g = graph_cls()
-            graph_kwargs = {"stream": capture_stream} if capture_stream is not None else {}
             if explicit_graph_cleanup:
                 original_stream = dev_mod.current_stream()
             try:
                 if explicit_graph_cleanup:
                     try:
-                        with graph_ctx(g, **graph_kwargs):
+                        with graph_ctx(g):
                             for _ in range(repeat_n):
                                 kernel_func()
                     finally:
@@ -571,7 +562,7 @@ def benchmark_with_power(
                         # context restores the caller's current stream.
                         dev_mod.set_stream(original_stream)
                 else:
-                    with graph_ctx(g, **graph_kwargs):
+                    with graph_ctx(g):
                         for _ in range(repeat_n):
                             kernel_func()
                 dev_mod.synchronize()
