@@ -85,6 +85,11 @@ from sglang.srt.layers.quantization.fp8_utils import (
     requant_block_scale_ue8m0_for_deepgemm,
     triton_w8a8_block_fp8_linear,
 )
+from sglang.srt.layers.quantization.modelopt_quant import (
+    pad_nvfp4_activation_for_cutlass,
+    pad_nvfp4_weight,
+    slice_nvfp4_output,
+)
 
 _BLOCK_SIZE = [128, 128]
 _SERVING_GEMM_CONFIG_READY = False
@@ -274,16 +279,6 @@ def run_gemm(gemm_type, batch_size, N, K, *, perf_filename, device="cuda:0"):  #
     if gemm_type == "nvfp4":
         if not HAS_FLASHINFER_FP4 or sglang_fp4_quantize is None:
             raise RuntimeError("SGLang NVFP4 GEMM requires FlashInfer FP4 quantization support")
-        if N % 128 != 0 or K % 64 != 0:
-            # The FlashInfer path consumes the modelopt 128x4 block-scale layout
-            # without synthetic padding; misaligned weights cannot be quantized
-            # into that layout. The current shared sweep contains no such
-            # shape, so this guard exists to classify rather than silently
-            # drop any future misaligned case.
-            raise ValueError(
-                f"SGLang NVFP4 dense GEMM requires n % 128 == 0 and k % 64 == 0 "
-                f"for the modelopt block-scale layout, got n={N}, k={K}"
-            )
         # The FP4 runner initialize_fp4_gemm_config resolved (fp4_utils.py:149-170:
         # flashinfer_cutedsl on SM100/103, marlin on SM80-90, flashinfer_cutlass
         # otherwise) under the mm_fp4 backend name serving passes
@@ -318,9 +313,16 @@ def run_gemm(gemm_type, batch_size, N, K, *, perf_filename, device="cuda:0"):  #
                 is_sf_swizzled_layout=True,
             )
             del b_bf16_dummy
+            # ModelOptFp4LinearMethod.process_weights_after_loading pads the packed
+            # weight's N and K to FP4_GEMM_ALIGNMENT (32) for these backends
+            # (modelopt_quant.py:1991-1993, pad_nvfp4_weight :205-252); the swizzled
+            # scale is already 128 x 4 padded, as serving's interleave pads it
+            # (:2000-2027). apply() then pads the activation by the same K columns
+            # and slices the N padding off the output (:2120-2140).
+            b_fp4, weights_padding_cols = pad_nvfp4_weight(b_fp4)
+            w_n = b_fp4.shape[0]
             b_fp4 = b_fp4.t()
             b_sf = b_sf.view(torch.float8_e4m3fn).t()
-            out = torch.empty((M, N), device=device, dtype=dtype)
 
             def gemm_op():
                 # ModelOptFp4LinearMethod.apply (modelopt_quant.py:2076-2160):
@@ -331,21 +333,15 @@ def run_gemm(gemm_type, batch_size, N, K, *, perf_filename, device="cuda:0"):  #
                 # (kernels/kda_kernels/qwen3x_nvfp4_gemm.py:13-22, 94-110; it
                 # returns None off SM120 and for other shapes).
                 a_fp4_dynamic, a_sf_dynamic = sglang_fp4_quantize(a_bf16, a_global_scale)
-                kda_out = try_qwen3x_nvfp4_gemm(a_fp4_dynamic, b_fp4, a_sf_dynamic, b_sf, alpha, dtype, N)
+                a_fp4_dynamic = pad_nvfp4_activation_for_cutlass(a_fp4_dynamic, weights_padding_cols)
+                kda_out = try_qwen3x_nvfp4_gemm(a_fp4_dynamic, b_fp4, a_sf_dynamic, b_sf, alpha, dtype, w_n)
                 if kda_out is not None:
                     nvfp4_ran.add("kda")
-                    return kda_out
+                    return slice_nvfp4_output(kda_out, N)
                 nvfp4_ran.add(fp4_backend)
-                return flashinfer_mm_fp4(
-                    a_fp4_dynamic,
-                    b_fp4,
-                    a_sf_dynamic,
-                    b_sf,
-                    alpha,
-                    dtype,
-                    backend=fp4_backend,
-                    out=out,
-                )
+                # fp4_gemm (modelopt_quant.py:136-185) calls mm_fp4 without an output buffer
+                out = flashinfer_mm_fp4(a_fp4_dynamic, b_fp4, a_sf_dynamic, b_sf, alpha, dtype, backend=fp4_backend)
+                return slice_nvfp4_output(out, N)
 
             return gemm_op
 

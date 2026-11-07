@@ -308,7 +308,7 @@ class TestCollectMoeImportSurface:
 # ---------------------------------------------------------------------------
 # The sglang 0.5.23 names each module touches at import time: the serving
 # GEMM entry points and backend initializers in srt/layers/quantization
-# (fp8_utils, fp4_utils, unquant), the fused-op trace in sglang.kernels.fused_op
+# (fp8_utils, fp4_utils, unquant, modelopt_quant's NVFP4 padding helpers), the fused-op trace in sglang.kernels.fused_op
 # and the SM120 KDA NVFP4 GEMM in sglang.kernels.ops.gemm. The JIT quantization
 # kernels live in sglang.kernels.ops.quantization.fp8_kernel (the 0.5.14
 # srt/layers/quantization/fp8_kernel path is gone).
@@ -339,6 +339,11 @@ SGLANG_0523_GEMM_SURFACE = {
         "initialize_fp8_gemm_config": _dummy,
         "requant_block_scale_ue8m0_for_deepgemm": _dummy,
         "triton_w8a8_block_fp8_linear": _dummy,
+    },
+    "sglang.srt.layers.quantization.modelopt_quant": {
+        "pad_nvfp4_activation_for_cutlass": _dummy,
+        "pad_nvfp4_weight": _dummy,
+        "slice_nvfp4_output": _dummy,
     },
 }
 SGLANG_0523_COMPUTESCALE_SURFACE = {

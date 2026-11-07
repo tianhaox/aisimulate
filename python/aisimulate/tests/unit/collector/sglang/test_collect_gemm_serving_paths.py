@@ -221,7 +221,35 @@ def test_fp8_label_probe_turns_tracing_off_when_the_call_raises():
 # --- nvfp4: serving's activation quant, then the SM120 KDA kernel or mm_fp4 ---
 
 
-def _nvfp4_gemm_op(kda_result, ran: set, calls: list, fp4_backend="cutlass"):
+def _round_up(x, m):
+    return -(-x // m) * m
+
+
+def _nvfp4_padding(calls: list) -> dict:
+    """serving's modelopt_quant padding helpers, by shape: N and K to 32 (K packed 2 per byte)."""
+
+    def pad_nvfp4_weight(w):
+        rows, col_bytes = w.shape
+        padded = _Tensor((_round_up(rows, 32), _round_up(col_bytes * 2, 32) // 2), w.dtype)
+        calls.append(("pad_weight", w.shape, padded.shape))
+        return padded, padded.shape[1] - col_bytes
+
+    def pad_nvfp4_activation_for_cutlass(x, cols):
+        calls.append(("pad_activation", cols))
+        return _Tensor((x.shape[0], x.shape[1] + cols), x.dtype)
+
+    def slice_nvfp4_output(out, n):
+        calls.append(("slice", n))
+        return out
+
+    return {
+        "pad_nvfp4_weight": pad_nvfp4_weight,
+        "pad_nvfp4_activation_for_cutlass": pad_nvfp4_activation_for_cutlass,
+        "slice_nvfp4_output": slice_nvfp4_output,
+    }
+
+
+def _nvfp4_gemm_op(kda_result, ran: set, calls: list, fp4_backend="cutlass", n=256, k=512):
     def flashinfer_fp4_quantize(x, global_scale, is_sf_swizzled_layout):
         calls.append(("flashinfer_fp4_quantize", x.shape))
         rows, k = x.shape
@@ -236,12 +264,13 @@ def _nvfp4_gemm_op(kda_result, ran: set, calls: list, fp4_backend="cutlass"):
         calls.append(("kda", b_fp4.shape, b_sf.shape, b_sf.dtype, out_features))
         return kda_result
 
-    def flashinfer_mm_fp4(a_fp4, b_fp4, a_sf, b_sf, alpha, dtype, *, backend, out):
-        calls.append(("mm_fp4", backend))
-        return out
+    def flashinfer_mm_fp4(a_fp4, b_fp4, a_sf, b_sf, alpha, dtype, *, backend):
+        calls.append(("mm_fp4", backend, a_fp4.shape, b_fp4.shape))
+        return "mm-out"
 
     return _create_gemm(
         {
+            **_nvfp4_padding(calls),
             "torch": _fake_torch(),
             "flashinfer_fp4_quantize": flashinfer_fp4_quantize,
             "sglang_fp4_quantize": sglang_fp4_quantize,
@@ -251,8 +280,8 @@ def _nvfp4_gemm_op(kda_result, ran: set, calls: list, fp4_backend="cutlass"):
             "fp4_backend": fp4_backend,
             "gemm_type": "nvfp4",
             "M": 4,
-            "N": 256,
-            "K": 512,
+            "N": n,
+            "K": k,
             "device": "cpu",
         }
     )()
@@ -261,18 +290,37 @@ def _nvfp4_gemm_op(kda_result, ran: set, calls: list, fp4_backend="cutlass"):
 def test_nvfp4_gemm_op_quantizes_activations_with_serving_fp4_quantize_then_runs_mm_fp4():
     ran, calls = set(), []
     gemm_op = _nvfp4_gemm_op(None, ran, calls, fp4_backend="cute-dsl")
-    # Setup quantizes the weight once with FlashInfer's own quantizer.
-    assert calls == [("flashinfer_fp4_quantize", (256, 512))]
+    # Setup quantizes the weight once with FlashInfer's own quantizer, then pads it
+    # as process_weights_after_loading does (aligned here: no padding).
+    assert calls == [("flashinfer_fp4_quantize", (256, 512)), ("pad_weight", (256, 256), (256, 256))]
+    calls.clear()
+
+    assert gemm_op() == "mm-out"
+
+    assert calls[0] == ("sglang_fp4_quantize", (4, 512))
+    assert calls[1] == ("pad_activation", 0)
+    # fp4_gemm tries the KDA kernel first with the [K/2, N] weight and its
+    # float8_e4m3fn [K/16, N] scale view, as ModelOptFp4LinearMethod.apply passes them.
+    assert calls[2] == ("kda", (256, 256), (32, 256), FLOAT8, 256)
+    assert calls[3] == ("mm_fp4", "cute-dsl", (4, 256), (256, 256))
+    assert calls[4] == ("slice", 256)
+    assert ran == {"cute-dsl"}
+
+
+def test_nvfp4_gemm_op_pads_a_misaligned_shape_as_serving_does():
+    # n=48, k=48: serving pads the packed weight to N=64, K=64 (32 bytes), pads the
+    # activation by the same 8 bytes, runs the GEMM at N=64 and slices back to 48.
+    ran, calls = set(), []
+    gemm_op = _nvfp4_gemm_op(None, ran, calls, n=48, k=48)
+    assert calls[-1] == ("pad_weight", (48, 24), (64, 32))
     calls.clear()
 
     gemm_op()
 
-    assert calls[0] == ("sglang_fp4_quantize", (4, 512))
-    # fp4_gemm tries the KDA kernel first with the [K/2, N] weight and its
-    # float8_e4m3fn [K/16, N] scale view, as ModelOptFp4LinearMethod.apply passes them.
-    assert calls[1] == ("kda", (256, 256), (32, 256), FLOAT8, 256)
-    assert calls[2] == ("mm_fp4", "cute-dsl")
-    assert ran == {"cute-dsl"}
+    assert calls[1] == ("pad_activation", 8)
+    assert calls[2][0] == "kda" and calls[2][1] == (32, 64) and calls[2][-1] == 64
+    assert calls[3] == ("mm_fp4", "cutlass", (4, 32), (32, 64))
+    assert calls[4] == ("slice", 48)
 
 
 def test_nvfp4_gemm_op_returns_the_kda_output_when_serving_would():
@@ -281,7 +329,7 @@ def test_nvfp4_gemm_op_returns_the_kda_output_when_serving_would():
     calls.clear()
 
     assert gemm_op() == "kda-out"
-    assert [c[0] for c in calls] == ["sglang_fp4_quantize", "kda"]
+    assert [c[0] for c in calls] == ["sglang_fp4_quantize", "pad_activation", "kda", "slice"]
     assert ran == {"kda"}
 
 
@@ -464,9 +512,9 @@ def _nvfp4_overrides(events: list, *, autotune_enabled=True):
             tune_fn()
         yield autotune_enabled
 
-    def flashinfer_mm_fp4(a, b, a_sf, b_sf, alpha, dtype, *, backend, out):
+    def flashinfer_mm_fp4(a, b, a_sf, b_sf, alpha, dtype, *, backend):
         events.append(("mm_fp4", backend, v2["active"]))
-        return out
+        return "mm-out"
 
     runner = SimpleNamespace(
         is_flashinfer_cutedsl=lambda: True,
@@ -479,6 +527,7 @@ def _nvfp4_overrides(events: list, *, autotune_enabled=True):
         return _Tensor((x.shape[0], x.shape[1] // 2), "uint8"), _Tensor(x.shape, "uint8")
 
     return {
+        **_nvfp4_padding([]),
         "HAS_FLASHINFER_FP4": True,
         "sglang_fp4_quantize": quantize,
         "flashinfer_fp4_quantize": quantize,
