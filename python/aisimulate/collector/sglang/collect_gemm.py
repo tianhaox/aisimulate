@@ -65,7 +65,7 @@ selection, quantization helpers, and perf logging.
 #   shape. Retire it by timing fp8_block through dispatch_w8a8_block_fp8_linear, as
 #   serving does; that also lets SM89/120 run fp8_block (drop its entry in
 #   collector/skips.py).
-__compat__ = "sglang==0.5.21"
+__compat__ = "sglang==0.5.23"
 
 import os
 

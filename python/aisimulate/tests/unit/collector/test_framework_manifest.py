@@ -313,9 +313,9 @@ WIDEEP_OPS = {entry.op for entry in WIDEEP_SGLANG_REGISTRY}
 @pytest.mark.parametrize(
     ("installed_version", "requested_ops", "workload", "version"),
     [
-        # msa resolves on the stock default; kda moved to 0.5.23 with the
+        # attention and msa resolve on the stock default; kda moved to 0.5.23 with the
         # op-by-op upgrade (a family pin, still the stock workload).
-        ("0.5.21+cu130", {"gemm"}, "default", "0.5.21"),
+        ("0.5.21+cu130", {"attention_context"}, "default", "0.5.21"),
         ("0.5.23", {"kda"}, "default", "0.5.23"),
         ("0.5.21", {"msa_context_module"}, "default", "0.5.21"),
         ("0.5.10", {"moe_ep"}, "wideep", "0.5.10"),
@@ -342,11 +342,11 @@ def test_vllm_xpu_runtime_selection_rejects_version_mismatch():
 @pytest.mark.parametrize(
     ("installed_version", "requested_ops", "match"),
     [
-        ("0.5.14", {"gemm"}, r"stock collector requires exactly 0\.5\.21"),
-        ("0.5.21rc1", {"gemm"}, r"stock collector requires exactly 0\.5\.21"),
-        ("0.5.21.post1", {"gemm"}, r"stock collector requires exactly 0\.5\.21"),
+        ("0.5.14", {"attention_context"}, r"stock collector requires exactly 0\.5\.21"),
+        ("0.5.21rc1", {"attention_context"}, r"stock collector requires exactly 0\.5\.21"),
+        ("0.5.21.post1", {"attention_context"}, r"stock collector requires exactly 0\.5\.21"),
         ("0.5.21", {"moe_ep"}, r"WideEP collector requires exactly 0\.5\.10"),
-        ("0.5.21", {"gemm", "moe_ep"}, r"0\.5\.21 != 0\.5\.10.*separate containers"),
+        ("0.5.21", {"attention_context", "moe_ep"}, r"0\.5\.21 != 0\.5\.10.*separate containers"),
     ],
 )
 def test_runtime_selection_rejects_mismatched_or_mixed_pins(installed_version, requested_ops, match):
@@ -360,7 +360,7 @@ def test_runtime_selection_rejects_mismatched_or_mixed_pins(installed_version, r
 @pytest.mark.parametrize(
     ("installed_version", "requested_ops", "workload", "version"),
     [
-        ("0.5.21+cu130", {"gemm"}, "default", "0.5.21"),
+        ("0.5.21+cu130", {"attention_context"}, "default", "0.5.21"),
         ("0.5.23", {"kda"}, "default", "0.5.23"),
         ("0.5.10", {"moe_ep"}, "wideep", "0.5.10"),
     ],
@@ -381,11 +381,11 @@ def test_no_model_identity_resolves_exactly_like_today(installed_version, reques
 
 
 def test_unknown_model_id_falls_back_to_default_resolution():
-    baseline = require_collector_runtime("sglang", "0.5.21", requested_ops={"gemm"}, wideep_ops=WIDEEP_OPS)
+    baseline = require_collector_runtime("sglang", "0.5.21", requested_ops={"attention_context"}, wideep_ops=WIDEEP_OPS)
     unmatched = require_collector_runtime(
         "sglang",
         "0.5.21",
-        requested_ops={"gemm"},
+        requested_ops={"attention_context"},
         wideep_ops=WIDEEP_OPS,
         model_path="some-org/not-a-pinned-model",
     )

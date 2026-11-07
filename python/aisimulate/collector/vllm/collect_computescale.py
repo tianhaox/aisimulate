@@ -24,7 +24,7 @@ deployments.
 # compute_scale: 8/8 representative cases. The native framework
 # builders/selectors remain authoritative; no kernel fallback is introduced.
 # The campaign manifest still selects one exact release per run.
-__compat__ = "vllm==0.30.0"
+__compat__ = "vllm==0.32.0"
 
 import torch
 from collector.helper import benchmark_with_power, get_sm_version, log_perf

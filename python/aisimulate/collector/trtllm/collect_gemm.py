@@ -9,7 +9,7 @@ FP8, FP8 block, and related quantization modes. Shape policy comes from
 quantized-weight setup, and perf logging.
 """
 
-__compat__ = "trtllm==1.3.0rc29"
+__compat__ = "trtllm==1.4.0rc2"
 
 import ctypes
 import math

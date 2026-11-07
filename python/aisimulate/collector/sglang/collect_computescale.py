@@ -13,7 +13,7 @@ binds both to this producer's checkpoint:
 # 0.5.21 (H20/sm90 collector port: op_smoke + path gates in the v0.5.21 image;
 # findings hopper_sglang_collector_port_0514_to_0521_2026_10_01).
 # One release per file; earlier code is `git log -- <this file>` away.
-__compat__ = "sglang==0.5.21"
+__compat__ = "sglang==0.5.23"
 
 from importlib.metadata import version as _dist_version  # setuptools/pkg_resources is absent from sglang>=0.5.21 images
 

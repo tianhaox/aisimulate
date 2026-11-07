@@ -122,7 +122,7 @@ quantized-weight preparation, and selected-kernel reporting.
 # Helpers with identical bodies: scaled_fp4_quant (_custom_ops.py:1513-1588),
 #   per_block_cast_to_fp8 (utils/deep_gemm.py:983-1002). All imports below
 #   resolve at 0.31.0.
-__compat__ = "vllm==0.31.0"
+__compat__ = "vllm==0.32.0"
 
 from types import SimpleNamespace
 
