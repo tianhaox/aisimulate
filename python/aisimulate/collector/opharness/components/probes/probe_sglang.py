@@ -349,7 +349,10 @@ def main() -> None:
                     initialize_mamba_selective_state_update_backend()
             except Exception as _e:
                 rec.setdefault("init_warnings", []).append(f"mamba_ssu_backend: {type(_e).__name__}")
-            for _fn in ("initialize_fp8_gemm_config", "initialize_fp4_gemm_config"):
+            # all three, as scheduler.py:1010-1013 (0.5.23) does: without the bf16 one the
+            # probe served SM100 bf16 linears on cuBLAS while serving runs the CuTe DSL lane
+            # ("auto" -> cutedsl, unquant.py initialize_bf16_gemm_config) (2026-11-08)
+            for _fn in ("initialize_fp8_gemm_config", "initialize_bf16_gemm_config", "initialize_fp4_gemm_config"):
                 try:
                     _f = getattr(__import__("sglang.benchmark.one_batch", fromlist=[_fn]), _fn)
                     _f(sa) if _inspect.signature(_f).parameters else _f()

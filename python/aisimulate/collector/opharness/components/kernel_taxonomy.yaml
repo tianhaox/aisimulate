@@ -254,3 +254,12 @@ rules:
      match: "^bmm_(MxE4m3|Bfloat16|E4m3)_(MxE2m1|E2m1E2m1|E4m3E4m3)|^moe::dev::"}
   - {backend: torch_sdpa, role: attention, sms: [sm89],
      match: "^pytorch_flash::flash_fwd_kernel$"}
+  # CuTe DSL dense GEMM / activation quant on Blackwell (2026-11-08, gemm gates at the new pins):
+  # SGLang's TGV bf16 GEMM (unquant.py cutedsl lane), FlashInfer's NVFP4 activation quant, and
+  # TRT-LLM's CuTe DSL FP4 dense GEMM with its block-size quant (NVFP4GemmUnifiedRunner tactic)
+  - {backend: cutlass, role: gemm, sms: [sm100, sm103],
+     match: "^kernel_cutlass_kernel_TgvGemmCuteExtKernel|^kernel_cutlass_kernel_tensorrt_llm_torchkernelsblackwelldense_blockscaled_gemm"}
+  - {backend: flashinfer, role: quant, sms: [sm100, sm103],
+     match: "^kernel_cutlass_kernel_flashinferquantizationkernelsnvfp4_quantize"}
+  - {backend: trtllm_internal, role: quant,
+     match: "^tensorrt_llm::_v1::kernels::quantize_with_block_size"}

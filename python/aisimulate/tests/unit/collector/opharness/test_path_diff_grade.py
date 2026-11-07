@@ -48,6 +48,7 @@ _LABELS = {
     "triton_per_fused__to_copy_abs_ceil_clamp_div_exp2_log2_max_view_0": ("framework_native", "activation"),
     "triton_": ("infra", "infra"),
     "vllm::per_token_group_quant_8bit_packed_kernel": ("vllm_kernel", "quant"),
+    "deep_gemm::transpose_and_pack_fp32_into_ue8m0": ("deepgemm", "gemm"),
 }
 
 
@@ -250,3 +251,14 @@ def test_only_the_timed_runs_are_checked_for_auxiliary_work():
     col = [_INDUCTOR_QUANT, _B200_GEMM]
     g = grade(col, [_B200_GEMM], ("gemm",), measured=[_B200_GEMM])
     assert g["verdict"] == "aligned" and g["aux_drift"] == {}
+
+
+def test_a_warmup_only_kernel_of_the_target_role_is_not_graded():
+    # SGLang B200 fp8_block, 2026-11-08: DeepGEMM packed a scale once on the first call; the
+    # timed runs launch only the GEMM and serving's quant, as serving does
+    pack = "deep_gemm::transpose_and_pack_fp32_into_ue8m0"
+    col = [pack, _B200_GEMM, "per_token_group_quant_8bit_kernel"]
+    srv = [_B200_GEMM, "per_token_group_quant_8bit_kernel"]
+    assert grade(col, srv, ("gemm",))["verdict"] == "diverged"  # timed range only: the pack counts
+    g = grade(col, srv, ("gemm",), measured=[_B200_GEMM, "per_token_group_quant_8bit_kernel"])
+    assert g["verdict"] == "aligned" and g["kernel_drift"] is None and g["aux_drift"] == {}

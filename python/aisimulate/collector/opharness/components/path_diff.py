@@ -98,8 +98,9 @@ def grade(col_kernels, srv_kernels, target_roles, cap_error, role_of, col_measur
     target_roles: the op roles this gate must prove; None = every labeled
     non-glue role the collector executed (unscoped gate, recorded as such).
     role_of(kernel) -> (backend, role) | None, from the taxonomy.
-    col_measured: the kernels of the collector's timed runs alone (None: the
-    capture did not record them, and auxiliary work goes unchecked).
+    col_measured: the kernels of the collector's timed runs alone; when given they
+    replace col_kernels for every check (None: the capture did not record them,
+    the timed range is graded and auxiliary work goes unchecked).
     srv_every: every serving kernel, any phase (default srv_kernels).
 
       aligned              every collector kernel of every target role name-
@@ -129,6 +130,11 @@ def grade(col_kernels, srv_kernels, target_roles, cap_error, role_of, col_measur
                 out.setdefault(hit[1], {})[k.split("<")[0]] = hit[0]
         return out
 
+    # The timed runs alone are what the row pays for; a warmup's one-time work (a DeepGEMM
+    # scale pack on the first call, autotune candidates) is in the timed range but not in them.
+    # Without them (an older trace), the whole timed range stands in.
+    if col_measured:
+        col_kernels = col_measured
     col_roles, srv_roles = by_role(col_kernels), by_role(srv_kernels)
     if target_roles is None:
         target_roles = tuple(sorted(r for r in col_roles if r not in _NEVER_TARGET))
