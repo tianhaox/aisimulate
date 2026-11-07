@@ -623,3 +623,45 @@ gates:
     prefix_len: 0}
   repo: MiniMaxAI/MiniMax-M3
   kv: auto
+- gate: moe_nvfp4_DeepSeek-V3.1-NVFP4
+  backend: vllm
+  op: moe
+  select: {moe_type: nvfp4, model_name: nvidia/DeepSeek-V3.1-NVFP4, hidden_size: 7168, inter_size: 2048, topk: 8, num_experts: 256, tp: 1, ep: 1, distribution: balanced, num_tokens: [1, 4096]}
+  repo: nvidia/DeepSeek-V3.1-NVFP4
+  kv: auto
+- gate: moe_nvfp4_DeepSeek-V3.1-NVFP4
+  backend: sglang
+  op: moe
+  select: {moe_type: nvfp4, model_name: nvidia/DeepSeek-V3.1-NVFP4, hidden_size: 7168, inter_size: 2048, topk: 8, num_experts: 256, tp: 1, ep: 1, distribution: balanced, num_tokens: [1, 4096]}
+  repo: nvidia/DeepSeek-V3.1-NVFP4
+  kv: auto
+- gate: moe_nvfp4_DeepSeek-V3.1-NVFP4
+  backend: trtllm
+  op: moe
+  select: {moe_type: nvfp4, model_name: nvidia/DeepSeek-V3.1-NVFP4, hidden_size: 7168, inter_size: 2048, topk: 8, num_experts: 256, tp: 1, ep: 1, distribution: balanced, num_tokens: [1, 4096]}
+  repo: nvidia/DeepSeek-V3.1-NVFP4
+  kv: auto
+- gate: moe_bf16_gemma4-26B-A4B
+  backend: sglang
+  op: moe
+  select: {moe_type: bfloat16, model_name: google/gemma-4-26B-A4B, hidden_size: 2816, inter_size: 704, topk: 8, num_experts: 128, tp: 1, ep: 1, distribution: balanced, num_tokens: [1, 4096]}
+  repo: google/gemma-4-26B-A4B
+  kv: auto
+- gate: moe_mxfp4_gpt-oss-120b
+  backend: sglang
+  op: moe
+  select: {moe_type: w4a16_mxfp4, model_name: openai/gpt-oss-120b, hidden_size: 2880, inter_size: 2880, topk: 4, num_experts: 128, tp: 1, ep: 1, distribution: balanced, num_tokens: [1, 4096]}
+  repo: openai/gpt-oss-120b
+  kv: auto
+- gate: moe_bf16_gemma4-26B-A4B
+  backend: trtllm
+  op: moe
+  select: {moe_type: bfloat16, model_name: google/gemma-4-26B-A4B, hidden_size: 2816, inter_size: 704, topk: 8, num_experts: 128, tp: 1, ep: 1, distribution: balanced, num_tokens: [1, 4096]}
+  repo: google/gemma-4-26B-A4B
+  kv: auto
+- gate: moe_mxfp4_gpt-oss-120b
+  backend: trtllm
+  op: moe
+  select: {moe_type: w4a16_mxfp4, model_name: openai/gpt-oss-120b, hidden_size: 2880, inter_size: 2880, topk: 4, num_experts: 128, tp: 1, ep: 1, distribution: balanced, num_tokens: [1, 4096]}
+  repo: openai/gpt-oss-120b
+  kv: auto
