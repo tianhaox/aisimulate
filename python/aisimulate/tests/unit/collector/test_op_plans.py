@@ -470,26 +470,25 @@ def test_gemm_floors_remove_whole_dtypes(sm, dtypes):
     assert sorted({case.gemm_type for case in plan("gemm", "vllm", sm).cases}) == dtypes
 
 
-def test_gemm_sglang_fp8_block_skip_covers_only_sm89_and_sm120():
-    for sm in (89, 120):
-        removed = plan("gemm", "sglang", sm).removed
-        assert [(region.region, region.reason) for region in removed if region.region == "dtype=fp8_block"] == [
-            ("dtype=fp8_block", repr(_entry(backend="sglang", op="gemm")))
-        ]
-    for sm in (90, 100, 103):
-        assert "fp8_block" in {case.gemm_type for case in plan("gemm", "sglang", sm).cases}
+def test_gemm_sglang_plans_fp8_block_on_every_fp8_sm():
+    # SGLang times fp8_block through serving's dispatch (Triton on SM89, CUTLASS
+    # on SM120, DeepGEMM on SM90/SM10x), so no SM leaves the dtype out.
+    for sm in (89, 90, 100, 103, 120):
+        op_plan = plan("gemm", "sglang", sm)
+        assert "fp8_block" in {case.gemm_type for case in op_plan.cases}
+        assert not [region for region in op_plan.removed if region.region == "dtype=fp8_block"]
 
 
 def test_summary_counts_per_dtype_and_hashes_the_planned_ids():
-    op_plan = plan("gemm", "sglang", 120)
+    op_plan = plan("gemm", "sglang", 89)
     summary = summarize("gemm", op_plan, case_id=lambda row: f"sglang.gemm:run_gemm:{row}")
     shapes = summary["by_dtype"]["bfloat16"]
 
     assert summary["cases"] == 3 * shapes
-    assert summary["by_dtype"] == {"bfloat16": shapes, "fp8": shapes, "nvfp4": shapes}
+    assert summary["by_dtype"] == {"bfloat16": shapes, "fp8": shapes, "fp8_block": shapes}
     assert summary["groups"] == len({(case.gemm_type, case.n, case.k) for case in op_plan.cases})
     assert summary["removed"] == [
-        {"region": "dtype=fp8_block", "cases": shapes, "reason": repr(_entry(backend="sglang", op="gemm"))}
+        {"region": "dtype=nvfp4", "cases": shapes, "reason": repr(_entry(dtype=["nvfp4", "w4a8_mxfp4_mxfp8"]))}
     ]
     assert summary["plan_hash"] == case_plan_hash([f"sglang.gemm:run_gemm:{case}" for case in op_plan.cases])
     assert "rows" not in summary

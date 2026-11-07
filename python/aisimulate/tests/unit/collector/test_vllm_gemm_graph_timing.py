@@ -10,6 +10,7 @@ an eager result even when a benchmark helper silently changes its behavior.
 """
 
 import ast
+import contextlib
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,11 +21,11 @@ pytestmark = pytest.mark.unit
 SOURCE = Path(__file__).resolve().parents[3] / "collector" / "vllm" / "collect_gemm.py"
 
 
-def _run_timing_block(gemm_type, result, *, capture_error=None):
+def _run_timing_block(gemm_type, result, *, capture_error=None, kernel_source="test-selected-kernel"):
     tree = ast.parse(SOURCE.read_text(), filename=str(SOURCE))
     run = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_gemm")
     start = next(i for i, n in enumerate(run.body) if isinstance(n, ast.FunctionDef) and n.name == "kernel_func")
-    calls = {"benchmark": [], "forward": [], "published": []}
+    calls = {"benchmark": [], "forward": [], "published": [], "autotuned": []}
     x = object()
 
     @contextmanager
@@ -38,9 +39,16 @@ def _run_timing_block(gemm_type, result, *, capture_error=None):
         kwargs["kernel_func"]()
         yield result
 
+    @contextmanager
+    def flashinfer_autotuned(num_tokens, tune_fn, *, label=""):
+        calls["autotuned"].append((num_tokens, label))
+        yield True
+
     namespace = {
+        "contextlib": contextlib,
         "torch": SimpleNamespace(device=lambda d: d, cuda=SimpleNamespace(get_device_name=lambda d: "test GPU")),
         "benchmark_with_power": benchmark_with_power,
+        "flashinfer_autotuned": flashinfer_autotuned,
         "log_perf": lambda **kwargs: calls["published"].append(kwargs),
         "device": "cuda:0",
         "gemm_type": gemm_type,
@@ -51,7 +59,7 @@ def _run_timing_block(gemm_type, result, *, capture_error=None):
         "op_list": [SimpleNamespace(forward=lambda arg: calls["forward"].append(arg))],
         "outside_loop_count": 1,
         "vllm_version": "test-version",
-        "kernel_source": "test-selected-kernel",
+        "kernel_source": kernel_source,
         "perf_filename": "test-perf-file",
     }
     code = compile(ast.Module(body=run.body[start:], type_ignores=[]), str(SOURCE), "exec")
@@ -91,3 +99,65 @@ def test_capture_failure_propagates_without_publication():
         run()
     assert exc.value is failure
     assert calls["published"] == []
+
+
+def _run_config_block(qc):
+    """Execute run_gemm's VllmConfig block, from its construction to entering it."""
+    tree = ast.parse(SOURCE.read_text(), filename=str(SOURCE))
+    run = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "run_gemm")
+    start = next(
+        i
+        for i, n in enumerate(run.body)
+        if isinstance(n, ast.Assign) and any(getattr(t, "id", None) == "vllm_config" for t in n.targets)
+    )
+    end = next(i for i, n in enumerate(run.body) if i > start and "set_current_vllm_config" in ast.unparse(n))
+    built = []
+    entered = []
+
+    class VllmConfig:
+        def __init__(self, **kwargs):
+            built.append(kwargs)
+            self.model_config = None
+
+    namespace = {
+        "VllmConfig": VllmConfig,
+        "SimpleNamespace": SimpleNamespace,
+        "set_current_vllm_config": lambda config: config,
+        "exit_stack": SimpleNamespace(enter_context=entered.append),
+        "dtype": "bf16",
+        "qc": qc,
+    }
+    code = compile(ast.Module(body=run.body[start : end + 1], type_ignores=[]), str(SOURCE), "exec")
+    exec(code, namespace)
+    return built, entered
+
+
+@pytest.mark.parametrize("qc", [None, object()], ids=["bfloat16", "quantized"])
+def test_vllm_config_carries_the_layer_quant_config(qc):
+    # Serving derives custom ops from VllmConfig.quant_config: block FP8 turns on
+    # the CUDA quant_fp8 op (vllm/config/vllm.py has_blocked_weights). A bare
+    # VllmConfig() would time the torch-native activation quant instead.
+    built, entered = _run_config_block(qc)
+    assert built == [{"quant_config": qc}]
+    assert len(entered) == 1
+    assert entered[0].model_config.hf_text_config.model_type == ""
+
+
+@pytest.mark.parametrize(
+    ("kernel_source", "tuned"),
+    [
+        ("FlashInferCutlassNvFp4LinearKernel", True),
+        ("CutlassFP8ScaledMMLinearKernel", True),
+        ("FlashInferCuteDslNvFp4LinearKernel", False),
+    ],
+)
+def test_flashinfer_autotune_follows_serving_skip_rule(kernel_source, tuned):
+    # Serving tunes every FlashInfer op except fp4_gemm under the cute-dsl kernel
+    # (vllm warmup/kernel_warmup.py _flashinfer_autotune_skip_ops); the tuner leaves
+    # kernels it does not own untouched, so only the cute-dsl lane skips the pass.
+    run, calls, _ = _run_timing_block(
+        "nvfp4", {"used_cuda_graph": True, "latency_ms": 1.0, "power_stats": None}, kernel_source=kernel_source
+    )
+    run()
+    assert calls["autotuned"] == ([(1, kernel_source)] if tuned else [])
+    assert len(calls["published"]) == 1

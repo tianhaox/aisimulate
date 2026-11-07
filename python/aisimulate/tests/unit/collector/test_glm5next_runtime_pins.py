@@ -38,9 +38,9 @@ def test_glm_pin_rejects_other_runtimes(backend, wrong_version, expected):
 @pytest.mark.parametrize(
     "backend,version,model_path",
     [
-        ("vllm", "0.31.0", None),  # gemm family pin
-        ("vllm", "0.31.0", "zai-org/GLM-5.2-FP8"),
-        ("sglang", "0.5.21", "zai-org/GLM-5.2-FP8"),
+        ("vllm", "0.32.0", None),  # gemm family pin
+        ("vllm", "0.32.0", "zai-org/GLM-5.2-FP8"),
+        ("sglang", "0.5.23", "zai-org/GLM-5.2-FP8"),
     ],
 )
 def test_other_models_keep_their_runtime(backend, version, model_path):

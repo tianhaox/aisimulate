@@ -24,6 +24,12 @@ from collector.op_plans import plan_cases
 
 _OUTSIDE_LOOP_COUNT = 5  # to reduce impact of L2 cache hit
 
+# Serving's per-tensor FP8 Linear quantizes its activation with these two ops:
+# static_quantize_e4m3_per_tensor when the checkpoint carries an input_scale,
+# quantize_e4m3_per_tensor otherwise (FP8QDQLinearMethod.apply,
+# modules/linear.py:782-793). The fp8 GEMM rows time the dynamic one; the
+# difference measured here turns them into static-quant rows.
+
 
 def get_computescale_test_cases():
     return plan_cases("compute_scale", "trtllm", get_sm_version())

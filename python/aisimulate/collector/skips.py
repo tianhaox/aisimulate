@@ -71,11 +71,9 @@ SKIPS: list[dict] = [
     # TRT-LLM runs it on SM90 only.
     {"dtype": "w4a16_mxfp4", "sm": [80, 86]},
     # FP4 tensor cores, which NVFP4 and MXFP8 x MXFP4 need, start at Blackwell (SM100).
+    # Below it vLLM serves NVFP4 checkpoints weight-only (Marlin W4A16; Humming on
+    # SM90, kernels/linear/nvfp4/humming.py), which is not an NVFP4 measurement.
     {"dtype": ["nvfp4", "w4a8_mxfp4_mxfp8"], "sm": [80, 86, 89, 90]},
-    # SGLang: the collector times fp8_block GEMMs through DeepGEMM, which has no
-    # SM89 or SM120 kernel, so every case would fail. Serving runs them on
-    # Triton (SM89) and CUTLASS (SM120).
-    {"backend": "sglang", "op": "gemm", "dtype": "fp8_block", "sm": [89, 120]},
     # SGLang: the MoE collector has no per-tensor fp8 path, so every case would
     # fail. Serving runs ModelOpt FP8 checkpoints through ModelOptFp8MoEMethod.
     {"backend": "sglang", "op": "moe", "dtype": "fp8", "sm": [89, 90, 100, 103, 120]},
@@ -325,9 +323,13 @@ SKIPS: list[dict] = [
     {"backend": "trtllm", "model": "MiMoV2FlashForCausalLM"},
     # TRT-LLM cannot serve Muse Glimmer: it registers no model class for it.
     {"backend": "trtllm", "model": "MuseGlimmerForConditionalGeneration"},
-    # TRT-LLM cannot serve GLM-5.3-Flash: it registers no model class for it,
-    # and its mHC collector drives only DeepSeek-V4's module API.
-    {"backend": "trtllm", "model": "Glm5NextForConditionalGeneration"},
+    # TRT-LLM cannot serve GLM-5.3-Flash on the release these ops are pinned to:
+    # it registers no model class for it, and the mHC collector drives only
+    # DeepSeek-V4's module API. The release gemm is pinned to registers it
+    # (_torch/models/modeling_glm5_next.py:400, modeling_glm5_next_vision.py:995),
+    # so gemm is not listed; drop an op from the list when its pin moves to a
+    # release with the class.
+    {"backend": "trtllm", "op": ["moe", "mhc_module", "kda"], "model": "Glm5NextForConditionalGeneration"},
 ]
 
 _RUN_KEYS = frozenset(("backend", "op", "sm"))

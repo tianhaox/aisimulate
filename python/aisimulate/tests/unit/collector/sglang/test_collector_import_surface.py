@@ -304,45 +304,85 @@ class TestCollectMoeImportSurface:
 
 
 # ---------------------------------------------------------------------------
-# collect_gemm.py
+# collect_gemm.py / collect_computescale.py
 # ---------------------------------------------------------------------------
-_GEMM_COMMON_SURFACE = {
-    "sglang.srt.layers.deep_gemm_wrapper": {"DEEPGEMM_SCALE_UE8M0": False, "gemm_nt_f8f8bf16": _dummy},
-    "sglang.srt.layers.quantization.fp8_utils": {"requant_weight_ue8m0": _dummy},
+# The sglang 0.5.23 names each module touches at import time: the serving
+# GEMM entry points and backend initializers in srt/layers/quantization
+# (fp8_utils, fp4_utils, unquant), the fused-op trace in sglang.kernels.fused_op
+# and the SM120 KDA NVFP4 GEMM in sglang.kernels.ops.gemm. The JIT quantization
+# kernels live in sglang.kernels.ops.quantization.fp8_kernel (the 0.5.14
+# srt/layers/quantization/fp8_kernel path is gone).
+SGLANG_0523_GEMM_SURFACE = {
+    "sglang.kernels.fused_op": {
+        "clear_fused_op_trace": _dummy,
+        "disable_fused_op_trace": _dummy,
+        "enable_fused_op_trace": _dummy,
+        "get_fused_op_trace": _dummy,
+    },
+    "sglang.kernels.ops.gemm": {"try_qwen3x_nvfp4_gemm": _dummy},
+    "sglang.srt.layers.quantization.unquant": {
+        "UnquantizedLinearMethod": _Dummy,
+        "initialize_bf16_gemm_config": _dummy,
+    },
+    "sglang.srt.layers.quantization.fp4_utils": {
+        "fp4_quantize": _dummy,
+        "get_fp4_gemm_runner_backend": _dummy,
+        "initialize_fp4_gemm_config": _dummy,
+    },
+    "sglang.srt.layers.quantization.fp8_utils": {
+        "_deepgemm_block_fp8_supported": _dummy,
+        "apply_fp8_linear": _dummy,
+        "cutlass_fp8_supported": _dummy,
+        "cutlass_w8a8_block_fp8_linear_with_fallback": _dummy,
+        "deepgemm_w8a8_block_fp8_linear_with_fallback": _dummy,
+        "dispatch_w8a8_block_fp8_linear": _dummy,
+        "initialize_fp8_gemm_config": _dummy,
+        "requant_block_scale_ue8m0_for_deepgemm": _dummy,
+        "triton_w8a8_block_fp8_linear": _dummy,
+    },
 }
-
-# fp8_kernel.py (sglang_per_token_group_quant_fp8): relocated from
-# srt/layers/quantization/ (0.5.14) to the new top-level
-# sglang.kernels.ops.quantization package (0.5.17).
-SGLANG_0514_GEMM_SURFACE = {
-    **_GEMM_COMMON_SURFACE,
-    "sglang.srt.layers.quantization.fp8_kernel": {"sglang_per_token_group_quant_fp8": _dummy},
-}
-SGLANG_0517_GEMM_SURFACE = {
-    **_GEMM_COMMON_SURFACE,
-    "sglang.kernels.ops.quantization.fp8_kernel": {"sglang_per_token_group_quant_fp8": _dummy},
+SGLANG_0523_COMPUTESCALE_SURFACE = {
+    "sglang.kernels.ops.quantization.fp8_kernel": {
+        "sglang_per_token_quant_fp8": _dummy,
+        "static_quant_fp8": _dummy,
+    },
 }
 
 _COLLECT_GEMM_PATH = COLLECTOR_DIR / "sglang" / "collect_gemm.py"
 _COLLECT_GEMM_DOTTED = "collector.sglang.collect_gemm"
+_COLLECT_COMPUTESCALE_PATH = COLLECTOR_DIR / "sglang" / "collect_computescale.py"
+_COLLECT_COMPUTESCALE_DOTTED = "collector.sglang.collect_computescale"
 # collect_gemm.py does `import torch.nn.functional as F` -- needs real
 # submodule entries in sys.modules, not just attribute access on a mocked
-# `torch`, plus the separate sgl_kernel package it unconditionally imports.
-_GEMM_LENIENT_EXTRAS = ("torch.nn", "torch.nn.functional", "sgl_kernel")
+# `torch`.
+_GEMM_LENIENT_EXTRAS = ("torch.nn", "torch.nn.functional")
 
 
 class TestCollectGemmImportSurface:
-    """gemm ran clean end-to-end on real GPU hardware (per the report this
-    task responds to); these tests are the forward-looking regression guard
-    -- no prefix-code bug to reproduce here, unlike collect_moe.py."""
+    """The forward-looking regression guard for the module-level imports of
+    the GEMM and compute_scale collectors: a name the pinned release moved or
+    dropped fails here instead of at the first GPU task."""
 
-    def test_imports_cleanly_against_0514_shaped_sglang(self, monkeypatch):
-        _install_fake_sglang(monkeypatch, SGLANG_0514_GEMM_SURFACE, lenient_extras=_GEMM_LENIENT_EXTRAS)
-        _import_fresh(monkeypatch, _COLLECT_GEMM_DOTTED, _COLLECT_GEMM_PATH)
+    def test_gemm_imports_cleanly_against_0523_shaped_sglang(self, monkeypatch):
+        _install_fake_sglang(monkeypatch, SGLANG_0523_GEMM_SURFACE, lenient_extras=_GEMM_LENIENT_EXTRAS)
+        module = _import_fresh(monkeypatch, _COLLECT_GEMM_DOTTED, _COLLECT_GEMM_PATH)
+        assert module.__compat__ == "sglang==0.5.23"
 
-    def test_imports_cleanly_against_0517_shaped_sglang(self, monkeypatch):
-        _install_fake_sglang(monkeypatch, SGLANG_0517_GEMM_SURFACE, lenient_extras=_GEMM_LENIENT_EXTRAS)
-        _import_fresh(monkeypatch, _COLLECT_GEMM_DOTTED, _COLLECT_GEMM_PATH)
+    def test_gemm_import_fails_without_the_0523_block_fp8_dispatch(self, monkeypatch):
+        surface = dict(SGLANG_0523_GEMM_SURFACE)
+        surface["sglang.srt.layers.quantization.fp8_utils"] = {
+            name: value
+            for name, value in SGLANG_0523_GEMM_SURFACE["sglang.srt.layers.quantization.fp8_utils"].items()
+            if name != "dispatch_w8a8_block_fp8_linear"
+        }
+        _install_fake_sglang(monkeypatch, surface, lenient_extras=_GEMM_LENIENT_EXTRAS)
+        with pytest.raises(ImportError):
+            _import_fresh(monkeypatch, _COLLECT_GEMM_DOTTED, _COLLECT_GEMM_PATH)
+
+    def test_computescale_imports_cleanly_against_0523_shaped_sglang(self, monkeypatch):
+        _install_fake_sglang(monkeypatch, SGLANG_0523_COMPUTESCALE_SURFACE)
+        module = _import_fresh(monkeypatch, _COLLECT_COMPUTESCALE_DOTTED, _COLLECT_COMPUTESCALE_PATH)
+        assert module.__compat__ == "sglang==0.5.23"
 
 
 # ---------------------------------------------------------------------------
