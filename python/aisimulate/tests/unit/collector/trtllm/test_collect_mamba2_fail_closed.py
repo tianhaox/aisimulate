@@ -149,7 +149,9 @@ def _fake_torch():
     )
 
 
-def _load_runner(name, benchmark_with_power, log_perf, *, ssu_label="selective_state_update_flashinfer"):
+def _load_runner(
+    name, benchmark_with_power, log_perf, *, ssu_label="selective_state_update_flashinfer", token_major=False
+):
     ssu_calls = []
 
     def ssu(*args, **kwargs):
@@ -169,9 +171,9 @@ def _load_runner(name, benchmark_with_power, log_perf, *, ssu_label="selective_s
         "selective_state_update": lambda *args, **kwargs: None,
         "_decode_state_update_kernel": lambda *geometry: (ssu, ssu_label),
         "_decode_dt": lambda batch_size, nheads, head_dim, _device: _Tensor((batch_size, nheads, head_dim)),
-        "_token_major_prefill_conv": lambda: False,
-        "_prefill_conv_token_major_inputs": None,
-        "_run_prefill_conv_token_major": None,
+        "_token_major_prefill_conv": lambda: token_major,
+        "_prefill_conv_token_major_inputs": lambda xbc, b, s, _device: (xbc, xbc, None, None, None),
+        "_run_prefill_conv_token_major": lambda *args: None,
     }
     module = ast.Module(body=[_function(name)], type_ignores=[])
     exec(compile(module, str(SOURCE), "exec"), namespace)
@@ -295,3 +297,12 @@ def test_decode_dt_is_an_fp32_per_head_tensor_broadcast_over_head_dim():
     assert seen["randn"] == ((4, 128), "fp32")
     assert seen["repeat"] == ((4, 128), "b h -> b h p", {"p": 64})
     assert dt.shape == (4, 128, 64)
+
+
+def test_trtllm_mamba2_token_major_context_cells_complete():
+    """The token-major prefill conv frees its channel-major input before timing; at 53a83fcd6
+    the cell cleanup deleted the name again and every context cell raised UnboundLocalError."""
+    benchmark_with_power, log_perf, logged = _failing_on(0)
+    run, _ = _load_runner("run_mamba2_context_benchmark", benchmark_with_power, log_perf, token_major=True)
+    assert run(batch_size_list=[1, 2], seq_len_list=[32], **_LAYER) is None
+    assert logged == ["causal_conv1d_fn_token_major", "mamba_chunk_scan_combined"] * 2

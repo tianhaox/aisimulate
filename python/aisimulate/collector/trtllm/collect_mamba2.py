@@ -291,7 +291,8 @@ def run_mamba2_context_benchmark(
                     x_tm, out_tm, cu_seqlens, cache_idx, has_init = _prefill_conv_token_major_inputs(
                         xbc_input, batch_size, seq_len, device
                     )
-                    del xbc_input
+                    # free the channel-major copy before timing; the cell cleanup deletes the name
+                    xbc_input = None
 
                     def run_conv1d(
                         _x=x_tm, _o=out_tm, _conv_state=conv_state, _cu=cu_seqlens, _ci=cache_idx, _hi=has_init
