@@ -190,6 +190,51 @@ gates:
       fp8; no serving record can exist'}
   repo: deepseek-ai/DeepSeek-V3.2
   kv: fp8
+- gate: gemm_nvfp4_DeepSeek-V3.1-NVFP4
+  backend: vllm
+  op: gemm
+  select: {gemm_type: nvfp4, m: 4096, n: 7168, k: 16384}
+  also:
+  - op: gemm
+    select: {gemm_type: nvfp4, m: 1, n: 7168, k: 16384}
+  repo: nvidia/DeepSeek-V3.1-NVFP4
+  kv: auto
+- gate: gemm_nvfp4_DeepSeek-V3.1-NVFP4
+  backend: sglang
+  op: gemm
+  select: {gemm_type: nvfp4, m: 4096, n: 7168, k: 16384}
+  also:
+  - op: gemm
+    select: {gemm_type: nvfp4, m: 1, n: 7168, k: 16384}
+  repo: nvidia/DeepSeek-V3.1-NVFP4
+  kv: auto
+- gate: gemm_nvfp4_DeepSeek-V3.1-NVFP4
+  backend: trtllm
+  op: gemm
+  select: {gemm_type: nvfp4, m: 4096, n: 7168, k: 16384}
+  also:
+  - op: gemm
+    select: {gemm_type: nvfp4, m: 1, n: 7168, k: 16384}
+  repo: nvidia/DeepSeek-V3.1-NVFP4
+  kv: auto
+- gate: gemm_bf16_Llama-3.1-8B
+  backend: sglang
+  op: gemm
+  select: {gemm_type: bfloat16, m: 4096, n: 4096, k: 4096}
+  also:
+  - op: gemm
+    select: {gemm_type: bfloat16, m: 1, n: 4096, k: 4096}
+  repo: meta-llama/Meta-Llama-3.1-8B
+  kv: auto
+- gate: gemm_bf16_Llama-3.1-8B
+  backend: trtllm
+  op: gemm
+  select: {gemm_type: bfloat16, m: 4096, n: 4096, k: 4096}
+  also:
+  - op: gemm
+    select: {gemm_type: bfloat16, m: 1, n: 4096, k: 4096}
+  repo: meta-llama/Meta-Llama-3.1-8B
+  kv: auto
 - gate: kda_gen_Kimi-K3
   backend: vllm
   op: kda

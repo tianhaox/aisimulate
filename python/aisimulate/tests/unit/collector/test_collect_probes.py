@@ -249,9 +249,9 @@ def test_trace_case_sets_env_arguments_for_the_run_only(monkeypatch, tmp_path):
 
 
 def test_trace_case_refuses_a_release_the_op_does_not_pin(monkeypatch, tmp_path):
-    """vLLM gemm is pinned to 0.31.0 next to a 0.30.0 default: traced in the default image, the
+    """vLLM gemm has a family pin next to the 0.30.0 default: traced in the default image, the
     gate compared another release's kernels than the table's."""
     _fake_torch(monkeypatch, [_Event("gemm_kernel")])
     monkeypatch.setattr(trace_case, "installed_version", lambda backend: "0.30.0")
-    with pytest.raises(RuntimeError, match=r"requires exactly 0\.31\.0, found 0\.30\.0"):
+    with pytest.raises(RuntimeError, match=r"requires exactly (?!0\.30\.0)\d+\.\d+\.\d+, found 0\.30\.0"):
         trace_case.run({"backend": "vllm", "op": "gemm", "m": "1"}, tmp_path)
