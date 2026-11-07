@@ -323,13 +323,31 @@ SKIPS: list[dict] = [
     {"backend": "trtllm", "model": "MiMoV2FlashForCausalLM"},
     # TRT-LLM cannot serve Muse Glimmer: it registers no model class for it.
     {"backend": "trtllm", "model": "MuseGlimmerForConditionalGeneration"},
-    # TRT-LLM cannot serve GLM-5.3-Flash on the release these ops are pinned to:
-    # it registers no model class for it, and the mHC collector drives only
-    # DeepSeek-V4's module API. The release gemm is pinned to registers it
-    # (_torch/models/modeling_glm5_next.py:400, modeling_glm5_next_vision.py:995),
-    # so gemm is not listed; drop an op from the list when its pin moves to a
-    # release with the class.
+    # TRT-LLM cannot serve GLM-5.3-Flash on the release mhc_module and kda are
+    # pinned to: it registers no model class for it, and the mHC collector drives
+    # only DeepSeek-V4's module API. The release gemm and moe are pinned to
+    # registers it (_torch/models/modeling_glm5_next.py:400,
+    # modeling_glm5_next_vision.py:995), so gemm is not listed; drop an op from the
+    # list when its pin moves to a release with the class. moe stays until the
+    # MoE collector builds the GLM-5.3-Flash layer (collect_moe.py has no routing
+    # for the architecture, so every case would fail as a block).
     {"backend": "trtllm", "op": ["moe", "mhc_module", "kda"], "model": "Glm5NextForConditionalGeneration"},
+    # TRT-LLM registers no Step3p7FlashForCausalLM (the Step3p7 text model
+    # registers as "Step3p5ForCausalLM", _torch/models/modeling_step3p7.py:1557),
+    # so serving cannot load it; the MoE collector refuses the architecture.
+    {"backend": "trtllm", "op": "moe", "model": "Step3p7FlashForCausalLM"},
+    # Kimi-K3 on SM100/103 runs TRTLLM-Gen SiTu, which takes only NVFP4 or
+    # W4A8_MXFP4_MXFP8 (KimiK3MoERuntime._check_trtllm_situ_quant,
+    # modeling_kimi_linear.py); its MXFP4 checkpoint loads as W4A8_MXFP4_MXFP8 there
+    # (ModelConfig.get_mxfp4_quant_algo), so a W4A16 row would time a mode serving
+    # does not run.
+    {
+        "backend": "trtllm",
+        "op": "moe",
+        "sm": [100, 103],
+        "moe_type": "w4a16_mxfp4",
+        "model_name": "moonshotai/Kimi-K3",
+    },
 ]
 
 _RUN_KEYS = frozenset(("backend", "op", "sm"))

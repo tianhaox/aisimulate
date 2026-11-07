@@ -38,6 +38,7 @@ frameworks:
       kda: *sglang_0523_runtime
       gemm: *sglang_0523_runtime
       quantize: *sglang_0523_runtime
+      moe: *sglang_0523_runtime
     # Model-scoped collector runtime pins: when the resolved run model_path
     # exactly equals one of these keys, the pin overrides BOTH the family
     # pins above and the framework default for every op in the run — the
@@ -104,13 +105,14 @@ frameworks:
           default: "nvcr.io/nvidia/tensorrt-llm/release:1.4.0rc2@sha256:93a3eaf1fa574813d608a7147735134bcfbd06d18d1aa98e8ee0d5da09e51e3a"
       gemm: *trtllm_140rc2_runtime
       quantize: *trtllm_140rc2_runtime
+      moe: *trtllm_140rc2_runtime
   vllm:
     source_repo: "https://github.com/vllm-project/vllm.git"
     default:
       version: "0.30.0"
       images:
         default: "vllm/vllm-openai:v0.30.0@sha256:8a69ffad015f138d7170c4ddc429e230a3bc1c1719f67e14324749df200a4b90"
-    # moe / mhc / attention moved to vLLM 0.31.0 (gemm and kda since moved on to 0.32.0):
+    # mhc / attention moved to vLLM 0.31.0 (gemm, kda and moe since moved on to 0.32.0):
     # GLM-5.3-Flash collects these families on 0.31.0, and each collector file
     # targets exactly one release, so the families upgrade instead of carrying
     # 0.30.0 and 0.31.0 side by side. A family pin moves the family for every
@@ -118,12 +120,11 @@ frameworks:
     # collectors are `git log` away. Same stock image as the GLM-5.3-Flash
     # model pin below (multi-arch index; amd64 a4a4c043..., arm64 3f7dd5b7...).
     families:
-      moe: &vllm_0310_runtime
+      mhc: &vllm_0310_runtime
         version: "0.31.0"
         source_commit: "db9527a46873454610df6dbedf79a36d6bf1a7f6"
         images:
           default: "vllm/vllm-openai:v0.31.0@sha256:c1c9f6fd5c109ba7f0546a59f5b2f15fb87f64c77782e90a27b648b42a8e67c3"
-      mhc: *vllm_0310_runtime
       attention: *vllm_0310_runtime
       # Op-by-op move to vLLM 0.32.0 (2026-11): a family moves here once its
       # gates align and its source check is done; the default follows the last one.
@@ -135,6 +136,7 @@ frameworks:
       linear_attention: *vllm_0320_runtime
       gemm: *vllm_0320_runtime
       quantize: *vllm_0320_runtime
+      moe: *vllm_0320_runtime
     # kda family pin RETIRED: the family ran on the
     # kimi-k3 preview image (0.1.dev19262) while the consumer's fused-decode
     # pricing did not match 0.27's packed-decode serving path.
@@ -147,7 +149,10 @@ frameworks:
       # default per the pin-consolidation rule: pins BELOW the
       # target version upgrade with it; the kda preview pin (an odd dev-build
       # pin) was revisited at the 0.30.0 move and retired, see above.
-      # moe: the 0.31.0 family pin above is a stock release.
+      # moe: on 0.32.0 with the families above. Kimi-K3 SiTU runs natively
+      # (collect_moe passes the betas; SM100/SM103 serve CutlassExpertsMxfp4,
+      # other SMs MarlinExperts). Rows labeled *_situ_as_silu (0.24.0-0.31.0
+      # tables) timed silu on a forced Marlin path.
       # History: NO family pin (owner decision, reverting a
       # family-wide preview pin — a temporary preview build must
       # not own a family default; a family pin here hijacks image selection

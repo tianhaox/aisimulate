@@ -20,12 +20,8 @@ These tests use STRICT fakes instead: every ``sglang.*`` module is a plain
 touches at import time (module-level, not inside function bodies) --
 ``types.ModuleType`` raises ``AttributeError`` on anything not explicitly
 set, the same failure mode the real framework produces for a genuinely
-absent attribute. Two shapes are modeled, derived from the sweep documented
-in each collect_*.py file's module-level comment blocks: one matching
-sglang 0.5.14's real surface, one matching 0.5.17's. Only the names that
-actually differ between versions are called out per-shape; everything
-unchanged between versions (``FusedMoE``, ``TopK``, ``Fp8Config``, etc.) is
-shared, since re-verifying THEIR existence is not this failure class.
+absent attribute. Each collector's surface is the one of the SGLang release
+it is pinned to; a pin bump replaces it.
 
 ``torch``/``pkg_resources``/``sgl_kernel`` are faked permissively
 (``MagicMock``) -- they are unrelated, always-absent-in-this-venv
@@ -96,13 +92,6 @@ def _raise_unset_server_args():
     raise ValueError("Global server args is not set yet!")
 
 
-_published_server_args = []
-
-
-def _record_server_args(server_args):
-    _published_server_args.append(server_args)
-
-
 def _install_fake_sglang(monkeypatch, specs: dict[str, dict], *, lenient_extras: tuple[str, ...] = ()) -> None:
     # Tests in the same process may already have imported a real or a
     # differently-shaped fake SGLang tree. Purge the whole namespace so
@@ -128,145 +117,71 @@ def _import_fresh(monkeypatch, dotted_name: str, source_path: Path) -> types.Mod
 
 
 # ---------------------------------------------------------------------------
-# collect_moe.py -- the module that actually broke
+# collect_moe.py -- the module that first broke this way
 # ---------------------------------------------------------------------------
-_MOE_COMMON_SURFACE = {
+# The sglang 0.5.23 names collect_moe.py touches at import time: the
+# runtime-context publish and pin primitives, the FusedMoE/TopK layer modules,
+# the Triton runner and its config module (observed for tuned-config hits), the
+# FlashInfer runner modules and the quant methods whose parallel bindings the
+# collector replaces, and the quant configs it builds. The Triton MoE kernels
+# live in sglang.kernels.ops.moe (the 0.5.14 srt/layers/moe/moe_runner path is
+# gone), and runtime_context has no bare _global_server_args.
+_published_moe_server_args: list = []
+
+
+def _record_moe_publish(server_args, *, role):
+    _published_moe_server_args.append((server_args, role))
+
+
+SGLANG_0523_MOE_SURFACE = {
+    "sglang.srt.runtime_context": {
+        "get_exec": _dummy,
+        "get_flags": _dummy,
+        "get_server_args": _raise_unset_server_args,
+        "publish": _record_moe_publish,
+    },
+    "sglang.srt.server_args": {"ServerArgs": _ServerArgsDummy},
+    "sglang.kernels.ops.moe.fused_moe_triton_kernels": {"_B_DESC_CACHE": {}},
     "sglang.srt.layers.moe.fused_moe_triton.layer": {"FusedMoE": _Dummy},
-    "sglang.srt.layers.moe.token_dispatcher.standard": {},
-    "sglang.srt.layers.moe.topk": {
-        "StandardTopKOutput": _Dummy,
-        "TopK": _Dummy,
-        "TopKConfig": _Dummy,
-        "TopKOutputFormat": _Dummy,
-        "select_experts": _dummy,
-    },
-    "sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_mxint4_moe": {},
-    "sglang.srt.layers.quantization.fp8": {"Fp8Config": _Dummy},
-    "sglang.srt.layers.quantization.modelopt_quant": {
-        "ModelOptFp4Config": _Dummy,
-        "ModelOptFp8Config": _Dummy,
-    },
-    "sglang.srt.layers.quantization.mxfp4": {"Mxfp4Config": _Dummy},
-    "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe": {"fused_moe": _dummy},
+    "sglang.srt.layers.moe.moe_runner.flashinfer_cutlass": {},
+    "sglang.srt.layers.moe.moe_runner.flashinfer_trtllm": {},
+    "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe": {},
     "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config": {
-        "get_config_dtype_str": _dummy,
         "get_default_config": _dummy,
         "get_moe_configs": _dummy,
     },
-    "sglang.srt.layers.moe.moe_runner.base": {"MoeRunnerConfig": _Dummy},
-    "sglang.srt.layers.quantization.compressed_tensors.compressed_tensors": {"CompressedTensorsConfig": _Dummy},
-    "sglang.srt.utils": {"is_hip": _dummy},
-}
-
-# sglang.srt.server_args: 0.5.14 has a bare `_global_server_args` module
-# global; 0.5.17 replaces it with get_global_server_args()/
-# set_global_server_args_for_scheduler()/ServerArgs (server_args.py:
-# 9294-9316) and drops the bare global entirely.
-# sglang.srt.runtime_context: 0.5.14's 227-line file exposes only
-# get_context/get_parallel (no _server_args slot on the RuntimeContext it
-# returns -- confirmed by reading the whole file, not just grepping, after
-# an earlier version of this fix wrongly assumed get_context alone was a
-# safe version probe); 0.5.17 adds get_flags/get_exec/get_server_args.
-# fused_moe_triton_kernels: relocated from srt/layers/moe/moe_runner/
-# triton_utils/ (0.5.14) to the new top-level sglang.kernels.ops.moe
-# package (0.5.17).
-# layers.moe.utils: MOE_RUNNER_BACKEND (0.5.14 bare global, gone at 0.5.17)
-# -- not touched at import time either way, included for completeness.
-SGLANG_0514_MOE_SURFACE = {
-    **_MOE_COMMON_SURFACE,
-    "sglang.srt.server_args": {"_global_server_args": None},
-    "sglang.srt.runtime_context": {"get_context": _dummy, "get_parallel": _dummy},
-    "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels": {"_B_DESC_CACHE": {}},
-    "sglang.srt.layers.moe.utils": {
-        "MoeRunnerBackend": _Dummy,
-        "RoutingMethodType": _Dummy,
-        "MOE_RUNNER_BACKEND": None,
-    },
-}
-
-SGLANG_0517_MOE_SURFACE = {
-    **_MOE_COMMON_SURFACE,
-    "sglang.srt.server_args": {
-        "ServerArgs": _ServerArgsDummy,
-        "get_global_server_args": _dummy,
-        "set_global_server_args_for_scheduler": _record_server_args,
-        "set_global_server_args_for_tokenizer": _dummy,
-        # Deliberately NO _global_server_args -- the whole bug.
-    },
-    "sglang.srt.runtime_context": {
-        "get_context": _dummy,
-        "get_parallel": _dummy,
-        "get_flags": _dummy,
-        "get_exec": _dummy,
-        "get_server_args": _raise_unset_server_args,
-    },
-    "sglang.kernels.ops.moe.fused_moe_triton_kernels": {"_B_DESC_CACHE": {}},
+    "sglang.srt.layers.moe.token_dispatcher.standard": {},
+    "sglang.srt.layers.moe.topk": {"TopK": _Dummy},
     "sglang.srt.layers.moe.utils": {"MoeRunnerBackend": _Dummy, "RoutingMethodType": _Dummy},
+    "sglang.srt.layers.quantization.compressed_tensors.compressed_tensors": {"CompressedTensorsConfig": _Dummy},
+    "sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_mxint4_moe": {},
+    "sglang.srt.layers.quantization.fp8": {"Fp8Config": _Dummy},
+    "sglang.srt.layers.quantization.modelopt_quant": {"ModelOptFp4Config": _Dummy},
+    "sglang.srt.layers.quantization.mxfp4": {"Mxfp4Config": _Dummy},
+    "sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe": {},
 }
 
 _COLLECT_MOE_PATH = COLLECTOR_DIR / "sglang" / "collect_moe.py"
 _COLLECT_MOE_DOTTED = "collector.sglang.collect_moe"
 
-# Verbatim pre-fix excerpt: collector/sglang/collect_moe.py lines 60-86 at
-# commit f5b49140a581809b3031775883fc1c2e55132c96 (the commit immediately
-# before the server_args fix), truncated right after the module-level
-# `_global_server_args` mock block whose bare attribute read (line 78
-# there) is the exact statement that crashed the first real-GPU 0.5.17 run.
-# "vs 0.5.14-shaped" on this exact pre-fix code proves the bug is
-# 0.5.17-specific, not a general break. Embedded as a string constant
-# instead of a `git show` read: that commit is a branch-head object that
-# squash-merge-only main and base-branch rebases leave unreachable on fresh
-# clones -- this test's `git show` hard-errored in CI with
-# CalledProcessError 128 after a base-branch rebase orphaned the pinned
-# commit.
-_PRE_FIX_MOE_SNIPPET = """\
-import gc
-import importlib
-import itertools
-import os
-import tempfile
-from contextlib import contextmanager
-from pathlib import Path
-from types import SimpleNamespace
-from typing import TypedDict
-from unittest.mock import MagicMock
-
-import pkg_resources
-
-# Mock global server args before importing MOE modules (required by SGLang 0.5.5+)
-# The fused_moe_triton_config module now requires get_global_server_args() to be set
-import sglang.srt.server_args as _server_args_module
-import torch
-
-if _server_args_module._global_server_args is None:
-    _mock_server_args = MagicMock()
-    _mock_server_args.enable_deterministic_inference = False
-    _mock_server_args.enable_fused_moe_sum_all_reduce = (
-        False  # SGLang 0.5.14; prevents fused all-reduce in single-GPU benchmarks
-    )
-    _mock_server_args.kt_weight_path = None
-    _mock_server_args.flashinfer_mxfp4_moe_precision = "default"
-    _server_args_module._global_server_args = _mock_server_args
-"""
-
 
 class TestCollectMoeImportSurface:
-    def test_imports_cleanly_against_0514_shaped_sglang(self, monkeypatch):
-        _install_fake_sglang(monkeypatch, SGLANG_0514_MOE_SURFACE)
+    def test_imports_cleanly_against_0523_shaped_sglang(self, monkeypatch):
+        _install_fake_sglang(monkeypatch, SGLANG_0523_MOE_SURFACE)
+        module = _import_fresh(monkeypatch, _COLLECT_MOE_DOTTED, _COLLECT_MOE_PATH)
+        assert module._triton_config_namespaces() == [
+            sys.modules["sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config"]
+        ]
+
+    def test_unset_server_args_are_published_as_the_scheduler_publishes_them(self, monkeypatch):
+        _published_moe_server_args.clear()
+        _install_fake_sglang(monkeypatch, SGLANG_0523_MOE_SURFACE)
+
         _import_fresh(monkeypatch, _COLLECT_MOE_DOTTED, _COLLECT_MOE_PATH)
 
-    def test_imports_cleanly_against_0517_shaped_sglang(self, monkeypatch):
-        _install_fake_sglang(monkeypatch, SGLANG_0517_MOE_SURFACE)
-        _import_fresh(monkeypatch, _COLLECT_MOE_DOTTED, _COLLECT_MOE_PATH)
-
-    def test_0517_unset_server_args_are_constructed_and_published(self, monkeypatch):
-        _published_server_args.clear()
-        _install_fake_sglang(monkeypatch, SGLANG_0517_MOE_SURFACE)
-
-        _import_fresh(monkeypatch, _COLLECT_MOE_DOTTED, _COLLECT_MOE_PATH)
-
-        assert len(_published_server_args) == 1
-        published = _published_server_args[0]
+        assert len(_published_moe_server_args) == 1
+        published, role = _published_moe_server_args[0]
+        assert role == "scheduler"
         assert published.args == ()
         assert published.kwargs == {
             "model_path": "dummy",
@@ -276,31 +191,30 @@ class TestCollectMoeImportSurface:
             "flashinfer_mxfp4_moe_precision": "default",
         }
 
-    def test_0517_shaped_fake_reproduces_the_real_bug_on_prefix_code(self, monkeypatch, tmp_path):
-        """Proves red on a scratch revert, per the review's explicit ask:
-        exec the embedded verbatim pre-fix excerpt (_PRE_FIX_MOE_SNIPPET)
-        against the exact same 0.5.17-shaped fake the tests above use, and
-        confirm it fails with the exact real-world AttributeError -- not an
-        assumption about what "should" happen."""
-        scratch_file = tmp_path / "collect_moe.py"
-        scratch_file.write_text(_PRE_FIX_MOE_SNIPPET)
+    def test_a_record_already_published_in_the_process_is_kept(self, monkeypatch):
+        _published_moe_server_args.clear()
+        surface = dict(SGLANG_0523_MOE_SURFACE)
+        surface["sglang.srt.runtime_context"] = {
+            **SGLANG_0523_MOE_SURFACE["sglang.srt.runtime_context"],
+            "get_server_args": lambda: object(),
+        }
+        _install_fake_sglang(monkeypatch, surface)
 
-        _install_fake_sglang(monkeypatch, SGLANG_0517_MOE_SURFACE)
+        _import_fresh(monkeypatch, _COLLECT_MOE_DOTTED, _COLLECT_MOE_PATH)
 
-        with pytest.raises(AttributeError, match="_global_server_args"):
-            _import_fresh(monkeypatch, _COLLECT_MOE_DOTTED, scratch_file)
+        assert _published_moe_server_args == []
 
-    def test_prefix_code_was_fine_against_0514_shaped_sglang(self, monkeypatch, tmp_path):
-        """Companion to the test above: the pre-fix code was never broken in
-        general, only against 0.5.17's shape -- confirms the bug (and this
-        regression test) is version-specific, not a false alarm that would
-        have failed either way."""
-        scratch_file = tmp_path / "collect_moe.py"
-        scratch_file.write_text(_PRE_FIX_MOE_SNIPPET)
-
-        _install_fake_sglang(monkeypatch, SGLANG_0514_MOE_SURFACE)
-
-        _import_fresh(monkeypatch, _COLLECT_MOE_DOTTED, scratch_file)
+    def test_import_fails_on_the_retired_kernel_location(self, monkeypatch):
+        """The 0.5.14 Triton MoE kernel module location is not a fallback any more."""
+        surface = {
+            name: attrs
+            for name, attrs in SGLANG_0523_MOE_SURFACE.items()
+            if name != "sglang.kernels.ops.moe.fused_moe_triton_kernels"
+        }
+        surface["sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels"] = {"_B_DESC_CACHE": {}}
+        _install_fake_sglang(monkeypatch, surface)
+        with pytest.raises(ImportError):
+            _import_fresh(monkeypatch, _COLLECT_MOE_DOTTED, _COLLECT_MOE_PATH)
 
 
 # ---------------------------------------------------------------------------

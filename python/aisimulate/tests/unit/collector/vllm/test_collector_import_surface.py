@@ -154,6 +154,17 @@ VLLM_0271_MOE_SURFACE = {
     **_MOE_COMMON_SURFACE,
     "vllm.model_executor.layers.fused_moe.layer": {"FusedMoEFactory": _dummy},
 }
+# The surface collect_moe.py targets (vLLM 0.32.0): FusedMoEFactory with no
+# FusedMoE fallback, MoEActivation for the non-gated ckpt_names
+# (fused_moe/activation.py:21,47-54,72), and the platform/FlashInfer helpers
+# its warmup-autotune parity reads (platforms/interface.py:531,
+# utils/flashinfer.py:88).
+VLLM_0320_MOE_SURFACE = {
+    **VLLM_0271_MOE_SURFACE,
+    "vllm.model_executor.layers.fused_moe.activation": {"MoEActivation": _Dummy},
+    "vllm.platforms": {"current_platform": _Dummy()},
+    "vllm.utils.flashinfer": {"has_flashinfer": _dummy},
+}
 
 _COLLECT_MOE_PATH = COLLECTOR_DIR / "vllm" / "collect_moe.py"
 _COLLECT_MOE_DOTTED = "collector.vllm.collect_moe"
@@ -218,16 +229,22 @@ def run_moe_torch(
 
 
 class TestCollectMoeImportSurface:
-    def test_imports_cleanly_against_0240_shaped_vllm(self, monkeypatch):
-        _install_fake_vllm(monkeypatch, VLLM_0240_MOE_SURFACE)
+    def test_imports_cleanly_against_0320_shaped_vllm(self, monkeypatch):
+        _install_fake_vllm(monkeypatch, VLLM_0320_MOE_SURFACE)
         module = _import_fresh(monkeypatch, _COLLECT_MOE_DOTTED, _COLLECT_MOE_PATH)
         with pytest.raises(ValueError, match=_SENTINEL_MATCH):
             module.run_moe_torch(*_SENTINEL_ARGS, **_SENTINEL_KWARGS)
 
-    def test_imports_cleanly_against_0271_shaped_vllm(self, monkeypatch):
-        _install_fake_vllm(monkeypatch, VLLM_0271_MOE_SURFACE)
+    def test_one_release_per_file_drops_the_fusedmoe_fallback(self, monkeypatch):
+        """collect_moe.py targets one release: a FusedMoE-only (0.24.0-shaped)
+        layer module no longer resolves, instead of silently binding the
+        pre-rename name."""
+        _install_fake_vllm(
+            monkeypatch,
+            {**VLLM_0320_MOE_SURFACE, "vllm.model_executor.layers.fused_moe.layer": {"FusedMoE": _dummy}},
+        )
         module = _import_fresh(monkeypatch, _COLLECT_MOE_DOTTED, _COLLECT_MOE_PATH)
-        with pytest.raises(ValueError, match=_SENTINEL_MATCH):
+        with pytest.raises(ImportError, match="FusedMoEFactory"):
             module.run_moe_torch(*_SENTINEL_ARGS, **_SENTINEL_KWARGS)
 
     def test_0271_shaped_fake_reproduces_a_break_on_prefix_code(self, monkeypatch, tmp_path):
@@ -272,7 +289,7 @@ class TestCollectMoeImportSurface:
         ``_moe_execution_key() -> _resolve_moe_runtime_config()``
         (collect_moe.py:321 -> :251 -> :113) DURING CASE ENUMERATION,
         before any per-case classified-failure handling applies."""
-        _install_fake_vllm(monkeypatch, VLLM_0271_MOE_SURFACE)
+        _install_fake_vllm(monkeypatch, VLLM_0320_MOE_SURFACE)
         module = _import_fresh(monkeypatch, _COLLECT_MOE_DOTTED, _COLLECT_MOE_PATH)
         with pytest.raises(FileNotFoundError, match=re.escape("RadixArk/Qwen3.8-2.4T-A95B-NVFP4")):
             module._load_model_moe_config("RadixArk/Qwen3.8-2.4T-A95B-NVFP4")
@@ -281,7 +298,7 @@ class TestCollectMoeImportSurface:
         """Companion: the base bf16 id and its packaged -FP8 alias id both
         DO have a packaged config (proves the RadixArk gap above is a real,
         specific absence, not a general fixture problem)."""
-        _install_fake_vllm(monkeypatch, VLLM_0271_MOE_SURFACE)
+        _install_fake_vllm(monkeypatch, VLLM_0320_MOE_SURFACE)
         module = _import_fresh(monkeypatch, _COLLECT_MOE_DOTTED, _COLLECT_MOE_PATH)
         for model_name in ("Qwen/Qwen3.8-2.4T-A95B", "Qwen/Qwen3.8-2.4T-A95B-FP8"):
             config = module._load_model_moe_config(model_name)
@@ -305,7 +322,9 @@ _GEMM_SURFACE = {
         "CompressedTensorsConfig": _Dummy
     },
     "vllm.model_executor.layers.quantization.fp8": {"Fp8Config": _Dummy},
+    "vllm.platforms": {"current_platform": _Dummy()},
     "vllm.utils.deep_gemm": {"per_block_cast_to_fp8": _dummy},
+    "vllm.utils.flashinfer": {"has_flashinfer": _dummy},
 }
 
 _COLLECT_GEMM_PATH = COLLECTOR_DIR / "vllm" / "collect_gemm.py"
