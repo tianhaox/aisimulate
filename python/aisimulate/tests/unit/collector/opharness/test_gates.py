@@ -151,3 +151,19 @@ def test_a_gate_reads_only_its_own_backends_trace(gates, tmp_path):
     assert gates._trace(dirs, name, "vllm", "0.32.0").parent.parent.name == "vllm-0.32.0"
     assert gates._trace(dirs, name, "vllm", "0.33.0").parent.parent.name.startswith("vllm-")
     assert gates._trace(dirs[:1], name, "vllm", "0.32.0") is None
+
+
+def test_a_gate_reads_only_traces_from_its_own_sm(gates, tmp_path):
+    """Shard names repeat across systems: grading sm90 once read the B200 trace of the same shard."""
+    name = "gemm_bf16_Llama-3.1-8B"
+    for system, sm in (("b200_sxm", 100), ("h100_sxm", 90), ("h100_failed", None)):
+        shard = tmp_path / system / f"{gates.SHARD_OP}__{name}"
+        shard.mkdir(parents=True)
+        result = {"framework_version": "0.32.0", **({"sm": sm} if sm is not None else {})}
+        (shard / "probe_trace_case.json").write_text(json.dumps({"args": {"backend": "vllm"}, "result": result}))
+    dirs = sorted(tmp_path.iterdir())
+    assert gates._trace(dirs, name, "vllm", "0.32.0", 90).parent.parent.name == "h100_sxm"
+    assert gates._trace(dirs, name, "vllm", "0.32.0", 100).parent.parent.name == "b200_sxm"
+    # a trace that died before recording its SM is used only when no attributed one exists
+    assert gates._trace(dirs, name, "vllm", "0.32.0", 103).parent.parent.name == "h100_failed"
+    assert gates._trace([tmp_path / "b200_sxm"], name, "vllm", "0.32.0", 90) is None
