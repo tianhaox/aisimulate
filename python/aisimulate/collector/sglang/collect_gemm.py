@@ -70,6 +70,7 @@ from collector.helper import (
     get_sm_version,
     log_perf,
 )
+from collector.sglang.runtime_limits import decode_autotune_max_tokens
 from sglang.kernels.fused_op import (
     clear_fused_op_trace,
     disable_fused_op_trace,
@@ -136,34 +137,14 @@ def _ensure_serving_gemm_config() -> None:
 
 
 def _decode_autotune_max_tokens() -> int:
-    """The largest token count SGLang's default warm-up tunes FlashInfer ops at.
+    """The largest token count SGLang's default warm-up tunes FlashInfer GEMMs at.
 
-    Warm-up runs one decode-shaped dummy forward at the decode CUDA-graph max
-    batch size under autotune (base_runner.py:279-285,
-    decode_cuda_graph_runner.py:704-716, flashinfer_autotune.py:354-362); the
-    extend-shaped pass at the prefill token ceiling is opt-in
-    (SGLANG_FLASHINFER_AUTOTUNE_EXTEND, srt/environ.py:1282;
-    flashinfer_autotune.py:412-443). FlashInfer profiles mm_fp4 at the hybrid
-    buckets up to that dummy's m (flashinfer 0.7.2 autotuner/autotuner.py:
-    3282-3285, gemm/gemm_base.py:9073-9101). The default batch size follows GPU memory
-    (srt/arg_groups/memory_hook.py:89-180, MiB from
-    srt/utils/common.py:990-1017) for the tp_size 1 of the ServerArgs
-    _ensure_serving_gemm_config publishes.
+    The decode warm-up dummy's batch size (runtime_limits.decode_autotune_max_tokens)
+    for the tp_size 1 of the ServerArgs _ensure_serving_gemm_config publishes.
+    FlashInfer profiles mm_fp4 at the hybrid buckets up to that dummy's m
+    (flashinfer 0.7.2 autotuner/autotuner.py:3282-3285, gemm/gemm_base.py:9073-9101).
     """
-    from sglang.srt.utils.common import get_device_memory_capacity
-
-    gpu_mem = get_device_memory_capacity()
-    if gpu_mem is None:
-        return 160
-    if gpu_mem < 20 * 1024:
-        return 8
-    if gpu_mem < 35 * 1024:
-        return 48
-    if gpu_mem < 60 * 1024:
-        return 32
-    if gpu_mem < 160 * 1024:
-        return 256
-    return 512
+    return decode_autotune_max_tokens(tp_size=1)
 
 
 def cdiv(a: int, b: int) -> int:

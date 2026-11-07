@@ -52,8 +52,13 @@ def _load_guard(sm_version: int, installed_version: str = "0.5.23"):
         ("w4a16_mxfp4", 90),
         ("w4a16_mxfp4", 100),
         ("w4a16_mxfp4", 103),
+        # Kimi-K3 W4A16 on SM120: auto resolves Mxfp4MoEMethod to Triton.
+        ("w4a16_mxfp4", 120),
         ("w4a8_mxfp4_mxfp8", 100),
         ("w4a8_mxfp4_mxfp8", 103),
+        # SM120 GPT-OSS and DeepSeek-V4 FP4 experts: flashinfer_mxfp4 on the
+        # CUTLASS MXFP8 x MXFP4 kernel.
+        ("w4a8_mxfp4_mxfp8", 120),
     ],
 )
 def test_guard_accepts_traced_lanes(moe_type, sm_version):
@@ -63,11 +68,7 @@ def test_guard_accepts_traced_lanes(moe_type, sm_version):
 @pytest.mark.parametrize(
     ("moe_type", "sm_version"),
     [
-        # SM120 GPT-OSS serves flashinfer_mxfp4 on the CUTLASS MXFP8 x MXFP4 leaf,
-        # not the Marlin W4A16 runner the plan declares there.
-        ("w4a16_mxfp4", 120),
         ("w4a8_mxfp4_mxfp8", 90),
-        ("w4a8_mxfp4_mxfp8", 120),
     ],
 )
 def test_guard_rejects_untraced_lanes(moe_type, sm_version):

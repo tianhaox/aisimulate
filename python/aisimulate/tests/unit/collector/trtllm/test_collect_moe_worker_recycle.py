@@ -312,15 +312,17 @@ def test_moe_sweep_tunes_as_serving_warmup_then_measures_every_requested_shape()
     sweep.run()
 
     model_config = sweep.builder.call_args.kwargs["model_config"]
-    # A deployment running 65536 tokens through the layer has max_num_tokens >= 65536.
-    assert model_config.max_num_tokens == model_config.moe_max_num_tokens == 65536
+    # Tuned as a default deployment (max_num_tokens 8192, which bounds both MoE
+    # tunings); the sweep's largest shape still runs in one chunk.
+    assert model_config.max_num_tokens == 8192
+    assert model_config.moe_max_num_tokens == 65536
     assert model_config.moe_backend == "CUTLASS"
     assert sweep.resolved == [("AUTO", "Qwen3MoeForCausalLM", "bfloat16")]
     assert sweep.builder.call_args.kwargs["allow_backend_degradation"] is True
     # post_load_weights first, then serving's warmup (max_num_tokens, then 1) under
     # autotune(), then one graph measurement per requested shape.
     assert sweep.calls == (
-        [("post_load", None, None), ("tuning", 65536, True), ("tuning", 1, True)]
+        [("post_load", None, None), ("tuning", 8192, True), ("tuning", 1, True)]
         + [("measurement", n, True) for n in tokens]
     )
     assert sweep.tune_paths == ["/tune/sm100_trtllm9.9_bfloat16_h4096_i1024_e4_k2.json"]
@@ -356,11 +358,13 @@ def test_qwen3_routing_output_dtype_is_read_back_from_the_bound_backend():
 
 @pytest.mark.parametrize("stage", ["tuning", "measurement"])
 def test_moe_sweep_propagates_large_shape_failure_without_smaller_substitution(stage):
-    sweep = _run_sweep([2, 32768, 65536], fail_stage=stage, fail_tokens=65536)
+    # Tuning forwards serving's max_num_tokens (8192); measurement every requested shape.
+    fail_tokens = 8192 if stage == "tuning" else 65536
+    sweep = _run_sweep([2, 32768, 65536], fail_stage=stage, fail_tokens=fail_tokens)
     with pytest.raises(RuntimeError, match="native shape failed") as caught:
         sweep.run()
     assert caught.value is sweep.failure
-    assert sweep.calls[-1] == (stage, 65536, True)
+    assert sweep.calls[-1] == (stage, fail_tokens, True)
     # Measurement failures preserve only genuinely measured earlier rows.
     assert [row["num_tokens"] for row, _ in sweep.rows] == ([2, 32768] if stage == "measurement" else [])
 

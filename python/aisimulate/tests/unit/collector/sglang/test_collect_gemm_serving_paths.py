@@ -595,26 +595,40 @@ def test_nvfp4_above_the_decode_warmup_runs_untuned_like_serving():
 
 
 @pytest.mark.parametrize(
-    ("gpu_mem_mib", "expected"),
+    ("gpu_mem_mib", "tp_size", "expected"),
     [
-        (None, 160),
-        (16 * 1024, 8),
-        (32 * 1024, 48),
-        (48 * 1024, 32),
-        (80 * 1024, 256),
-        (97_887, 256),  # RTX PRO 6000 Blackwell, tp_size 1
-        (183_359, 512),  # B200
-        (288 * 1024, 512),  # B300
+        (None, 1, (4096, 160)),
+        (16 * 1024, 1, (2048, 8)),
+        (32 * 1024, 1, (4096, 48)),
+        (32 * 1024, 4, (4096, 160)),
+        (48 * 1024, 1, (4096, 32)),
+        (48 * 1024, 8, (4096, 160)),
+        (80 * 1024, 1, (8192, 256)),
+        (97_887, 1, (8192, 256)),  # RTX PRO 6000 Blackwell
+        (97_887, 4, (8192, 512)),
+        (144_000, 8, (8192, 512)),  # H200
+        (183_359, 1, (16384, 512)),  # B200
+        (288 * 1024, 2, (16384, 512)),  # B300
     ],
 )
-def test_decode_autotune_ceiling_follows_sglang_memory_defaults(monkeypatch, gpu_mem_mib, expected):
-    namespace = _run_gemm_namespace([], [])
+def test_serving_memory_defaults_follow_sglang_memory_table(monkeypatch, gpu_mem_mib, tp_size, expected):
+    from collector.sglang import runtime_limits
+
     common = types.ModuleType("sglang.srt.utils.common")
     common.get_device_memory_capacity = lambda: gpu_mem_mib
     for name in ("sglang", "sglang.srt", "sglang.srt.utils"):
         monkeypatch.setitem(sys.modules, name, sys.modules.get(name) or types.ModuleType(name))
     monkeypatch.setitem(sys.modules, "sglang.srt.utils.common", common)
-    assert namespace["_decode_autotune_max_tokens"]() == expected
+    assert runtime_limits.serving_memory_defaults(tp_size) == expected
+    assert runtime_limits.decode_autotune_max_tokens(tp_size) == expected[1]
+
+
+def test_gemm_decode_ceiling_is_the_tp1_warmup_batch():
+    namespace = _run_gemm_namespace([], [])
+    calls = []
+    namespace["decode_autotune_max_tokens"] = lambda tp_size: calls.append(tp_size) or 256
+    assert namespace["_decode_autotune_max_tokens"]() == 256
+    assert calls == [1]
 
 
 def test_nvfp4_kda_path_is_labelled_kda():

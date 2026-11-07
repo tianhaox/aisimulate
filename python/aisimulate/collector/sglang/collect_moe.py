@@ -45,6 +45,23 @@ point of its sweep on one layer build.
 #   (gemma4_fused_routing, models/gemma4_causal.py:251-283); the case row has
 #   no custom-routing field, so the table times the plain softmax top-k
 #   (select_experts). Both are one small routing kernel per forward.
+# - GPT-OSS W4A16 on SM89/90 at EP1: serving runs the triton_kernel runner
+#   (model_overrides/gpt_oss.py:100-117; sglang-kernel ships triton_kernels,
+#   kernels/aot/CMakeLists.txt:548-553), and Triton only at EP>1. The case
+#   dispatch is per quant mode and SM (cases/base_ops/moe.yaml), so the EP1
+#   rows time the Triton runner on BF16-upcast experts. Direction unknown.
+#   Retire it with an EP-aware dispatch for this lane.
+# - MiniMax-M3: serving hands the routed scaling factor to TopK only, applied
+#   to the top-k weights (apply_routed_scaling_factor_on_output=True), and
+#   builds FusedMoE without it and with gate_up_interleaved=False
+#   (models/minimax_m3.py:421-452). The row has one scaling field, which this
+#   collector passes to both, and no interleave field: the table times the
+#   factor where the runner applies it and the interleaved SwiGLU-alpha
+#   epilogue (on Triton, swiglu_gpt_oss_sigmoid_alpha instead of
+#   swiglu_no_interleaved_with_alpha_and_limit, moe_runner/triton_utils/
+#   fused_moe.py:741-756). Both are elementwise work on the MoE output or the
+#   intermediate; the GEMMs are serving's. Retire it with row fields for the
+#   scaling placement and the gate/up layout.
 __compat__ = "sglang==0.5.23"
 
 import contextlib
@@ -57,12 +74,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
-from collector.case_generator import get_moe_quantization_module_config
+from collector.case_generator import get_moe_quantization_module_config, moe_model_layer
 from collector.helper import (
     WORKER_RESTART,
     balanced_logits,
     benchmark_with_power,
     flashinfer_autotuned,
+    flashinfer_tuning_bucket,
     get_sm_version,
     log_perf,
     power_law_logits_v3,
@@ -70,6 +88,7 @@ from collector.helper import (
 from collector.op_plans import plan_cases
 from collector.sglang.moe_config_observation import append_record as append_triton_config_record
 from collector.sglang.moe_config_observation import observe_triton_config_selection
+from collector.sglang.runtime_limits import serving_memory_defaults
 from sglang.srt.runtime_context import get_exec, get_flags, get_server_args, publish
 from sglang.srt.server_args import ServerArgs
 
@@ -118,7 +137,7 @@ import sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tens
 import sglang.srt.layers.quantization.fp8 as _fp8_mod
 import sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe as _mxfp4_trtllm_mod
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, RoutingMethodType
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
@@ -162,8 +181,58 @@ _KERNEL_SOURCE_BY_RUNNER = {
     "triton_kernel": "sglang_triton_kernel_moe",
     "marlin": "sglang_marlin_moe",
     "flashinfer_trtllm": "sglang_flashinfer_trtllm_moe",
+    # The routed TRT-LLM-gen runner: the router's top-k is materialized and the
+    # kernel takes precomputed ids (moe_runner/flashinfer_trtllm.py:1845-1876);
+    # NVFP4 shares the trtllm weight prep (modelopt_quant.py:2389-2392, 3237-3243).
+    "flashinfer_trtllm_routed": "sglang_flashinfer_trtllm_routed_moe",
     "flashinfer_cutlass": "sglang_flashinfer_cutlass_moe",
 }
+
+# FlashInfer's MoE ops profile every bucket of their own list,
+# get_hybrid_num_tokens_buckets(tune_max_num_tokens), in one tuning call whatever
+# the call's m: the list is a static tuple (flashinfer 0.7.2
+# fused_moe/shared/tuning.py:303-309, fused_moe/core.py:970-981), which the tuner
+# takes as is and profiles in full (autotuner/autotuner.py:3282-3287, 2331-2332).
+# A lookup maps m to the next bucket up, capped at the tune_max_num_tokens of
+# that call (helper.flashinfer_tuning_bucket). SGLang's default warm-up calls each
+# op in one decode dummy forward (runtime_limits.decode_autotune_max_tokens), so
+# the tuned list depends on what the runner passes as tune_max_num_tokens:
+# - the TRT-LLM-gen runners (flashinfer_trtllm and _routed, the SM100 MXFP4 leaf,
+#   the DeepSeek-V4 FP4 TRT-LLM method, MXINT4) pass next_power_of_2(m)
+#   (moe_runner/flashinfer_trtllm.py:821, 1007, 1067, 1247, 1298, 1333, 1588,
+#   1642, 1780, 1808; mxfp4_flashinfer_trtllm_moe.py:521;
+#   compressed_tensors_w4a4_mxint4_moe.py:361). Warm-up tunes the buckets up to
+#   next_power_of_2(batch size); a run-time m maps to its own bucket (its cap
+#   next_power_of_2(m) never binds), and past that list runs FlashInfer's
+#   fallback tactic. GLM-5.3-Flash on these runners also tunes its experts at the
+#   prefill chunk (models/glm5_next.py:1503-1531; flashinfer_autotune.py:412-443).
+# - The CUTLASS runner (flashinfer_cutlass, the SM90 / SM120 MXFP4 leaves, the
+#   DeepSeek-V4 FP4 CUTLASS method) passes min(chunked prefill size, 8192) on
+#   every call (moe_runner/flashinfer_cutlass.py:168-181, 388, 610): warm-up
+#   tunes every bucket up to it, and m at or above it runs its tactic.
+_CUTLASS_MOE_DEFAULT_TUNE_MAX_NUM_TOKENS = 8192
+_PREFILL_AUTOTUNED_MOE_ARCHITECTURES = frozenset({"Glm5NextForConditionalGeneration"})
+_PREFILL_AUTOTUNED_MOE_RUNNERS = frozenset({"flashinfer_trtllm", "flashinfer_trtllm_routed"})
+
+
+def _flashinfer_moe_tuning_bucket(
+    num_tokens: int, *, kernel_source: str, moe_backend: str, tp_size: int, architecture: str | None
+) -> int | None:
+    """The bucket serving's warm-up tuned the tactic of an m-token MoE call for, or None (untuned).
+
+    ``tp_size`` is the serving world (moe_tp x moe_ep), which sets the default
+    decode batch size; ``kernel_source`` names the runner family (CUTLASS or
+    TRT-LLM-gen) the built layer runs.
+    """
+    chunked_prefill_size, decode_batch_size = serving_memory_defaults(tp_size)
+    if "cutlass" in kernel_source:
+        tune_max = min(chunked_prefill_size, _CUTLASS_MOE_DEFAULT_TUNE_MAX_NUM_TOKENS)
+        return flashinfer_tuning_bucket(num_tokens, tune_max, tune_max_num_tokens=tune_max)
+    warmup_tokens = decode_batch_size
+    if architecture in _PREFILL_AUTOTUNED_MOE_ARCHITECTURES and moe_backend in _PREFILL_AUTOTUNED_MOE_RUNNERS:
+        warmup_tokens = max(warmup_tokens, chunked_prefill_size)
+    return flashinfer_tuning_bucket(num_tokens, 1 << (warmup_tokens - 1).bit_length())
+
 
 # Mxfp4MoEMethod runs flashinfer_mxfp4 on one of three FlashInfer leaves by GPU
 # (srt/layers/quantization/mxfp4.py:420-437): trtllm-gen on SM100/103, the
@@ -405,6 +474,7 @@ def _benchmark_moe_layer(
     apply_router_weight_on_input: bool,
     is_fp4_experts: bool,
     int4_group_size: int,
+    architecture: str | None,
     device: str,
 ) -> str:
     """Build one SGLang FusedMoE + TopK and time every token point on it.
@@ -421,6 +491,10 @@ def _benchmark_moe_layer(
     serving_autotunes = (
         moe_backend in _SERVING_AUTOTUNED_MOE_RUNNERS and torch.cuda.get_device_capability(device)[0] >= 9
     )
+    # Kimi-K3's SiTU experts load w1/w3 non-interleaved and its TopK materializes
+    # the top-k on the FlashInfer runners (models/kimi_k3.py:505-551); every other
+    # row keeps FusedMoE's interleaved default and the format bind_runner_backend picks.
+    situ = activation == "situ"
     moe_layer = None
     try:
         with (
@@ -449,6 +523,7 @@ def _benchmark_moe_layer(
                 routing_method_type=routing_method,
                 routed_scaling_factor=routed_scaling_factor,
                 apply_router_weight_on_input=apply_router_weight_on_input,
+                gate_up_interleaved=not situ,
             ).to(device)
             with torch.no_grad():
                 for name, parameter in moe_layer.named_parameters():
@@ -489,6 +564,11 @@ def _benchmark_moe_layer(
                         routed_scaling_factor is not None and moe_layer.should_fuse_routed_scaling_factor_in_topk
                     ),
                     is_fp4_experts=is_fp4_experts,
+                    output_format=(
+                        TopKOutputFormat.STANDARD
+                        if situ and moe_backend in ("flashinfer_mxfp4", "flashinfer_trtllm")
+                        else None
+                    ),
                 )
             # A model binds its router to the built experts, which picks the TopK
             # output format: kernel-side routing (bypassed) only where the
@@ -531,20 +611,34 @@ def _benchmark_moe_layer(
                         moe_layer(hidden_states, topk_layer(hidden_states, router_logits))
 
                 tune = contextlib.nullcontext()
-                if serving_autotunes:
+                tune_tokens = (
+                    _flashinfer_moe_tuning_bucket(
+                        num_tokens,
+                        kernel_source=kernel_source,
+                        moe_backend=moe_backend,
+                        tp_size=moe_tp_size * moe_ep_size,
+                        architecture=architecture,
+                    )
+                    if serving_autotunes
+                    else None
+                )
+                if tune_tokens is not None:
                     # Serving tunes FlashInfer ops under autotune(True) plus
                     # autotune_v2(mode="tune", persistent_cache=False), where
                     # FlashInfer's default tactic races the candidates
-                    # (flashinfer_autotune.py:354-362). The tuning pass profiles
-                    # this point's real routing, then the timed runs look the
-                    # tactic up (helper.flashinfer_autotuned).
-                    def tune_fn(num_tokens=num_tokens, kernel_func=kernel_func):
+                    # (flashinfer_autotune.py:354-362). The pass profiles the
+                    # bucket serving tuned this point's tactic at
+                    # (_flashinfer_moe_tuning_bucket), then the timed runs look
+                    # it up (helper.flashinfer_autotuned). A point past the
+                    # warm-up's list runs untuned, on FlashInfer's fallback
+                    # tactic, as serving does.
+                    def tune_fn(tune_tokens=tune_tokens, kernel_func=kernel_func):
                         from flashinfer import autotune_v2
 
-                        with autotune_v2(mode="tune", persistent_cache=False, tuning_buckets=(num_tokens,)):
+                        with autotune_v2(mode="tune", persistent_cache=False, tuning_buckets=(tune_tokens,)):
                             kernel_func()
 
-                    tune = flashinfer_autotuned(num_tokens, tune_fn, label=kernel_source)
+                    tune = flashinfer_autotuned(tune_tokens, tune_fn, label=kernel_source)
                 with (
                     tune,
                     benchmark_with_power(
@@ -576,17 +670,30 @@ def _benchmark_moe_layer(
 #   scheme; every other CUDA SM keeps auto and builds the Marlin WNA16 scheme
 #   (srt/layers/quantization/compressed_tensors/compressed_tensors.py:911-951).
 # - w4a16_mxfp4: GPT-OSS on SM100/103 serves flashinfer_mxfp4
-#   (srt/arg_groups/model_overrides/gpt_oss.py:64-68) on the trtllm-gen leaf;
-#   SM89/90 keep auto, which Mxfp4MoEMethod resolves to Triton
-#   (srt/layers/quantization/mxfp4.py:1443-1450) unless the image ships
-#   triton_kernels (gpt_oss.py:100-117). SM120 GPT-OSS serves flashinfer_mxfp4
-#   (gpt_oss.py:69-74) on the CUTLASS MXFP8 x MXFP4 leaf (mxfp4.py:426-427), an
-#   MXFP8-activation kernel, not the Marlin W4A16 the plan declares there.
-# - w4a8_mxfp4_mxfp8: the trtllm-gen MXFP4 x MXFP8 leaf, SM100/103 only.
+#   (srt/arg_groups/model_overrides/gpt_oss.py:64-68) on the trtllm-gen leaf.
+#   On SM89/90 an EP>1 GPT-OSS server keeps auto, which Mxfp4MoEMethod resolves
+#   to Triton (srt/layers/quantization/mxfp4.py:1443-1450) on experts upcast to
+#   BF16 at load (:1115-1133); an EP1 server runs triton_kernel (gpt_oss.py:
+#   100-117), because sglang-kernel installs the triton_kernels package
+#   (kernels/aot/CMakeLists.txt:548-553; is_triton_kernels_available,
+#   srt/utils/common.py:4814-4815). The plan's per-SM pin cannot follow the EP
+#   split: see the GPT-OSS deviation note in this file's header. Kimi-K3 keeps
+#   auto off SM100/103/107 (model_overrides/kimi_k3.py:172-190), so SM89, SM90
+#   and SM120 serve it on the same Triton path, SiTU applied from gemm1_alpha /
+#   gemm1_clamp_limit (moe_runner/triton.py:162-170, 208-215;
+#   triton_utils/fused_moe.py:825-834). SM120 GPT-OSS runs the MXFP8 x MXFP4
+#   lane below (collector/skips.py).
+# - w4a8_mxfp4_mxfp8: the trtllm-gen MXFP4 x MXFP8 leaf on SM100/103 and the
+#   CUTLASS MXFP8 x MXFP4 kernel on SM120, which flashinfer_mxfp4 serves there for
+#   GPT-OSS (gpt_oss.py:69-74; Mxfp4MoEMethod's cutlass_sm120 leaf, mxfp4.py:
+#   426-427, quantizes activations to MXFP8, moe_runner/flashinfer_cutlass.py:
+#   541-548) and for the DeepSeek-V4 FP4 experts
+#   (model_overrides/deepseek_v4.py:75-88; Mxfp4FlashinferCutlassMoEMethod
+#   scales activations to MXFP8 on SM120, mxfp4_flashinfer_cutlass_moe.py:36-44).
 _VERIFIED_LANE_SMS = {
     "int4_wo": frozenset({89, 90, 100, 103, 120}),
-    "w4a16_mxfp4": frozenset({89, 90, 100, 103}),
-    "w4a8_mxfp4_mxfp8": frozenset({100, 103}),
+    "w4a16_mxfp4": frozenset({89, 90, 100, 103, 120}),
+    "w4a8_mxfp4_mxfp8": frozenset({100, 103, 120}),
 }
 
 
@@ -665,6 +772,7 @@ def run_moe_torch(
         "triton_kernel",
         "marlin",
         "flashinfer_trtllm",
+        "flashinfer_trtllm_routed",
         "flashinfer_cutlass",
         "flashinfer_mxfp4",
     }:
@@ -847,6 +955,7 @@ def run_moe_torch(
             apply_router_weight_on_input=apply_router_weight_on_input,
             is_fp4_experts=is_fp4_experts,
             int4_group_size=int4_group_size,
+            architecture=moe_model_layer(model_name, hidden_size, inter_size, topk, num_experts).architecture,
             device=device,
         )
 

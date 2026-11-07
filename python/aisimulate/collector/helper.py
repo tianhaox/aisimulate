@@ -1017,26 +1017,38 @@ def _flashinfer_autotune_api():
     return autotune, AutoTuner
 
 
-def flashinfer_tuning_bucket(num_tokens: int, max_tuned_tokens: int | None = None) -> int | None:
+def flashinfer_tuning_bucket(
+    num_tokens: int, max_tuned_tokens: int | None = None, *, tune_max_num_tokens: int | None = None
+) -> int | None:
     """The token count serving's FlashInfer warm-up tuned the tactic it runs at ``num_tokens`` for.
 
     FlashInfer's MoE and FP4 GEMM ops map a runtime token count up to the next bucket of
     its hybrid list at lookup (``map_to_hybrid_bucket_uncapped``, flashinfer 0.7.0.post1
     fused_moe/utils.py:276-291, the ``map_to_tuning_buckets`` of mm_fp4,
-    gemm/gemm_base.py:7887-7915). The MoE ops clamp that bucket to their
-    tune_max_num_tokens (fused_moe/shared/tuning.py:304-308, core.py:938-946), which
-    this function does not model: it matches them only for counts up to that clamp.
-    Serving warm-up profiles the hybrid list up to
-    ``max_tuned_tokens`` (``get_hybrid_num_tokens_buckets``, fused_moe/utils.py:195-242,
-    which appends that maximum; both functions are unchanged at 0.7.2, which SGLang
-    0.5.23 pins). Returns ``None`` when ``num_tokens`` maps past the
-    profiled list: serving has no tuned entry there and runs the op's fallback tactic.
-    ``max_tuned_tokens=None`` means serving profiles every count the caller times.
-    Callers pass the result to :func:`flashinfer_autotuned` and time ``num_tokens``.
+    gemm/gemm_base.py:7887-7915). The MoE ops clamp that bucket to the
+    ``tune_max_num_tokens`` the caller hands them (``make_hybrid_bucket_mapper`` ->
+    ``map_to_hybrid_bucket``, fused_moe/utils.py:245-273; fused_moe/shared/tuning.py:
+    304-308, core.py:938-946), so every count at or above it runs the tactic of that
+    bucket: pass the op's ``tune_max_num_tokens`` to model it, or ``None`` for an op
+    whose mapper is uncapped (mm_fp4, the cute-dsl MoE). Serving warm-up profiles the
+    hybrid list up to ``max_tuned_tokens`` (``get_hybrid_num_tokens_buckets``,
+    fused_moe/utils.py:195-242, which appends that maximum; these functions are
+    unchanged at 0.7.2, which SGLang 0.5.23 pins). Returns ``None`` when ``num_tokens``
+    maps to a bucket off the profiled list: serving has no tuned entry there and runs
+    the op's fallback tactic. ``max_tuned_tokens=None`` means serving profiles every
+    bucket the caller times. Callers pass the result to :func:`flashinfer_autotuned`
+    and time ``num_tokens``.
     """
-    from flashinfer.fused_moe.utils import get_hybrid_num_tokens_buckets, map_to_hybrid_bucket_uncapped
+    from flashinfer.fused_moe.utils import (
+        get_hybrid_num_tokens_buckets,
+        map_to_hybrid_bucket,
+        map_to_hybrid_bucket_uncapped,
+    )
 
-    bucket = map_to_hybrid_bucket_uncapped(int(num_tokens))
+    if tune_max_num_tokens is None:
+        bucket = map_to_hybrid_bucket_uncapped(int(num_tokens))
+    else:
+        bucket = map_to_hybrid_bucket(int(num_tokens), int(tune_max_num_tokens))
     if max_tuned_tokens is None or bucket in get_hybrid_num_tokens_buckets(int(max_tuned_tokens)):
         return bucket
     return None

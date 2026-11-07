@@ -46,6 +46,9 @@ def _load_functions(*names: str, namespace: dict | None = None) -> dict:
         "_triton_config_namespaces": lambda: [],
         "observe_triton_config_selection": observe_triton_config_selection,
         "append_triton_config_record": lambda *_args, **_kwargs: None,
+        # The architecture only widens SGLang's FlashInfer tuning range
+        # (test_collect_moe_serving_paths.py covers it).
+        "moe_model_layer": lambda *_args: SimpleNamespace(architecture=None),
         **(namespace or {}),
     }
     exec(compile(ast.Module(body=selected, type_ignores=[]), str(SOURCE_PATH), "exec"), loaded)
@@ -391,19 +394,59 @@ def test_case_generator_preserves_representative_sglang_moe_runtime_contracts():
     assert "num_expert_group=num_expert_group" in source
 
 
-def test_sm120_population_gates_w4a8_and_keeps_w4a16_marlin():
-    # SGLang's w4a8_mxfp4_mxfp8 runner has no verified SM120 pin
-    # (collector/skips.py), so the plan leaves that region out on
-    # SM120 while the w4a16_mxfp4 slice runs on Marlin.
+def test_sm120_population_runs_gptoss_as_w4a8_and_skips_w4a16():
+    # SGLang serves GPT-OSS MXFP4 on SM120 as MXFP8 x MXFP4 on flashinfer_mxfp4
+    # (gpt_oss.py:69-74, mxfp4.py:426-427) and no W4A16 lane (collector/skips.py),
+    # so only the w4a8_mxfp4_mxfp8 slice is planned there.
     populated = _populate_gptoss_cases(
         [_gptoss_case(tp=1, ep=1)],
         sm_version=120,
         allowed_mode={"w4a16_mxfp4", "w4a8_mxfp4_mxfp8"},
-        resolved_backend="marlin",
     )
 
+    assert {case[0] for case in populated} == {"w4a8_mxfp4_mxfp8"}
+    assert all(case[12] == "flashinfer_mxfp4" for case in populated)
+
+
+def _k3_case():
+    k3 = _gptoss_case(tp=1, ep=1)
+    k3.model_name = "moonshotai/Kimi-K3"
+    return k3
+
+
+def test_sm120_population_keeps_kimi_k3_w4a16_and_skips_its_mxfp8_activations():
+    # Kimi-K3 keeps auto on SM120 (kimi_k3.py:172-190): Mxfp4MoEMethod's Triton
+    # runner on BF16-upcast experts, so only the W4A16 slice is served.
+    populated = _populate_gptoss_cases(
+        [_k3_case()], sm_version=120, allowed_mode={"w4a16_mxfp4", "w4a8_mxfp4_mxfp8"}, resolved_backend="triton"
+    )
     assert {case[0] for case in populated} == {"w4a16_mxfp4"}
-    assert all(case[12] == "marlin" for case in populated)
+    assert all(case[12] == "triton" for case in populated)
+
+
+def test_kimi_k3_row_carries_serving_situ_and_triton_pins():
+    from collector.case_generator import get_common_moe_test_cases, get_sglang_moe_backend
+
+    k3 = next(case for case in get_common_moe_test_cases() if case.model_name == "moonshotai/Kimi-K3")
+    # models/kimi_k3.py:503-521: activation=config.hidden_act, the SiTU betas as gemm1.
+    assert (k3.sglang_moe_activation, k3.sglang_moe_gemm1_alpha, k3.sglang_moe_gemm1_clamp_limit) == (
+        "situ",
+        4.0,
+        25.0,
+    )
+    # auto off SM100/103/107 resolves Mxfp4MoEMethod to Triton (mxfp4.py:1443-1450).
+    assert [get_sglang_moe_backend(k3, "w4a16_mxfp4", sm) for sm in (89, 90, 120)] == ["triton"] * 3
+    assert get_sglang_moe_backend(k3, "w4a8_mxfp4_mxfp8", 100) == "flashinfer_mxfp4"
+
+
+@pytest.mark.parametrize("sm_version", [100, 103])
+def test_sm100_population_runs_kimi_k3_as_w4a8_only(sm_version):
+    # SM100/103 serve K3 on flashinfer_mxfp4 at the default precision, MXFP8
+    # activations (fields/exec_.py:892-897, moe_runner/flashinfer_trtllm.py:1145-1166).
+    populated = _populate_gptoss_cases(
+        [_k3_case()], sm_version=sm_version, allowed_mode={"w4a16_mxfp4", "w4a8_mxfp4_mxfp8"}
+    )
+    assert {case[0] for case in populated} == {"w4a8_mxfp4_mxfp8"}
 
 
 @pytest.mark.parametrize(("tp", "ep"), [(4, 8), (32, 1), (32, 8)])
@@ -430,6 +473,7 @@ def test_gptoss_mxfp4_population_retains_tp_and_ep_buckets(tp, ep):
         ("w4a16_mxfp4", 90, "triton"),
         ("w4a16_mxfp4", 120, "marlin"),
         ("w4a8_mxfp4_mxfp8", 100, "flashinfer_mxfp4"),
+        ("w4a8_mxfp4_mxfp8", 120, "flashinfer_mxfp4"),
     ],
 )
 def test_yaml_backend_map_matches_sglang_0514(mode, sm_version, expected):

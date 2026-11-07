@@ -13,9 +13,11 @@ pinned SGLang release that the timed path depends on:
   them;
 * TopK is bound to the built experts (``TopK.bind_runner_backend``) with no
   explicit output format, as a model binds it, which is what picks bypassed
-  versus materialized routing;
+  versus materialized routing; Kimi-K3's SiTU experts materialize it and load
+  gate/up non-interleaved, as models/kimi_k3.py builds them;
 * FlashInfer runners are tuned like serving's warm-up (``autotune_v2`` inside
-  the tuning pass), other runners are not tuned;
+  the tuning pass) at the bucket serving tuned, untuned past the warm-up's
+  list, and other runners are not tuned;
 * the row's kernel source comes from the runner FusedMoE resolved.
 """
 
@@ -124,6 +126,7 @@ class _FakeLayer:
     def __init__(self, record, **kwargs):
         self.record = record
         self.kwargs = kwargs
+        record.append(("layer_init", kwargs))
         self.runner_backend = SimpleNamespace(value=kwargs["_backend"])
         self.routing_method_type = "resolved-routing"
         self.should_fuse_routed_scaling_factor_in_topk = True
@@ -156,10 +159,39 @@ class _FakeTopK:
         return "topk-output"
 
 
-def _run_layer_benchmark(monkeypatch, *, moe_backend, capability_major, routing_method_type=None, num_tokens=(4, 8)):
+def _pow2_tuning_bucket(calls):
+    """helper.flashinfer_tuning_bucket for counts up to 256, where FlashInfer's hybrid
+    bucket is the next power of 2; records how the collector asked."""
+
+    def tuning_bucket(num_tokens, max_tuned_tokens=None, *, tune_max_num_tokens=None):
+        calls.append((num_tokens, max_tuned_tokens, tune_max_num_tokens))
+        bucket = 1 << (num_tokens - 1).bit_length()
+        if tune_max_num_tokens is not None:
+            bucket = min(bucket, tune_max_num_tokens)
+        return bucket if max_tuned_tokens is None or bucket <= max_tuned_tokens else None
+
+    return tuning_bucket
+
+
+def _run_layer_benchmark(
+    monkeypatch,
+    *,
+    moe_backend,
+    capability_major,
+    routing_method_type=None,
+    num_tokens=(4, 8),
+    activation="silu",
+    architecture=None,
+    memory_defaults=(16384, 512),
+    kernel_source=None,
+    moe_tp_size=1,
+    moe_ep_size=2,
+):
     record = []
     tuned = []
     v2_contexts = []
+    bucket_calls = []
+    memory_calls = []
 
     @contextlib.contextmanager
     def autotune_v2(**kwargs):
@@ -194,15 +226,20 @@ def _run_layer_benchmark(monkeypatch, *, moe_backend, capability_major, routing_
     loaded = _load(
         "_benchmark_moe_layer",
         "_SERVING_AUTOTUNED_MOE_RUNNERS",
+        "_flashinfer_moe_tuning_bucket",
+        "_CUTLASS_MOE_DEFAULT_TUNE_MAX_NUM_TOKENS",
+        "_PREFILL_AUTOTUNED_MOE_ARCHITECTURES",
+        "_PREFILL_AUTOTUNED_MOE_RUNNERS",
         namespace={
             "torch": fake_torch,
             "gc": SimpleNamespace(collect=lambda: None),
             "FusedMoE": lambda **kwargs: _FakeLayer(record, _backend=moe_backend, **kwargs),
             "TopK": lambda **kwargs: _FakeTopK(record, **kwargs),
+            "TopKOutputFormat": SimpleNamespace(STANDARD="standard"),
             "MoeRunnerBackend": lambda value: value,
             "RoutingMethodType": {"Renormalize": "Renormalize", "DeepSeekV3": "DeepSeekV3"},
             "_quant_config": lambda *_args, **_kwargs: None,
-            "_kernel_source": lambda *_args, **_kwargs: f"sglang_{moe_backend}",
+            "_kernel_source": lambda *_args, **_kwargs: kernel_source or f"sglang_{moe_backend}",
             "_mxfp4_activation_precision": lambda _moe_type: "default",
             "_ensure_writable_flashinfer_cubin_dir": lambda: None,
             "_pin_moe_runner_backend": no_op,
@@ -213,6 +250,8 @@ def _run_layer_benchmark(monkeypatch, *, moe_backend, capability_major, routing_
             "power_law_logits_v3": lambda *_args: SimpleNamespace(to=lambda **_kwargs: "logits"),
             "benchmark_with_power": benchmark_with_power,
             "flashinfer_autotuned": flashinfer_autotuned,
+            "flashinfer_tuning_bucket": _pow2_tuning_bucket(bucket_calls),
+            "serving_memory_defaults": lambda tp_size: memory_calls.append(tp_size) or memory_defaults,
         },
     )
     rows = []
@@ -225,11 +264,11 @@ def _run_layer_benchmark(monkeypatch, *, moe_backend, capability_major, routing_
         inter_size=128,
         topk=2,
         num_experts=8,
-        moe_tp_size=1,
-        moe_ep_size=2,
+        moe_tp_size=moe_tp_size,
+        moe_ep_size=moe_ep_size,
         distributed="balanced",
         power_law_alpha=0.0,
-        activation="silu",
+        activation=activation,
         is_gated=True,
         has_bias=False,
         gemm1_alpha=None,
@@ -245,9 +284,18 @@ def _run_layer_benchmark(monkeypatch, *, moe_backend, capability_major, routing_
         apply_router_weight_on_input=False,
         is_fp4_experts=False,
         int4_group_size=128,
+        architecture=architecture,
         device="cuda:0",
     )
-    return source, record, tuned, v2_contexts, rows
+    return SimpleNamespace(
+        source=source,
+        record=record,
+        tuned=tuned,
+        v2_contexts=v2_contexts,
+        rows=rows,
+        bucket_calls=bucket_calls,
+        memory_calls=memory_calls,
+    )
 
 
 @pytest.mark.parametrize(
@@ -255,16 +303,19 @@ def _run_layer_benchmark(monkeypatch, *, moe_backend, capability_major, routing_
     [("Renormalize", "resolved-routing"), (None, None)],
 )
 def test_topk_is_bound_to_the_built_experts_like_a_model(monkeypatch, routing_method_type, bound_routing):
-    source, record, _tuned, _v2, rows = _run_layer_benchmark(
+    run = _run_layer_benchmark(
         monkeypatch, moe_backend="flashinfer_trtllm", capability_major=10, routing_method_type=routing_method_type
     )
+    source, record, rows = run.source, run.record, run.rows
 
     events = [event[0] for event in record]
     # One build for the sweep: weights processed once, TopK built and bound once, then forwards.
     assert events.count("process_weights") == 1 and events.count("topk_init") == 1
     assert events.index("process_weights") < events.index("topk_init") < events.index("bind")
     (topk_kwargs,) = [event[1] for event in record if event[0] == "topk_init"]
-    assert "output_format" not in topk_kwargs
+    assert topk_kwargs["output_format"] is None
+    (layer_kwargs,) = [event[1] for event in record if event[0] == "layer_init"]
+    assert layer_kwargs["gate_up_interleaved"] is True
     assert [event[1:] for event in record if event[0] == "bind"] == [("flashinfer_trtllm", bound_routing)]
     assert source == "sglang_flashinfer_trtllm"
     # Five router inputs per timed call: the row is per forward.
@@ -272,15 +323,97 @@ def test_topk_is_bound_to_the_built_experts_like_a_model(monkeypatch, routing_me
 
 
 def test_flashinfer_runners_are_tuned_like_serving_warmup(monkeypatch):
-    _source, _record, tuned, v2_contexts, _rows = _run_layer_benchmark(
-        monkeypatch, moe_backend="flashinfer_trtllm", capability_major=10
-    )
+    run = _run_layer_benchmark(monkeypatch, moe_backend="flashinfer_trtllm", capability_major=10, num_tokens=(3, 8))
 
-    assert tuned == [(4, "sglang_flashinfer_trtllm"), (8, "sglang_flashinfer_trtllm")]
-    assert v2_contexts == [
+    # m=3 runs the tactic of its bucket, 4; the pass profiles that bucket.
+    assert run.tuned == [(4, "sglang_flashinfer_trtllm"), (8, "sglang_flashinfer_trtllm")]
+    assert run.v2_contexts == [
         {"mode": "tune", "persistent_cache": False, "tuning_buckets": (4,)},
         {"mode": "tune", "persistent_cache": False, "tuning_buckets": (8,)},
     ]
+    # The serving world is moe_tp x moe_ep; TRT-LLM-gen runners map uncapped and
+    # are tuned up to next_power_of_2 of the decode warm-up batch.
+    assert set(run.memory_calls) == {2}
+    assert run.bucket_calls == [(3, 512, None), (8, 512, None)]
+
+
+def test_trtllm_gen_points_past_the_decode_warmup_run_untuned(monkeypatch):
+    run = _run_layer_benchmark(
+        monkeypatch,
+        moe_backend="flashinfer_trtllm",
+        capability_major=10,
+        num_tokens=(160, 200),
+        memory_defaults=(8192, 160),
+    )
+
+    # Warm-up m=160 hands FlashInfer tune_max 256, so 200 (bucket 256) is tuned too.
+    assert run.bucket_calls == [(160, 256, None), (200, 256, None)]
+    assert [entry[0] for entry in run.tuned] == [256, 256]
+
+    run = _run_layer_benchmark(
+        monkeypatch,
+        moe_backend="flashinfer_trtllm",
+        capability_major=10,
+        num_tokens=(64, 128),
+        memory_defaults=(8192, 64),
+    )
+    assert [entry[0] for entry in run.tuned] == [64]
+    assert [row[0] for row in run.rows] == [64, 128]
+
+
+def test_cutlass_runner_is_tuned_up_to_its_prefill_cap(monkeypatch):
+    run = _run_layer_benchmark(
+        monkeypatch,
+        moe_backend="flashinfer_cutlass",
+        capability_major=12,
+        num_tokens=(4, 200),
+        memory_defaults=(16384, 512),
+    )
+    # min(chunked prefill, 8192) is both the warm-up list's top and the lookup cap.
+    assert run.bucket_calls == [(4, 8192, 8192), (200, 8192, 8192)]
+
+    run = _run_layer_benchmark(
+        monkeypatch,
+        moe_backend="flashinfer_mxfp4",
+        capability_major=12,
+        num_tokens=(200,),
+        memory_defaults=(4096, 32),
+        kernel_source="sglang_flashinfer_cutlass_moe",
+    )
+    assert run.bucket_calls == [(200, 4096, 4096)]
+
+
+def test_glm53_flash_trtllm_experts_are_also_tuned_at_the_prefill_chunk(monkeypatch):
+    run = _run_layer_benchmark(
+        monkeypatch,
+        moe_backend="flashinfer_trtllm",
+        capability_major=10,
+        num_tokens=(4,),
+        memory_defaults=(16384, 512),
+        architecture="Glm5NextForConditionalGeneration",
+    )
+    assert run.bucket_calls == [(4, 16384, None)]
+
+    run = _run_layer_benchmark(
+        monkeypatch,
+        moe_backend="flashinfer_mxfp4",
+        capability_major=10,
+        num_tokens=(4,),
+        memory_defaults=(16384, 512),
+        architecture="Glm5NextForConditionalGeneration",
+        kernel_source="sglang_mxfp4_flashinfer_trtllm_moe",
+    )
+    assert run.bucket_calls == [(4, 512, None)]
+
+
+@pytest.mark.parametrize(("moe_backend", "standard"), [("flashinfer_mxfp4", True), ("marlin", False)])
+def test_situ_experts_load_non_interleaved_and_materialize_topk_on_flashinfer(monkeypatch, moe_backend, standard):
+    run = _run_layer_benchmark(monkeypatch, moe_backend=moe_backend, capability_major=10, activation="situ")
+
+    (topk_kwargs,) = [event[1] for event in run.record if event[0] == "topk_init"]
+    assert topk_kwargs["output_format"] == ("standard" if standard else None)
+    (layer_kwargs,) = [event[1] for event in run.record if event[0] == "layer_init"]
+    assert layer_kwargs["gate_up_interleaved"] is False
 
 
 @pytest.mark.parametrize(
@@ -288,12 +421,10 @@ def test_flashinfer_runners_are_tuned_like_serving_warmup(monkeypatch):
     [("triton", 10), ("marlin", 9), ("flashinfer_cutlass", 8)],
 )
 def test_runners_serving_does_not_tune_are_timed_untuned(monkeypatch, moe_backend, capability_major):
-    _source, _record, tuned, v2_contexts, rows = _run_layer_benchmark(
-        monkeypatch, moe_backend=moe_backend, capability_major=capability_major
-    )
+    run = _run_layer_benchmark(monkeypatch, moe_backend=moe_backend, capability_major=capability_major)
 
-    assert tuned == [] and v2_contexts == []
-    assert [row[0] for row in rows] == [4, 8]
+    assert run.tuned == [] and run.v2_contexts == [] and run.bucket_calls == []
+    assert [row[0] for row in run.rows] == [4, 8]
 
 
 # ---------------------------------------------------------------------------

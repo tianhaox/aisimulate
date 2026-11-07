@@ -79,10 +79,44 @@ SKIPS: list[dict] = [
     {"backend": "sglang", "op": "moe", "dtype": "fp8", "sm": [89, 90, 100, 103, 120]},
     # SGLang: a MoE case runs on the runner serving picks, pinned per quant mode
     # and SM in cases/base_ops/moe.yaml (moe_sglang.backends). int4_wo has no pin
-    # on SM80/86 and w4a8_mxfp4_mxfp8 none on SM120, so these cases would time a
-    # guessed runner.
+    # on SM80/86, so these cases would time a guessed runner.
     {"backend": "sglang", "op": "moe", "dtype": "int4_wo", "sm": [80, 86]},
-    {"backend": "sglang", "op": "moe", "dtype": "w4a8_mxfp4_mxfp8", "sm": [120]},
+    # SGLang serves GPT-OSS MXFP4 on SM120 on flashinfer_mxfp4
+    # (arg_groups/model_overrides/gpt_oss.py:69-74), whose SM120 leaf quantizes
+    # activations to MXFP8 (layers/quantization/mxfp4.py:426-427,
+    # moe_runner/flashinfer_cutlass.py:541-548): the w4a8_mxfp4_mxfp8 cases. A
+    # W4A16 case would time a mode serving does not run.
+    {
+        "backend": "sglang",
+        "op": "moe",
+        "dtype": "w4a16_mxfp4",
+        "sm": [120],
+        "model_name": ["openai/gpt-oss-20b", "openai/gpt-oss-120b"],
+    },
+    # SGLang serves Kimi-K3 on SM120 with BF16 activations: its flashinfer_mxfp4
+    # default is SM100/103/107 only (model_overrides/kimi_k3.py:172-190), and auto
+    # resolves Mxfp4MoEMethod to the Triton runner on upcast BF16 experts
+    # (mxfp4.py:1443-1450, 1115-1133). An MXFP8-activation case would time a mode
+    # serving does not run.
+    {
+        "backend": "sglang",
+        "op": "moe",
+        "dtype": "w4a8_mxfp4_mxfp8",
+        "sm": [120],
+        "model_name": "moonshotai/Kimi-K3",
+    },
+    # SGLang serves Kimi-K3 on SM100/103 on flashinfer_mxfp4 (kimi_k3.py:172-190)
+    # at the default precision, which quantizes activations to MXFP8 on the
+    # trtllm-gen leaf (arg_groups/fields/exec_.py:892-897,
+    # moe_runner/flashinfer_trtllm.py:1145-1166): the w4a8_mxfp4_mxfp8 cases. A
+    # W4A16 case (BF16 activations) would time a mode serving does not run.
+    {
+        "backend": "sglang",
+        "op": "moe",
+        "dtype": "w4a16_mxfp4",
+        "sm": [100, 103],
+        "model_name": "moonshotai/Kimi-K3",
+    },
     # TRT-LLM has no MoE implementation for int4_wo (W4A16) on any SM: building
     # the layer rejects every case.
     {"backend": "trtllm", "op": "moe", "dtype": "int4_wo", "sm": [80, 86, 89, 90, 100, 103, 120]},
@@ -327,11 +361,10 @@ SKIPS: list[dict] = [
     # pinned to: it registers no model class for it, and the mHC collector drives
     # only DeepSeek-V4's module API. The release gemm and moe are pinned to
     # registers it (_torch/models/modeling_glm5_next.py:400,
-    # modeling_glm5_next_vision.py:995), so gemm is not listed; drop an op from the
-    # list when its pin moves to a release with the class. moe stays until the
-    # MoE collector builds the GLM-5.3-Flash layer (collect_moe.py has no routing
-    # for the architecture, so every case would fail as a block).
-    {"backend": "trtllm", "op": ["moe", "mhc_module", "kda"], "model": "Glm5NextForConditionalGeneration"},
+    # modeling_glm5_next_vision.py:995) and the MoE collector builds its layer
+    # (Glm5NextMoE), so neither is listed; drop an op from the list when its pin
+    # moves to a release with the class.
+    {"backend": "trtllm", "op": ["mhc_module", "kda"], "model": "Glm5NextForConditionalGeneration"},
     # TRT-LLM registers no Step3p7FlashForCausalLM (the Step3p7 text model
     # registers as "Step3p5ForCausalLM", _torch/models/modeling_step3p7.py:1557),
     # so serving cannot load it; the MoE collector refuses the architecture.

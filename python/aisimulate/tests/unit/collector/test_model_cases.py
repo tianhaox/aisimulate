@@ -680,8 +680,9 @@ def test_gptoss_mxfp4_modes_are_additive_on_blackwell(monkeypatch):
     for backend in ("sglang", "trtllm"):
         assert _planned_moe_modes(monkeypatch, backend, model_path, 90) == {"w4a16_mxfp4"}, backend
         assert _planned_moe_modes(monkeypatch, backend, model_path, 100) == {"w4a16_mxfp4", "w4a8_mxfp4_mxfp8"}, backend
-    # SM120: SGLang has no verified w4a8 runner pin (collector/skips.py).
-    assert _planned_moe_modes(monkeypatch, "sglang", model_path, 120) == {"w4a16_mxfp4"}
+    # SM120: SGLang serves GPT-OSS MXFP4 as MXFP8 x MXFP4 on flashinfer_mxfp4
+    # (gpt_oss.py:69-74, mxfp4.py:426-427) and no W4A16 lane (collector/skips.py).
+    assert _planned_moe_modes(monkeypatch, "sglang", model_path, 120) == {"w4a8_mxfp4_mxfp8"}
     # vLLM serves gpt-oss MXFP4 experts with BF16 activations on every SM, and
     # its collector builds the MXFP8-activation path for DeepSeek-V4 only
     # (collector/skips.py).
@@ -697,7 +698,10 @@ def test_dsv4_native_w4a8_mode_is_planned_from_sm100(monkeypatch, backend):
     assert _planned_moe_modes(monkeypatch, backend, model_path, 90) == set()
     assert _planned_moe_modes(monkeypatch, backend, model_path, 100) == {"w4a8_mxfp4_mxfp8"}
     assert _planned_moe_modes(monkeypatch, backend, model_path, 103) == {"w4a8_mxfp4_mxfp8"}
-    expected_sm120 = {"w4a8_mxfp4_mxfp8"} if backend == "trtllm" else set()
+    # SGLang runs the FP4 experts as MXFP8 x MXFP4 on SM120 too
+    # (model_overrides/deepseek_v4.py:75-88, mxfp4_flashinfer_cutlass_moe.py:36-44);
+    # vLLM serves MXFP4 MoE on SM120 without MXFP8 activations (collector/skips.py).
+    expected_sm120 = set() if backend == "vllm" else {"w4a8_mxfp4_mxfp8"}
     assert _planned_moe_modes(monkeypatch, backend, model_path, 120) == expected_sm120
 
 

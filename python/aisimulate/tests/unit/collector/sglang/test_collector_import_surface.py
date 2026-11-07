@@ -151,7 +151,7 @@ SGLANG_0523_MOE_SURFACE = {
         "get_moe_configs": _dummy,
     },
     "sglang.srt.layers.moe.token_dispatcher.standard": {},
-    "sglang.srt.layers.moe.topk": {"TopK": _Dummy},
+    "sglang.srt.layers.moe.topk": {"TopK": _Dummy, "TopKOutputFormat": _Dummy},
     "sglang.srt.layers.moe.utils": {"MoeRunnerBackend": _Dummy, "RoutingMethodType": _Dummy},
     "sglang.srt.layers.quantization.compressed_tensors.compressed_tensors": {"CompressedTensorsConfig": _Dummy},
     "sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_mxint4_moe": {},

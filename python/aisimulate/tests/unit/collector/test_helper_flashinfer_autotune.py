@@ -107,10 +107,20 @@ def _hybrid_bucket_uncapped(x):
     return 1 << (x - 1).bit_length()
 
 
+def _hybrid_bucket(x, max_num_tokens):
+    """flashinfer 0.7.0.post1 fused_moe/utils.py map_to_hybrid_bucket, restated."""
+    if x <= 0:
+        return 1
+    if x >= max_num_tokens:
+        return max_num_tokens
+    return min(_hybrid_bucket_uncapped(x), max_num_tokens)
+
+
 @pytest.fixture
 def fake_flashinfer_buckets(monkeypatch):
     utils = types.ModuleType("flashinfer.fused_moe.utils")
     utils.get_hybrid_num_tokens_buckets = _hybrid_buckets
+    utils.map_to_hybrid_bucket = _hybrid_bucket
     utils.map_to_hybrid_bucket_uncapped = _hybrid_bucket_uncapped
     for name in ("flashinfer", "flashinfer.fused_moe"):
         monkeypatch.setitem(sys.modules, name, sys.modules.get(name) or types.ModuleType(name))
@@ -146,6 +156,26 @@ def test_tuning_bucket_matches_the_vllm_moe_plan_points(fake_flashinfer_buckets)
 )
 def test_tuning_bucket_is_none_past_the_tuned_list(fake_flashinfer_buckets, num_tokens, max_tuned, bucket):
     assert helper.flashinfer_tuning_bucket(num_tokens, max_tuned) == bucket
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "tune_max", "max_tuned", "bucket"),
+    [
+        # FlashInferExperts / TRT-LLM-gen ops hand FlashInfer a tune_max_num_tokens and
+        # every larger count runs that bucket's tactic.
+        (6144, 8192, 65536, 8192),
+        (12288, 8192, 65536, 8192),
+        (65536, 8192, 65536, 8192),
+        (320, 8192, 65536, 512),
+        # SGLang's CUTLASS runner: the warm-up profiles the list up to the same cap.
+        (12288, 4096, 4096, 4096),
+        (3000, 4096, 4096, 3072),
+        # A cap that is not a bucket of the warm-up list has no tuned entry.
+        (20000, 10000, 65536, None),
+    ],
+)
+def test_tuning_bucket_is_clamped_to_the_ops_tune_max(fake_flashinfer_buckets, num_tokens, tune_max, max_tuned, bucket):
+    assert helper.flashinfer_tuning_bucket(num_tokens, max_tuned, tune_max_num_tokens=tune_max) == bucket
 
 
 def test_tunes_once_at_the_exact_token_count_then_times_under_lookup_only(fake_flashinfer):
@@ -229,7 +259,7 @@ def test_both_moe_collectors_wrap_their_timing_in_the_tuning_context():
     # (helper.flashinfer_tuning_bucket).
     for backend, call in (
         ("vllm", "flashinfer_autotuned(tune_tokens, "),
-        ("sglang", "flashinfer_autotuned(num_tokens, "),
+        ("sglang", "flashinfer_autotuned(tune_tokens, "),
     ):
         source = (collector_root / backend / "collect_moe.py").read_text(encoding="utf-8")
         assert "flashinfer_autotuned," in source, backend

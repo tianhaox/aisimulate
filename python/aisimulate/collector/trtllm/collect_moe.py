@@ -66,9 +66,10 @@ moe_tune_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "moe_tu
 _TRTLLM_VERSION = tensorrt_llm.__version__
 _MODEL_CONFIG_ROOT = Path(__file__).resolve().parents[2] / "src/aisimulate_core/model_configs"
 
-# Serving's max_num_tokens default (BaseLlmArgs, llmapi/llm_args.py:5932). The
-# autotuner warmup forwards that many tokens, then one generation token
-# (pyexecutor/engine/runners/decoder/warmup.py:1059-1068, 1099-1104, 1158).
+# Serving's max_num_tokens default (BaseLlmArgs, llmapi/llm_args.py:5932-5933).
+# The autotuner warmup forwards that many tokens, then one generation token
+# (pyexecutor/engine/runners/decoder/warmup.py:1059-1068, 1099-1104, 1158), and
+# both MoE tuning bounds follow it (_run_moe_case).
 _SERVING_MAX_NUM_TOKENS = 8192
 
 # kernel_source per (provider, technique) of the implementation identity the
@@ -258,6 +259,32 @@ def _serving_moe_layer(declared, model_name, hidden_size, num_experts, topk, dty
         elif architecture == "DeepseekV4ForCausalLM" and declared.sglang_moe_swiglu_limit is not None:
             # SwiGLU clamped before the SiLU (models/modeling_deepseekv4.py:1670-1675).
             layer.activation = SwigluActivation(clamp=float(declared.sglang_moe_swiglu_limit))
+    elif architecture == "Glm5NextForConditionalGeneration":
+        # Glm5NextMoE (models/modeling_glm5_next.py:1552-1616): Glm5NextGate, a
+        # DeepseekV3Gate built from the checkpoint config that keeps an fp32
+        # correction bias and fp32 logits whatever the backend (:1520-1549), its
+        # routing method, and SwiGLU clamped at the config's swiglu_limit
+        # (:1573, :1613); no expert bias, weights applied after FC2.
+        from tensorrt_llm._torch.models.modeling_glm5_next import Glm5NextGate
+
+        config = _packaged_model_config(model_name)
+        layer.gate = Glm5NextGate(
+            SimpleNamespace(
+                hidden_size=hidden_size,
+                n_routed_experts=num_experts,
+                num_experts_per_tok=topk,
+                n_group=config.get("n_group"),
+                topk_group=config.get("topk_group"),
+                routed_scaling_factor=config["routed_scaling_factor"],
+                scoring_func=config.get("scoring_func", "sigmoid"),
+                norm_topk_prob=config["norm_topk_prob"],
+            ),
+            moe_backend=str(moe_backend),
+        )
+        _zero_routing_bias(layer.gate)
+        layer.routing_method = layer.gate.routing_method
+        layer.router_logits_dtype = torch.float32
+        layer.activation = SwigluActivation(clamp=float(config["swiglu_limit"]))
     elif architecture in _MINIMAX_M3_ARCHITECTURES:
         layer.gate = _serving_moe_gate(declared, hidden_size, num_experts, topk, dtype, moe_backend)
         layer.routing_method = layer.gate.routing_method
@@ -522,15 +549,22 @@ def _run_moe_case(
     else:
         moe_backend = ModelConfig.resolve_moe_backend("AUTO", declared.architecture, quant_config)
 
-    # A deployment that sends M tokens through one MoE layer runs with
-    # max_num_tokens >= M, and both tuning bounds follow it: CUTLASS tunes
-    # buckets up to min(moe_max_num_tokens, 16384 * slots / top_k,
-    # max_num_tokens * dp) (moe/fused_moe/cutlass/base.py:228-241) and
-    # TRTLLM-Gen up to max_num_tokens (trtllm_gen/base.py:225;
-    # custom_ops/trtllm_gen_custom_ops.py:549-571). moe_max_num_tokens equal to
-    # it keeps every token count in one chunk (configurable_moe.py:244-258).
+    # The layer is tuned as a default deployment tunes it: max_num_tokens 8192,
+    # which bounds both MoE tunings. CUTLASS tunes power-of-2 buckets up to
+    # min(moe_max_num_tokens, 16384 * slots / top_k, max_num_tokens * dp)
+    # (moe/fused_moe/cutlass/base.py:228-241, custom_ops/torch_custom_ops.py:
+    # 97-102, 327) and TRTLLM-Gen a power-of-2 ladder to 8192, plus
+    # max_num_tokens only above it (trtllm_gen/base.py:225;
+    # custom_ops/trtllm_gen_custom_ops.py:546-640). A larger M maps at run time
+    # to the 8192 tactic: the lookup takes the bucket's last power of 2 and caps
+    # it at the config's tune_max_num_tokens (autotuner.py:1807-1849; CUTLASS
+    # last_positive_power_of_2, TRTLLM-Gen round_rule), so the sweep times it on
+    # that tactic as serving runs it. moe_max_num_tokens stays at the sweep's
+    # largest M, which keeps every token count in one chunk
+    # (configurable_moe.py:244-258; it only enters CUTLASS's bound through the
+    # min above).
     max_tokens = max(num_tokens_lists)
-    max_num_tokens = max(_SERVING_MAX_NUM_TOKENS, max_tokens)
+    max_num_tokens = _SERVING_MAX_NUM_TOKENS
 
     mapping = Mapping()
     mapping.moe_ep_size = moe_ep_size
@@ -546,7 +580,7 @@ def _run_moe_case(
     model_config.mapping = mapping
     model_config.quant_config = quant_config
     model_config.max_num_tokens = max_num_tokens
-    model_config.moe_max_num_tokens = max_num_tokens
+    model_config.moe_max_num_tokens = max(max_num_tokens, max_tokens)
     model_config.moe_backend = moe_backend
 
     layer = _serving_moe_layer(declared, model_name, hidden_size, num_experts, topk, dtype, moe_backend)
@@ -665,8 +699,8 @@ def _run_moe_case(
     # (custom_ops/torch_custom_ops.py:97-102, 327; autotuner.py:1746-1769), and
     # TRTLLM-Gen a fixed power-of-2 ladder to 8192 plus max_num_tokens above it
     # (trtllm_gen_custom_ops.py:549-571). The first forward is also the dry run
-    # that moves lazy initialization and JIT out of the timed region; it is the
-    # case's largest shape, so a shape failure surfaces here first.
+    # that moves lazy initialization and JIT out of the timed region; larger
+    # token counts get theirs in benchmark_with_power's eager warm-ups.
     tuning_start = time.perf_counter()
     with (
         torch.inference_mode(),

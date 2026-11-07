@@ -104,7 +104,17 @@ def helpers(monkeypatch):
         "SwigluBiasActivation": _recording("SwigluBiasActivation"),
         "TritonFusedMoE": _TritonFusedMoE,
         "_TRTLLM_VERSION": "1.4.0rc2",
-        "_packaged_model_config": lambda model: {"activation_situ_beta": 4.0, "activation_situ_linear_beta": 25.0},
+        "_packaged_model_config": lambda model: {
+            "activation_situ_beta": 4.0,
+            "activation_situ_linear_beta": 25.0,
+            # GLM-5.3-Flash text config fields Glm5NextGate and Glm5NextMoE read.
+            "n_group": 1,
+            "topk_group": 1,
+            "routed_scaling_factor": 2.5,
+            "scoring_func": "sigmoid",
+            "norm_topk_prob": True,
+            "swiglu_limit": 10.0,
+        },
     }
     exec(
         compile(ast.Module(body=[n for n in tree.body if wanted(n)], type_ignores=[]), str(COLLECT_MOE), "exec"),
@@ -116,6 +126,7 @@ def helpers(monkeypatch):
         ("modeling_deepseekv4", "DeepseekV4Gate", _gate("v4")),
         ("modeling_minimaxm3", "MiniMaxM3Gate", _gate("m3")),
         ("modeling_gemma4", "Gemma4MoeRoutingMethod", _recording("Gemma4MoeRoutingMethod")),
+        ("modeling_glm5_next", "Glm5NextGate", _gate("glm5next")),
     ):
         module = ModuleType(f"tensorrt_llm._torch.models.{module_name}")
         setattr(module, attr, value)
@@ -189,6 +200,23 @@ def test_kimi_k3_routes_deepseek_style_with_situ_experts(helpers):
     assert type(layer.activation).__name__ == "SiTuActivation"
     assert layer.activation.kwargs == {"gate_softcap": 4.0, "linear_softcap": 25.0}
     assert layer.router_logits_dtype == "fp32"
+
+
+@pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM"])
+def test_glm53_flash_routes_through_its_gate_with_clamped_swiglu(helpers, moe_backend):
+    layer = _layer(helpers, "Glm5NextForConditionalGeneration", moe_backend=moe_backend)
+    assert layer.routing_method == ("gate-routing", "glm5next")
+    assert layer.gate.e_score_correction_bias.zeroed
+    (gate_config,) = layer.gate.args
+    # The case's shape with the checkpoint's routing constants, as Glm5NextMoE builds it.
+    assert (gate_config.hidden_size, gate_config.n_routed_experts, gate_config.num_experts_per_tok) == (7168, 256, 8)
+    assert (gate_config.n_group, gate_config.topk_group, gate_config.routed_scaling_factor) == (1, 1, 2.5)
+    assert gate_config.scoring_func == "sigmoid" and gate_config.norm_topk_prob is True
+    assert layer.gate.kwargs == {"moe_backend": moe_backend}
+    assert type(layer.activation).__name__ == "SwigluActivation"
+    assert layer.activation.kwargs == {"clamp": 10.0}
+    assert layer.router_logits_dtype == "fp32"
+    assert layer.bias is False and layer.apply_router_weight_on_input is False
 
 
 def test_minimax_m2_routes_with_an_fp32_bias(helpers):

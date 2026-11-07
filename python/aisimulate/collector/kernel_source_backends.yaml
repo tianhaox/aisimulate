@@ -156,6 +156,7 @@ mappings:
   # MoE labels name the constructed serving method + runner.
   - {framework: sglang, kernel_source: sglang_flashinfer_trtllm_moe, backend: flashinfer_trtllm_gen, source: "PR#1342 collect_moe.py"}
   - {framework: sglang, kernel_source: sglang_mxfp4_flashinfer_trtllm_moe, backend: flashinfer_trtllm_gen, source: "PR#1342 collect_moe.py (mxfp4 trtllm-gen)"}
+  - {framework: sglang, kernel_source: sglang_flashinfer_trtllm_routed_moe, backend: flashinfer_trtllm_gen, source: "collector/sglang/collect_moe.py _KERNEL_SOURCE_BY_RUNNER; sglang v0.5.23 moe_runner/flashinfer_trtllm.py:1845-1876 (routed TRT-LLM-gen MoE on materialized top-k), arg_groups/model_overrides/deepseek_v4.py:66-74, minimax_m2.py:23-32"}
   - {framework: sglang, kernel_source: sglang_flashinfer_cutlass_moe, backend: flashinfer_cutlass, source: "PR#1342 collect_moe.py"}
   - {framework: sglang, kernel_source: sglang_flashinfer_cutedsl_nvfp4, backend: flashinfer_cutedsl, source: "PR#1342 collect_moe.py"}
   # GDN sub-kernels and mHC.

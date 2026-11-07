@@ -62,13 +62,20 @@ model_case_values:
       topk: 8
       num_experts: 256
       sglang_moe_scoring_func: sigmoid
+      # MiMoV2MoE passes DeepSeekV3 routing to FusedMoE when the gate has a
+      # correction bias (noaux_tc) and norm_topk_prob is set
+      # (models/mimo_v2.py:446-450 at SGLang v0.5.23).
+      sglang_moe_routing_method_type: DeepSeekV3
       sglang_moe_routed_scaling_factor: 1.0
       sglang_moe_renormalize: true
       sglang_moe_has_correction_bias: true
       sglang_moe_num_expert_group: 1
       sglang_moe_topk_group: 1
       sglang_moe_backends:
-        fp8_block: {default: triton}
+        # An FP8 checkpoint without FP4 experts runs flashinfer_trtllm on
+        # SM100/103 (arg_groups/model_overrides/mimo_v2.py:33-49) and the auto
+        # Triton runner elsewhere.
+        fp8_block: {default: triton, 100: flashinfer_trtllm, 103: flashinfer_trtllm}
 
 all_frameworks_op_cases:
   moe:

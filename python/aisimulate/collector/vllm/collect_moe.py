@@ -306,6 +306,67 @@ def _moe_intermediate_size(inter_size: int, moe_tp_size: int, moe_ep_size: int, 
     return inter_size
 
 
+# FlashInfer's MoE ops map a runtime token count to a tuned bucket no larger than
+# the tune_max_num_tokens their caller hands them (helper.flashinfer_tuning_bucket),
+# so any m at or above it runs that bucket's tactic. What each experts class hands
+# FlashInfer at v0.32.0:
+# - nothing, so FlashInfer's default 8192 (flashinfer 0.7.0.post1 fused_moe/core.py:
+#   1290 cutlass_fused_moe, :4916 trtllm_bf16_routed_moe): FlashInferExperts
+#   (experts/flashinfer_cutlass_moe.py:365-389), TrtLlmBf16ExpertsModular
+#   (experts/trtllm_bf16_moe.py:209-229); TrtLlmMxint4ExpertsMonolithic passes
+#   8192 itself (quantization/utils/flashinfer_mxint4_moe.py:267);
+# - fi_moe_largest_bucket(moe_config) = max(max_num_tokens * dp_size, 8192)
+#   (fused_moe/utils.py:557-572): TrtLlmBf16ExpertsMonolithic (trtllm_bf16_moe.py:
+#   303), TrtLlmFp8ExpertsModular / Monolithic (trtllm_fp8_moe.py:332, 516, 575),
+#   TrtLlmMxfp4ExpertsMonolithic / Modular (trtllm_mxfp4_moe.py:268, 402),
+#   TrtLlmNvFp4ExpertsMonolithic (trtllm_nvfp4_moe.py:583);
+# - that bound capped at its own launch chunk: TrtLlmNvFp4ExpertsModular
+#   (trtllm_nvfp4_moe.py:385-387);
+# - no cap: FlashInferCuteDSLExperts, whose runner maps with
+#   map_to_hybrid_bucket_uncapped (flashinfer fused_moe/cute_dsl/tuner.py:545-556).
+_FLASHINFER_DEFAULT_TUNE_MAX_NUM_TOKENS = 8192
+_FI_DEFAULT_TUNE_MAX_EXPERTS = frozenset(
+    {"FlashInferExperts", "TrtLlmBf16ExpertsModular", "TrtLlmMxint4ExpertsMonolithic"}
+)
+_FI_LARGEST_BUCKET_EXPERTS = frozenset(
+    {
+        "TrtLlmBf16ExpertsMonolithic",
+        "TrtLlmFp8ExpertsModular",
+        "TrtLlmFp8ExpertsMonolithic",
+        "TrtLlmMxfp4ExpertsMonolithic",
+        "TrtLlmMxfp4ExpertsModular",
+        "TrtLlmNvFp4ExpertsMonolithic",
+    }
+)
+_FI_UNCAPPED_EXPERTS = frozenset({"FlashInferCuteDSLExperts"})
+
+
+def _flashinfer_moe_tune_max_num_tokens(leaf_experts) -> int | None:
+    """The tune_max_num_tokens ``leaf_experts`` hands its FlashInfer MoE op.
+
+    ``None`` for an experts class whose FlashInfer op maps uncapped and for
+    kernels FlashInfer's tuner does not own (Triton, Marlin, Humming, DeepGEMM,
+    vLLM CUTLASS). A FlashInfer or TRT-LLM-gen experts class not listed above
+    raises: its bound was never traced.
+    """
+    name = type(leaf_experts).__name__
+    if name in _FI_DEFAULT_TUNE_MAX_EXPERTS:
+        return _FLASHINFER_DEFAULT_TUNE_MAX_NUM_TOKENS
+    if name in _FI_LARGEST_BUCKET_EXPERTS or name == "TrtLlmNvFp4ExpertsModular":
+        from vllm.model_executor.layers.fused_moe.utils import fi_moe_largest_bucket
+
+        largest = fi_moe_largest_bucket(leaf_experts.moe_config)
+        if name == "TrtLlmNvFp4ExpertsModular":
+            return min(largest, leaf_experts._get_chunk_size())
+        return largest
+    if name.startswith(("FlashInfer", "TrtLlm")) and name not in _FI_UNCAPPED_EXPERTS:
+        raise RuntimeError(
+            f"vLLM MoE experts {name} run a FlashInfer op whose tune_max_num_tokens the collector has not "
+            "traced; add it to collector/vllm/collect_moe.py before timing it"
+        )
+    return None
+
+
 def get_moe_test_cases():
     return plan_cases("moe", "vllm", get_sm_version())
 
@@ -667,12 +728,13 @@ def run_moe_torch(
         # default O2 :427), skipping only fp4_gemm under the cute-dsl NVFP4
         # linear kernel (:295-311), which no MoE op uses. It profiles the hybrid
         # bucket list up to max_num_batched_tokens with round_up=True
-        # (:334-374), and every FlashInfer MoE op maps a runtime count up to the
-        # next bucket (tune_max_num_tokens = fi_moe_largest_bucket,
-        # fused_moe/utils.py:557-572), so a token count off that list runs the
-        # tactic of the next bucket up; tune at that bucket. Kernels the
-        # FlashInfer tuner does not own (Triton, Marlin, Humming, DeepGEMM, vLLM
-        # CUTLASS) are unaffected.
+        # (:334-374). After warmup no override is active, so every FlashInfer
+        # MoE op maps a runtime count up to the next bucket of its own list,
+        # clamped to the tune_max_num_tokens its experts class passes
+        # (_flashinfer_moe_tune_max_num_tokens): a token count off that list runs
+        # the tactic of the next bucket up, and one past the clamp the tactic of
+        # the clamp; tune at that bucket. Kernels the FlashInfer tuner does not
+        # own (Triton, Marlin, Humming, DeepGEMM, vLLM CUTLASS) are unaffected.
         serving_autotunes = has_flashinfer() and current_platform.has_device_capability(90)
         max_tuned_tokens = vllm_config.scheduler_config.max_num_batched_tokens
 
@@ -727,7 +789,15 @@ def run_moe_torch(
                     forward_context.moe_layer_index = 0
                     moe_module(hidden_states, router_logits)
 
-            tune_tokens = flashinfer_tuning_bucket(num_tokens, max_tuned_tokens) if serving_autotunes else None
+            tune_tokens = (
+                flashinfer_tuning_bucket(
+                    num_tokens,
+                    max_tuned_tokens,
+                    tune_max_num_tokens=_flashinfer_moe_tune_max_num_tokens(leaf_experts),
+                )
+                if serving_autotunes
+                else None
+            )
             if tune_tokens is not None:
                 autotuned = flashinfer_autotuned(tune_tokens, run_single_iteration, label=source)
             else:
