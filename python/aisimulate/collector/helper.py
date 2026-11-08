@@ -689,11 +689,15 @@ def benchmark_with_power(
         # Calculate latency
         latency_ms = start_event.elapsed_time(end_event) / actual_num_runs / repeat_n
 
-        # DIAG ONLY (not for merge): per-call time with the L2 warm (back to back, as timed) and
-        # cold (a 512 MiB memset before each call evicts the op's weights), for shards whose
-        # directory name carries "l2ab" (run_shards runs collect.py in the shard dir).
+        # DIAG ONLY (not for merge): per-call time (events around the op alone) with the L2
+        # warm, or cleared before each call by (write) a 512 MiB memset, (read) an int32 sum
+        # over 512 MiB, (gemm) a bf16 GEMM streaming a 512 MiB weight matrix, as other layers
+        # would in serving. Shards whose directory name carries "l2ab".
         if "l2ab" in os.path.basename(os.getcwd()):
-            _flush = torch.empty(512 * 1024 * 1024, dtype=torch.int8, device=device)
+            _wbuf = torch.empty(512 * 1024 * 1024, dtype=torch.int8, device=device)
+            _rbuf = torch.ones(128 * 1024 * 1024, dtype=torch.int32, device=device)
+            _gw = torch.randn(16384, 16384, dtype=torch.bfloat16, device=device)
+            _gx = torch.randn(8, 16384, dtype=torch.bfloat16, device=device)
 
             def _one_call():
                 if use_graph:
@@ -702,12 +706,19 @@ def benchmark_with_power(
                     for _ in range(repeat_n):
                         kernel_func()
 
+            _clears = {
+                "warm": None,
+                "write": lambda: _wbuf.zero_(),
+                "read": lambda: _rbuf.sum(),
+                "gemm": lambda: torch.matmul(_gx, _gw),
+            }
             _res = {}
-            for _mode in ("warm", "cold", "warm2"):
+            for _mode in ("warm", "write", "read", "gemm", "warm2"):
+                _clear = _clears.get(_mode)
                 _t = []
                 for _ in range(25):
-                    if _mode == "cold":
-                        _flush.zero_()
+                    if _clear is not None:
+                        _clear()
                     _s = dev_mod.Event(enable_timing=True)
                     _e = dev_mod.Event(enable_timing=True)
                     _s.record()
@@ -718,11 +729,11 @@ def benchmark_with_power(
                 _t.sort()
                 _res[_mode] = _t[len(_t) // 2]
             print(
-                f"DIAG_L2 timed_ms={latency_ms:.5f} warm_ms={_res['warm']:.5f} cold_ms={_res['cold']:.5f} "
-                f"warm2_ms={_res['warm2']:.5f} graph={use_graph} repeat_n={repeat_n}",
+                "DIAG_L2 timed_ms=%.5f " % latency_ms
+                + " ".join(f"{k}_ms={v:.5f}" for k, v in _res.items()),
                 flush=True,
             )
-            del _flush
+            del _wbuf, _rbuf, _gw, _gx
 
         if timed is not None:
             timed.__exit__(None, None, None)
