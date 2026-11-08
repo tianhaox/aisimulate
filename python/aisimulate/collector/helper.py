@@ -419,6 +419,31 @@ class PeriodicGarbageCollector:
         return True
 
 
+# L2 residency between timed calls. Back-to-back graph replays keep an op's weights in L2;
+# serving runs every other layer between two calls of one layer and reads them from HBM. On
+# B200 (126 MB L2) that made calls under 100 us 10-70% faster than cold (GEMM n=k=4096 +25%,
+# a 1-token gpt-oss MoE layer +27%); on H200 (50 MB) +8-15%; above 0.1 ms within 5%
+# (L2 A/B, 2026-11-09). A cold-L2 measurement clears L2 before every call by reading a buffer
+# twice the L2 size and subtracts the time of the reads alone. Reading, not writing: written
+# lines are dirty, so a block of clears alone also pays the write-back of the previous clear,
+# which a clear after an op does not, and the subtraction made 0.1-1 ms GEMMs read 6% faster
+# than warm (B200 and H200 check, 2026-11-09).
+_L2_FLUSH_BUFFERS: dict = {}
+
+
+def _l2_flush_buffer(device, dev_mod):
+    """A cached buffer twice the device's L2 size (at least 64 MiB); reading it evicts L2."""
+    import torch
+
+    index = getattr(device, "index", None) or 0
+    buf = _L2_FLUSH_BUFFERS.get(index)
+    if buf is None:
+        l2 = int(getattr(dev_mod.get_device_properties(index), "L2_cache_size", 0) or 0)
+        buf = torch.zeros(max(2 * l2, 64 << 20) // 4, dtype=torch.int32, device=f"cuda:{index}")
+        _L2_FLUSH_BUFFERS[index] = buf
+    return buf
+
+
 @contextmanager
 def benchmark_with_power(
     device,
@@ -434,6 +459,7 @@ def benchmark_with_power(
     explicit_graph_cleanup: bool = False,
     num_eager_warmups: int | None = None,
     min_warmup_seconds: float = 0.0,
+    cold_l2: bool = False,
 ):
     """
     Context manager that handles warmup, graph capture, timing, and power monitoring.
@@ -468,6 +494,10 @@ def benchmark_with_power(
                          to ~30% slower for up to ~0.1 s: on B200 a 1-token MoE layer
                          timed 0.110 ms after 3 replay warmups, 0.084 ms (steady)
                          after ~0.1 s of them. Default 0 keeps the count-only warmup.
+        cold_l2: Clear L2 before every timed call (a read of twice the L2 size, captured
+                         in the graph before each kernel_func call) and subtract the time of
+                         the reads alone, so an op reads its weights from HBM as it does
+                         between other layers in serving (see _L2_FLUSH_BUFFERS).
 
     Yields:
         dict with keys:
@@ -480,6 +510,13 @@ def benchmark_with_power(
     import torch
 
     dev_mod = get_device_module(device)
+    flush = _l2_flush_buffer(device, dev_mod) if cold_l2 else None
+
+    def _call():
+        if flush is not None:
+            flush.sum()
+        kernel_func()
+
     # One beat per measurement: the executor's stall watchdog counts it as progress.
     worker_heartbeat()
     # probe.trace_case only: the warmups, capture and timed runs are the measured path. A warmup
@@ -550,6 +587,7 @@ def benchmark_with_power(
     # Device Graph Capture with Optional Fallback (CUDA: CUDAGraph, XPU: XPUGraph)
     # ═══════════════════════════════════════════════════════════════════
     g = None
+    g_flush = None
     capture_phase_completed = False
     # Explicit cleanup also covers capture: a traceback can retain the graph.
     # The default preserves the pre-existing lifetime on capture failure.
@@ -568,7 +606,7 @@ def benchmark_with_power(
                     try:
                         with graph_ctx(g):
                             for _ in range(repeat_n):
-                                kernel_func()
+                                _call()
                     finally:
                         # capture_begin/end may raise before torch's stream
                         # context restores the caller's current stream.
@@ -576,7 +614,12 @@ def benchmark_with_power(
                 else:
                     with graph_ctx(g):
                         for _ in range(repeat_n):
-                            kernel_func()
+                            _call()
+                if flush is not None:
+                    g_flush = graph_cls()
+                    with graph_ctx(g_flush):
+                        for _ in range(repeat_n):
+                            flush.sum()
                 dev_mod.synchronize()
             except Exception as e:
                 if not allow_graph_fail:
@@ -617,7 +660,7 @@ def benchmark_with_power(
                     if use_graph:
                         g.replay()
                     else:
-                        kernel_func()
+                        _call()
                 dev_mod.synchronize()
         _close_phase("graph_warmup")
 
@@ -648,6 +691,22 @@ def benchmark_with_power(
         measured = torch.profiler.record_function(TRACE_MEASURED_RANGE) if timed is not None else None
         if measured is not None:
             measured.__enter__()
+
+        def _flush_only_ms():
+            # the L2 reads alone, timed the way the measured block runs them
+            fs, fe = dev_mod.Event(enable_timing=True), dev_mod.Event(enable_timing=True)
+            fs.record()
+            for _ in range(actual_num_runs):
+                if g_flush is not None:
+                    g_flush.replay()
+                else:
+                    for _ in range(repeat_n):
+                        flush.sum()
+            fe.record()
+            dev_mod.synchronize()
+            return fs.elapsed_time(fe)
+
+        flush_ms = [_flush_only_ms()] if flush is not None else []
         try:
             start_event.record()
             for _ in range(actual_num_runs):
@@ -657,12 +716,14 @@ def benchmark_with_power(
                     # Fallback: Direct execution
                     # This matches SGLang/VLLM pattern where kernel_func handles internal loops
                     for _ in range(repeat_n):
-                        kernel_func()
+                        _call()
             end_event.record()
             dev_mod.synchronize()
         finally:
             if measured is not None:
                 measured.__exit__(None, None, None)
+        if flush is not None:
+            flush_ms.append(_flush_only_ms())
         _close_phase("timed")
 
         # Check for throttling
@@ -687,7 +748,10 @@ def benchmark_with_power(
             power_stats = power_monitor.stop_sampling()
 
         # Calculate latency
-        latency_ms = start_event.elapsed_time(end_event) / actual_num_runs / repeat_n
+        total_ms = start_event.elapsed_time(end_event)
+        if flush_ms:
+            total_ms -= sum(flush_ms) / len(flush_ms)
+        latency_ms = total_ms / actual_num_runs / repeat_n
 
         if timed is not None:
             timed.__exit__(None, None, None)
@@ -700,6 +764,7 @@ def benchmark_with_power(
             "num_runs_executed": actual_num_runs,
             "used_cuda_graph": use_graph,  # NEW: Inform caller which path was used
             "phase_seconds": phase_seconds,
+            "cold_l2": flush is not None,
         }
     finally:
         if timed is not None:
@@ -707,6 +772,7 @@ def benchmark_with_power(
         # Preserve default cleanup after timing starts. Explicit cleanup also
         # resets graphs retained by capture tracebacks; framework-owned tensors
         # must still be released by the collector to reclaim their pool memory.
+        g_flush = None
         if g is not None and (explicit_graph_cleanup or capture_phase_completed):
             if explicit_graph_cleanup:
                 g.reset()

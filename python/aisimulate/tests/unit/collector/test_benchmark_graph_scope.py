@@ -125,6 +125,7 @@ def trace_benchmark(
         "os": os,
         "time": time,
         "worker_heartbeat": lambda: events.append("heartbeat"),
+        "_l2_flush_buffer": lambda device, dev_mod: SimpleNamespace(sum=lambda: events.append("flush")),
         "TRACE_CHILD_DIR_ENV": TRACE_CHILD_DIR_ENV,
         "TRACE_TIMED_RANGE": TRACE_TIMED_RANGE,
         "TRACE_MEASURED_RANGE": TRACE_MEASURED_RANGE,
@@ -304,3 +305,27 @@ def test_only_vllm_mla_module_binds_explicit_graph_cleanup():
     assert namespace["benchmark_with_power"](kernel_func=kernel, num_runs=30) == "native-context"
     assert calls == [{"explicit_graph_cleanup": True, "kernel_func": kernel, "num_runs": 30}]
     assert namespace["_benchmark_with_power"] is shared_benchmark
+
+
+def test_cold_l2_clears_l2_before_every_call_and_subtracts_the_clearing(monkeypatch):
+    """Serving reads a layer's weights from HBM: other layers run between its calls. A cold-L2
+    measurement captures an L2 clear before each call, times the clears alone before and after
+    the measured block, and subtracts their mean (the fake events all report 12 ms)."""
+    warm = trace_benchmark(monkeypatch)
+    assert "flush" not in warm["events"] and warm["result"]["cold_l2"] is False
+    cold = trace_benchmark(monkeypatch, cold_l2=True)
+    ev = cold["events"]
+    first = ev.index("capture:begin")
+    assert ev[first : first + 4] == ["capture:begin", "flush", "kernel", "capture:end"]
+    second = ev.index("capture:begin", first + 1)
+    assert ev[second : second + 3] == ["capture:begin", "flush", "capture:end"]
+    timed = [i for i, e in enumerate(ev) if e == "event:record"]
+    # clears alone, the measured block, clears alone: three pairs of timing events
+    assert len(timed) == 6
+    assert cold["result"]["cold_l2"] is True and cold["result"]["latency_ms"] == 0.0
+    assert warm["result"]["latency_ms"] == 12.0 / 3
+    eager = trace_benchmark(monkeypatch, eager=True, cold_l2=True)["events"]
+    rec = [i for i, e in enumerate(eager) if e == "event:record"]
+    # eager: the measured block (third and fourth timing events) clears L2 before each call
+    assert eager[rec[2] + 1 : rec[3]] == ["flush", "kernel"] * 3
+    assert eager[rec[0] + 1 : rec[1]] == ["flush"] * 3
