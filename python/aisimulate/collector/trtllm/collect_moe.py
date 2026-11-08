@@ -832,6 +832,42 @@ def _run_moe_case(
             del actual_logits
         del hidden_states
 
+    # DIAG: recovery curve of the 1-token point after a heavy phase
+    for heavy in (num_tokens_lists[-1], 8192):
+        hs_h = torch.randn([heavy, hidden_size]).bfloat16().to(torch.device(device))
+        lg_h = balanced_logits(heavy, num_experts, topk).to(device=torch.device(device), dtype=layer.router_logits_dtype)
+        hs_1 = torch.randn([1, hidden_size]).bfloat16().to(torch.device(device))
+        lg_1 = balanced_logits(1, num_experts, topk).to(device=torch.device(device), dtype=layer.router_logits_dtype)
+        g1 = torch.cuda.CUDAGraph()
+        s1 = torch.cuda.Stream()
+        s1.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s1):
+            for _ in range(3):
+                moe.forward(hs_1, lg_1, do_finalize=not min_latency_mode)
+        torch.cuda.current_stream().wait_stream(s1)
+        with torch.cuda.graph(g1):
+            moe.forward(hs_1, lg_1, do_finalize=not min_latency_mode)
+        for trial in range(2):
+            for _ in range(5):
+                moe.forward(hs_h, lg_h, do_finalize=not min_latency_mode)
+            torch.cuda.synchronize()
+            evs = [torch.cuda.Event(enable_timing=True) for _ in range(81)]
+            evs[0].record()
+            for w in range(80):
+                for _ in range(5):
+                    g1.replay()
+                evs[w + 1].record()
+            torch.cuda.synchronize()
+            per = [evs[w].elapsed_time(evs[w + 1]) / 5 for w in range(80)]
+            cum = 0.0
+            pts = []
+            for w, v in enumerate(per):
+                cum += v * 5
+                if w < 12 or w % 8 == 7:
+                    pts.append(f"{cum:.1f}ms:{v * 1000:.0f}us")
+            print(f"DIAG recovery after {heavy} tokens trial {trial}: " + " ".join(pts), flush=True)
+        del g1, hs_h, lg_h
+
     # DIAG: re-time the first points after the sweep (order effect check)
     for num_tokens in num_tokens_lists[:3]:
         hidden_states = torch.randn([num_tokens, hidden_size]).bfloat16().to(torch.device(device))
