@@ -689,6 +689,41 @@ def benchmark_with_power(
         # Calculate latency
         latency_ms = start_event.elapsed_time(end_event) / actual_num_runs / repeat_n
 
+        # DIAG ONLY (not for merge): per-call time with the L2 warm (back to back, as timed) and
+        # cold (a 512 MiB memset before each call evicts the op's weights), for shards whose
+        # directory name carries "l2ab" (run_shards runs collect.py in the shard dir).
+        if "l2ab" in os.path.basename(os.getcwd()):
+            _flush = torch.empty(512 * 1024 * 1024, dtype=torch.int8, device=device)
+
+            def _one_call():
+                if use_graph:
+                    g.replay()
+                else:
+                    for _ in range(repeat_n):
+                        kernel_func()
+
+            _res = {}
+            for _mode in ("warm", "cold", "warm2"):
+                _t = []
+                for _ in range(25):
+                    if _mode == "cold":
+                        _flush.zero_()
+                    _s = dev_mod.Event(enable_timing=True)
+                    _e = dev_mod.Event(enable_timing=True)
+                    _s.record()
+                    _one_call()
+                    _e.record()
+                    dev_mod.synchronize()
+                    _t.append(_s.elapsed_time(_e) / repeat_n)
+                _t.sort()
+                _res[_mode] = _t[len(_t) // 2]
+            print(
+                f"DIAG_L2 timed_ms={latency_ms:.5f} warm_ms={_res['warm']:.5f} cold_ms={_res['cold']:.5f} "
+                f"warm2_ms={_res['warm2']:.5f} graph={use_graph} repeat_n={repeat_n}",
+                flush=True,
+            )
+            del _flush
+
         if timed is not None:
             timed.__exit__(None, None, None)
             timed = None
