@@ -992,7 +992,7 @@ def test_module_prefix_context_sweeps_are_yaml_backed():
     from collector.case_generator import get_mla_module_sweep_spec
 
     assert get_mla_module_sweep_spec("plan").context_prefix_lengths == [
-        0, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048575
+        0, 1, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048575
     ]  # fmt: skip
     assert 128 in get_mla_module_sweep_spec("sglang").context_prefix_lengths
 

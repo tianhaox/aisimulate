@@ -93,12 +93,18 @@ common_case_values:
       # Prefix anchors at x2 spacing, to the 1M context of GLM-5.2 and MiniMax-M3.
       # 2048 is the tokens a query attends to in DeepSeek-V3.2 and GLM-5.x
       # (index_topk) and in MiniMax-M3 (16 top-k blocks of 128): the sparse
-      # attention cost turns nearly linear in the prefix above it.
-      prefix_lengths: [0, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048575]
-      # From this prefix on, only the sequence lengths serving's chunked prefill
-      # issues there: full chunks and a partial one.
+      # attention cost turns nearly linear in the prefix above it. Prefix 1 marks
+      # the step from no cached context to some: on the vLLM 0.30.0 DSA tables
+      # (B200, H200) a 1-256 token prefix costs 5-7.5% more than prefix 0 at
+      # isl 1k-2k, which interpolating from 0 to 512 underpredicts.
+      prefix_lengths: [0, 1, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048575]
+      # From this prefix on, the sequence lengths serving issues there: full and
+      # partial chunked-prefill chunks, and a short new turn on a cached context.
+      # isl 1 is the single-token path; at a 64k prefix isl 16 already costs
+      # 2.8-3.8x of it on the same tables, so 16 and 256 anchor the short inputs
+      # that 1 and 512 alone underpredicted by a median 11%.
       long_prefix_min: 16384
-      long_prefix_sequence_lengths: [1, 512, 2048, 8192, 16384]
+      long_prefix_sequence_lengths: [1, 16, 256, 512, 2048, 8192, 16384]
     generation:
       max_tokens: 33554432
       # DSA and MSA decode beyond the generation grid, to the 1M context, at small batch.

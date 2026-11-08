@@ -278,7 +278,7 @@ def test_dsa_context_points_follow_chunked_prefill():
     from collector.case_generator import get_mla_module_sweep_spec
 
     sweep = get_mla_module_sweep_spec("plan")
-    anchors = [0, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048575]
+    anchors = [0, 1, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048575]
     assert sweep.context_prefix_lengths == anchors
     max_position = {"deepseek-ai/DeepSeek-V3.2": 163840, "zai-org/GLM-5.2": 1048576}
     points = defaultdict(set)
@@ -296,7 +296,8 @@ def test_dsa_context_points_follow_chunked_prefill():
             and b * (s + p) <= 1048576
             and p + s <= ceiling
             # at long prefixes, the chunk sizes serving's chunked prefill issues there
-            and (p < 16384 or s in (1, 512, 2048, 8192, 16384))
+            # and the short new turns on a cached context
+            and (p < 16384 or s in (1, 16, 256, 512, 2048, 8192, 16384))
         }
         assert points[model] == expected, model
     assert (1, 1, 1048575) in points["zai-org/GLM-5.2"]
