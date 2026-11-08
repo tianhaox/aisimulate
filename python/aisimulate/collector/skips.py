@@ -381,6 +381,25 @@ SKIPS: list[dict] = [
         "moe_type": "w4a16_mxfp4",
         "model_name": "moonshotai/Kimi-K3",
     },
+    # TRT-LLM serves fp8_block MoE on SM120 through run_triton_fp8_block_scale_moe,
+    # whose moe_align_block_size launches _moe_prefix_kernel with NUM_EXPERTS = the
+    # rank's expert count as a tl.arange length, which Triton requires to be a power
+    # of two (_torch/moe/fused_moe/fused_moe_triton_fp8_block_scale.py:37-60, 95-160).
+    # These models' local expert counts are not a power of two at any EP (288, 160 and
+    # 384 experts), so every case fails at compile ("arange's range must be a power of
+    # 2", GLM-5.3-Flash on RTX PRO, smoke 2026-11-08) and serving cannot run them.
+    {
+        "backend": "trtllm",
+        "op": "moe",
+        "sm": [120],
+        "moe_type": "fp8_block",
+        "model_name": [
+            "zai-org/GLM-5.3-Flash",
+            "Qwen/Qwen3-Coder-480B-A35B-Instruct",
+            "moonshotai/Kimi-K2-Instruct",
+            "sgl-project/DeepSeek-V4-Pro-FP8",
+        ],
+    },
 ]
 
 _RUN_KEYS = frozenset(("backend", "op", "sm"))
