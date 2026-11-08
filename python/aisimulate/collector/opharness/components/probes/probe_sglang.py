@@ -145,6 +145,11 @@ def vision_dummy_forward(model, model_dir: str, rec: dict, attr_names=("visual",
         rec["vision_probe"] = {"error": f"{type(e).__name__}: {e}"[:400]}
 
 
+# decode steps run before the profiled ones, and profiled ones (steady-state decode timing)
+DECODE_WARM_STEPS = 3
+DECODE_TIMED_STEPS = 4
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -614,9 +619,16 @@ def main() -> None:
             trace["prefill_kernels"] = kernel_table(p1)
             trace["prefill_api"] = api_kernel_map(p1)
             try:
+                # decode in steady state: unprofiled steps first, then several profiled ones (a
+                # single step right after the prefill timed a slow just-after-heavy-work state)
                 next_ids, batch = out[0], out[-1]
+                for _ in range(DECODE_WARM_STEPS):
+                    next_ids, _ = ret.decode(next_ids, batch)
+                torch.cuda.synchronize()
+                rec["probe_decode_steps"] = {"warm": DECODE_WARM_STEPS, "timed": DECODE_TIMED_STEPS}
                 with profile(**_prof_kw) as p2:
-                    ret.decode(next_ids, batch)
+                    for _ in range(DECODE_TIMED_STEPS):
+                        next_ids, _ = ret.decode(next_ids, batch)
                     torch.cuda.synchronize()
                 trace["decode_kernels"] = kernel_table(p2)
                 trace["decode_api"] = api_kernel_map(p2)

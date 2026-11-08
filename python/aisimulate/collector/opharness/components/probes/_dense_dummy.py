@@ -12,13 +12,21 @@ shapes) and pick other tactics; the collector times dense weights (collector/hel
 fill_dense_weight_). A probe whose kernel times serve as the timing reference therefore runs
 dense low-bit weights too.
 
+The float weights matter too, through the routing. With every float drawn from U(-1e-3, 1e-3),
+a normalized hidden state is scaled by norm weights near 1e-3 and a router's logits come out
+near 1e-4, below the U(-1e-3, 1e-3) expert-correction bias of DeepSeek-style routers and the
+router bias of GPT-OSS: every prefill token then picks the same experts, and the grouped GEMMs
+of the reference ran 10-37% faster than the collector's balanced case (moe timing round,
+2026-11-09). Bias-free routers (Gemma 4) route on noise instead.
+
 ``densify(named_tensors)`` refills, after the framework's dummy initializer and before its
-post-load processing (repacking, scale conversion), every weight matrix whose storage is FP8 or
-an integer: FP8 from N(0, 64) clamped to +-448, 8-bit integers uniform over all bytes, 32-bit
-integers uniform over all bits (every bit pattern of these storages is a finite value). Only
-tensors named as weight matrices are touched: scales, zero points and the integer index tensors
-(g_idx, permutations, expert maps) keep the framework's values. 16/32-bit float weights keep
-the framework's U(-1e-3, 1e-3) draw, whose bits are already dense.
+post-load processing (repacking, scale conversion), every weight matrix: FP8 storage from
+N(0, 64) clamped to +-448, 8-bit integers uniform over all bytes, 32-bit integers uniform over
+all bits (every bit pattern of these storages is a finite value), 16/32-bit float matrices from
+N(0, 0.02) and normalization weights to 1, so hidden states keep unit scale and routers route on
+the tokens (logits around 1.7 for a 7168-wide hidden state). Only tensors named as weights are
+touched: scales, zero points, biases and the integer index tensors (g_idx, permutations, expert
+maps) keep the framework's values.
 """
 
 from __future__ import annotations
@@ -33,12 +41,21 @@ def is_weight_matrix(name: str) -> bool:
     return leaf.endswith(_MATRIX_SUFFIXES) and not any(s in leaf for s in _NOT_MATRIX)
 
 
-def _fill(tensor) -> bool:
+def is_norm_weight(name: str) -> bool:
+    parts = name.rsplit(".", 2)
+    return parts[-1] == "weight" and len(parts) > 1 and "norm" in parts[-2]
+
+
+def _fill(tensor, norm: bool = False) -> bool:
     import torch
 
     if tensor.is_floating_point():
         if tensor.element_size() >= 2:
-            return False
+            if norm:
+                tensor.fill_(1.0)
+            else:
+                tensor.normal_(0.0, 0.02)
+            return True
         flat = tensor.view(-1)
         for start in range(0, flat.numel(), _CHUNK):
             part = flat[start : start + _CHUNK]
@@ -56,9 +73,10 @@ def _fill(tensor) -> bool:
     return True
 
 
-def densify(named_tensors) -> dict:
-    """Refill the low-bit weight matrices of ``named_tensors`` ((name, tensor) pairs) in place;
-    returns {"tensors": n, "bytes": total} for the probe record."""
+def densify(named_tensors, low_bit: bool = True) -> dict:
+    """Refill the weights of ``named_tensors`` ((name, tensor) pairs) in place; ``low_bit=False``
+    leaves FP8 and integer storage alone (TRT-LLM's own dummy draw already fills them densely).
+    Returns {"tensors": n, "bytes": total} for the probe record."""
     import torch
 
     n = total = 0
@@ -67,7 +85,9 @@ def densify(named_tensors) -> dict:
             if tensor is None or tensor.device.type == "meta" or not is_weight_matrix(name):
                 continue
             data = tensor.data if hasattr(tensor, "data") else tensor
-            if _fill(data):
+            if not low_bit and not (data.is_floating_point() and data.element_size() >= 2):
+                continue
+            if _fill(data, norm=is_norm_weight(name)):
                 n += 1
                 total += data.numel() * data.element_size()
     return {"tensors": n, "bytes": total}
@@ -109,3 +129,22 @@ def install_sglang(rec: dict) -> None:
         acc["bytes"] += stats["bytes"]
 
     loader.initialize_dummy_weights = initialize_dummy_weights
+
+
+def install_trtllm(rec: dict) -> None:
+    """Wrap the initialize_dummy_weights TRT-LLM's model loader calls for load_format=dummy
+    (_torch/pyexecutor/model_loader.py ModelLoader.load): its FP8 / FP4 / INT8 draw is dense
+    already, its 16/32-bit floats are U(-1e-3, 1e-3), so only the floats are refilled. Takes
+    effect only when the executor builds the model in this process (rec in_process_model)."""
+    import tensorrt_llm._torch.pyexecutor.model_loader as model_loader
+
+    original = model_loader.initialize_dummy_weights
+
+    def initialize_dummy_weights(model, *args, **kwargs):
+        original(model, *args, **kwargs)
+        stats = densify([*model.named_parameters(), *model.named_buffers()], low_bit=False)
+        acc = rec.setdefault("probe_dense_weights", {"tensors": 0, "bytes": 0})
+        acc["tensors"] += stats["tensors"]
+        acc["bytes"] += stats["bytes"]
+
+    model_loader.initialize_dummy_weights = initialize_dummy_weights
