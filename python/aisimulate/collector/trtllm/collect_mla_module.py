@@ -132,6 +132,11 @@ def _round_up(a, b):
     return _ceil_div(a, b) * b
 
 
+# One 32 MiB GPU allocation unit for each pool of a DSA layer (MLA KV, indexer
+# K); see create_kv_cache_and_metadata.
+_DSA_POOL_ROUNDING_BYTES = 2 * (32 << 20)
+
+
 def _replace_quant_config(qc, **kwargs):
     """Replace fields in quant_config; supports both dataclass and Pydantic BaseModel."""
     if dataclasses.is_dataclass(qc):
@@ -485,8 +490,25 @@ def create_kv_cache_and_metadata(
         kv_cache_len = seq_len
 
     # --- KV Cache Manager ---
+    # The pool is sized for this case's requests; its size is not a timing input
+    # (MLA and the DSA indexer read KV through the block table). A DSA layer
+    # adds an indexer K-cache buffer (DSACacheManagerV2._extra_buffers_per_layer,
+    # attention/backends/sparse/dsa/cache_manager.py), a second pool in the same
+    # pool group, and V2 splits the quota with every pool rounded up to the GPU
+    # allocation unit, 2 MiB growing to 32 MiB with the quota
+    # (StorageManager::computeSlotCountForLevel, ratioToSlotCountList,
+    # kv_cache_manager_v2/storageManager.cpp). On a one-layer pool that rounding
+    # left the MLA pool short of one request: max_seq_len was clamped
+    # (clamp_max_seq_len_for_mem) and add_dummy_requests overran the page-index
+    # buffer ("base page indices is too short", every DSA case). DSA quotas
+    # therefore carry one largest unit per pool, converted to tokens at the
+    # smallest per-token footprint (head_dim bytes, an FP8 row); dense MLA has
+    # one pool and keeps the exact size.
+    kv_tokens = batch_size * _round_up(max_seq, tokens_per_block)
+    if model_config.sparse_attention_config is not None:
+        kv_tokens += _round_up(-(-_DSA_POOL_ROUNDING_BYTES // head_dim), tokens_per_block)
     kv_cache_config = KvCacheConfig(
-        max_tokens=batch_size * _round_up(max_seq, tokens_per_block),
+        max_tokens=kv_tokens,
         enable_block_reuse=False,
     )
     # Serving's class: KvCacheConfig.use_kv_cache_manager_v2 defaults to True
