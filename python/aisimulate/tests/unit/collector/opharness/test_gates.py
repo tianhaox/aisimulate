@@ -179,3 +179,11 @@ def test_a_gate_reads_only_traces_from_its_own_sm(gates, tmp_path):
     # a trace that died before recording its SM is used only when no attributed one exists
     assert gates._trace(dirs, name, "vllm", "0.32.0", 103).parent.parent.name == "h100_failed"
     assert gates._trace([tmp_path / "b200_sxm"], name, "vllm", "0.32.0", 90) is None
+
+
+def test_moe_gates_are_timed_at_their_token_points(gates):
+    """A timed gate grades its decode point (1 token) and prefill point (isl tokens) against
+    serving's time; ops not yet timed return None."""
+    select = {"moe_type": "fp8_block", "tp": 1, "num_tokens": [4096, 1]}
+    assert gates.gate_timing("moe", select) == ([1, 4096], 1)
+    assert gates.gate_timing("gemm", {"gemm_type": "fp8_block", "m": 4096}) is None

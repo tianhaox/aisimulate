@@ -293,3 +293,28 @@ def test_trace_case_refuses_a_release_the_op_does_not_pin(monkeypatch, tmp_path)
     monkeypatch.setattr(trace_case, "installed_version", lambda backend: "0.30.0")
     with pytest.raises(RuntimeError, match=r"requires exactly (?!0\.30\.0)\d+\.\d+\.\d+, found 0\.30\.0"):
         trace_case.run({"backend": "vllm", "op": "gemm", "m": "1"}, tmp_path)
+
+
+def test_measured_timing_gives_one_kernel_table_per_timed_point(monkeypatch):
+    """A timed gate compares the per-launch device time of each benchmark_with_power call (one
+    per swept point) with serving's at the matching shape."""
+    from collector import helper
+    from collector.probes import _traced_child
+
+    events = [
+        _Event(helper.TRACE_MEASURED_RANGE, "cpu", start=10.0, end=20.0),
+        _Event("fc_kernel", start=11.0, end=13.0),
+        _Event("fc_kernel", start=14.0, end=16.5),
+        _Event("Memcpy DtoD (Device -> Device)", start=17.0),
+        _Event("fc_kernel", start=25.0, end=26.0),  # between the windows: the next warm-up
+        _Event(helper.TRACE_MEASURED_RANGE, "cpu", start=30.0, end=40.0),
+        _Event(helper.TRACE_MEASURED_RANGE, start=30.5, end=39.0, annotation=True),
+        _Event("fc_kernel", start=31.0, end=41.0),
+    ]
+    _fake_torch(monkeypatch, events)
+    prof = types.SimpleNamespace(events=lambda: events)
+    assert _traced_child.measured_timing(prof) == [
+        {"fc_kernel": {"us": 4.5, "launches": 2}},
+        {"fc_kernel": {"us": 10.0, "launches": 1}},
+    ]
+    assert _traced_child.measured_timing(types.SimpleNamespace(events=lambda: events[1:5])) is None

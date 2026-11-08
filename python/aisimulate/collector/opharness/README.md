@@ -69,6 +69,17 @@ pipeline (the `aisim-campaign` skill). Nothing generated is committed.
   length and release on the same SM, on the kernels of the roles and phase its op decides;
   every other kernel of the timed runs alone (the trace's `measured_kernels`, warmups left
   out) must be one serving launches under its role, or the gate diverges with `aux_drift`.
+  A timed gate (`gates._TIMED_SWEEP`: moe) also compares time. Its 1-token point is
+  graded against serving's bs1 decode step and its `isl`-token point against the prefill
+  step. Over the target-role kernels both sides launch, the collector's per-launch time
+  (`measured_timing`) must be within `path_diff.TIMING_TOLERANCE` of serving's (record
+  `kernel_time`), or the gate is `timing-diverged`. A kernel that differs from serving's
+  only in its tactic (tile, stages) then shows under `tactic_drift` as a diagnostic.
+  Untimed, it still diverges the gate.
+  The vLLM and SGLang probes refill their dummy models' low-bit weights densely
+  (`probes/_dense_dummy.py`), because their own dummy draw leaves those weights near zero
+  and times fast. A record without dense weights gives `reference-not-dense` and is not
+  timed. TRT-LLM's own dummy draw is dense.
   It writes the verdicts to `results/pathdiff/<sm>/<backend>-<version>/`. A gate exists on
   an SM where its case is planned; `no_serving` marks an SM where the model cannot be
   served, which gets a `platform-floor` verdict.

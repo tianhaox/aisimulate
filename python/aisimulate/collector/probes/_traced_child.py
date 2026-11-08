@@ -39,19 +39,54 @@ def kernel_names(prof) -> tuple[list[str], bool, list[str] | None]:
     path. The measured set leaves out the warmups' one-time work too (JIT, autotune inputs):
     every kernel in it is paid on each timed call. GPU-side user annotations and memcpy/memset
     are not kernels."""
-    from torch.autograd import DeviceType
-
     events = prof.events()
-
-    def windows(name):
-        return [
-            (e.time_range.start, e.time_range.end) for e in events if e.name == name and e.device_type == DeviceType.CPU
-        ]
 
     def inside(spans):
         return sorted({e.name for e in kernels if any(lo <= e.time_range.start <= hi for lo, hi in spans)})
 
-    kernels = [
+    kernels = _kernel_events(events)
+    timed, measured = _windows(events, TIMED_RANGE), _windows(events, MEASURED_RANGE)
+    if not timed:
+        return sorted({e.name for e in kernels}), False, None
+    return inside(timed), True, inside(measured) if measured else None
+
+
+def measured_timing(prof) -> list[dict] | None:
+    """The device time of the timed runs, one table per measured window (each
+    benchmark_with_power call, in launch order): ``{kernel: {"us": total, "launches": n}}``
+    over the kernels that started inside it. The path gates compare the per-launch time of a
+    window with serving's at the matching shape. None when no window was recorded."""
+    events = prof.events()
+    spans = sorted(_windows(events, MEASURED_RANGE))
+    if not spans:
+        return None
+    tables: list[dict] = [{} for _ in spans]
+    for e in _kernel_events(events):
+        start = e.time_range.start
+        for i, (lo, hi) in enumerate(spans):
+            if lo <= start <= hi:
+                slot = tables[i].setdefault(e.name, {"us": 0.0, "launches": 0})
+                slot["us"] += e.time_range.end - e.time_range.start
+                slot["launches"] += 1
+                break
+    for table in tables:
+        for slot in table.values():
+            slot["us"] = round(slot["us"], 3)
+    return tables
+
+
+def _windows(events, name):
+    from torch.autograd import DeviceType
+
+    return [
+        (e.time_range.start, e.time_range.end) for e in events if e.name == name and e.device_type == DeviceType.CPU
+    ]
+
+
+def _kernel_events(events):
+    from torch.autograd import DeviceType
+
+    return [
         e
         for e in events
         if e.device_type == DeviceType.CUDA
@@ -59,10 +94,6 @@ def kernel_names(prof) -> tuple[list[str], bool, list[str] | None]:
         and e.name not in (TIMED_RANGE, MEASURED_RANGE)
         and not e.name.startswith(("Memcpy", "Memset"))
     ]
-    timed, measured = windows(TIMED_RANGE), windows(MEASURED_RANGE)
-    if not timed:
-        return sorted({e.name for e in kernels}), False, None
-    return inside(timed), True, inside(measured) if measured else None
 
 
 def main() -> None:
@@ -91,6 +122,7 @@ def main() -> None:
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     record = {"mode": mode, "status": status, "error": None if failure is None else repr(failure)[:500]}
     record["kernels"], record["timed"], record["measured"] = kernel_names(prof)
+    record["measured_timing"] = measured_timing(prof)
     (Path(out_dir) / f"child_{os.getpid()}.json").write_text(json.dumps(record))
     if failure is not None:
         raise failure

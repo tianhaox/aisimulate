@@ -262,3 +262,122 @@ def test_a_warmup_only_kernel_of_the_target_role_is_not_graded():
     assert grade(col, srv, ("gemm",))["verdict"] == "diverged"  # timed range only: the pack counts
     g = grade(col, srv, ("gemm",), measured=[_B200_GEMM, "per_token_group_quant_8bit_kernel"])
     assert g["verdict"] == "aligned" and g["kernel_drift"] is None and g["aux_drift"] == {}
+
+
+# ---------------------------------------------------------------- timed gates (2026-11-08)
+# owner decision: time decides a timed gate (within path_diff.TIMING_TOLERANCE of serving's at
+# the matching shape); a kernel that differs only in its tactic is a diagnostic
+_MOE = {
+    "bmm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_s6_et64x64": ("trtllm_gen", "moe_gemm"),
+    "bmm_E4m3_E4m3E4m3_Fp32_t128x128x128_s4_et128x64": ("trtllm_gen", "moe_gemm"),
+    "routingDeepSeek": ("trtllm_gen", "routing"),
+    "rmsnorm_kernel": ("framework_native", "norm_rope"),
+}
+FC_A, FC_B = "bmm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_s6_et64x64", "bmm_E4m3_E4m3E4m3_Fp32_t128x128x128_s4_et128x64"
+
+
+def _timing(windows, srv_time, points=(1, 4096), tol=path_diff.TIMING_TOLERANCE):
+    return path_diff.grade_timing(
+        windows,
+        srv_time,
+        ("moe_gemm", "routing"),
+        _MOE.get,
+        lambda n: n,
+        list(points),
+        lambda p: "decode" if p == 1 else "prefill" if p == 4096 else None,
+        tol,
+    )
+
+
+def _srv(decode_us, prefill_us, name=FC_A):
+    # serving's one profiled step per phase: two MoE layers, FC1 + FC2 per layer
+    return {
+        "decode": {name: {"us": decode_us * 4, "launches": 4}, "routingDeepSeek": {"us": 20.0, "launches": 2}},
+        "prefill": {name: {"us": prefill_us * 4, "launches": 4}, "rmsnorm_kernel": {"us": 50.0, "launches": 4}},
+    }
+
+
+def _win(us, name=FC_A, launches=12):
+    return {name: {"us": us * launches, "launches": launches}, "routingDeepSeek": {"us": 10.0 * 6, "launches": 6}}
+
+
+def test_timing_compares_per_launch_time_at_the_matching_serving_phase():
+    t = _timing([_win(100.0), _win(2000.0)], _srv(100.0, 2050.0))
+    assert t["status"] == "pass"
+    decode, prefill = t["points"]
+    assert (decode["point"], decode["phase"], prefill["phase"]) == (1, "decode", "prefill")
+    # decode: FC 100 vs 100 us over 4 launches, routing 10 vs 10 us over 2 -> 1.0
+    assert decode["ratio"] == 1.0 and decode["coverage"] == 1.0
+    assert prefill["ratio"] == pytest.approx(2000 / 2050, abs=1e-3)
+    assert prefill["serving_unpaired"] is None and prefill["collector_unpaired"] == ["routingDeepSeek"]
+
+
+def test_timing_outside_the_tolerance_fails_the_point():
+    t = _timing([_win(100.0), _win(2400.0)], _srv(100.0, 2000.0))
+    assert t["status"] == "fail"
+    assert [p["status"] for p in t["points"]] == ["pass", "fail"] and t["points"][1]["ratio"] == 1.2
+
+
+def test_a_tactic_difference_is_compared_on_time_and_listed():
+    t = _timing([_win(100.0), _win(2000.0, FC_B)], _srv(100.0, 2000.0, FC_A))
+    prefill = t["points"][1]
+    assert t["status"] == "pass" and prefill["kernels"][0]["kernel"] == "bmm_E4m3_E4m3E4m3_Fp32"
+    assert prefill["kernels"][0]["tactics"] == {"collector": [FC_B], "serving": [FC_A]}
+
+
+def test_windows_that_do_not_line_up_with_the_points_are_not_graded():
+    assert _timing([_win(100.0)], _srv(100.0, 2000.0))["status"] == "unmapped"
+    # a point that matches no serving shape is skipped; none graded is reported as such
+    assert _timing([_win(1.0)], _srv(1.0, 1.0), points=(64,))["status"] == "no-graded-point"
+
+
+def test_a_tactic_drift_passes_only_on_a_passing_time():
+    col, srv = [FC_B], [FC_A, "routingDeepSeek"]
+    untimed = path_diff.grade(col, set(srv), ("moe_gemm",), None, _MOE.get, col, set(srv))
+    assert untimed["verdict"] == "diverged" and untimed["tactic_drift"] and untimed["kernel_drift"] is None
+    passed = path_diff.grade(col, set(srv), ("moe_gemm",), None, _MOE.get, col, set(srv), {"status": "pass"})
+    assert passed["verdict"] == "aligned" and passed["tactic_drift"]["moe_gemm"]["collector_only_kernels"] == col
+    failed = path_diff.grade([FC_A], set(srv), ("moe_gemm",), None, _MOE.get, [FC_A], set(srv), {"status": "fail"})
+    assert failed["verdict"] == "timing-diverged"
+
+
+def test_a_kernel_of_another_family_is_drift_even_when_the_time_passes():
+    labels = {**_MOE, "_matmul_ogs_NNT_bf16xbf16xmxfp4": ("triton", "moe_gemm")}
+    col, srv = ["bmm_E4m3_E4m3E4m3_Fp32_x"], {"_matmul_ogs_NNT_bf16xbf16xmxfp4"}
+    labels["bmm_E4m3_E4m3E4m3_Fp32_x"] = ("triton", "moe_gemm")
+    g = path_diff.grade(col, srv, ("moe_gemm",), None, labels.get, col, srv, {"status": "pass"})
+    assert g["verdict"] == "diverged" and g["kernel_drift"] and g["tactic_drift"] is None
+
+
+def test_a_kernel_name_other_ops_share_pairs_only_on_its_full_name():
+    """DeepGEMM's fp8_gemm_kernel runs serving's dense GEMMs and its grouped MoE GEMM under one
+    normalized name; the full name (template arguments) pairs the MoE one alone."""
+    labels = {"deep_gemm::fp8_gemm_kernel": ("deepgemm", "moe_gemm")}
+    moe = "deep_gemm::fp8_gemm_kernel<4096u, 7168u, GroupedWithOffsetScheduler>"
+    dense = [
+        "deep_gemm::fp8_gemm_kernel<4096u, 1536u, NormalScheduler>",
+        "deep_gemm::fp8_gemm_kernel<7168u, 2048u, NormalScheduler>",
+    ]
+    srv = {"prefill": {moe: {"us": 2000.0, "launches": 2}, **{d: {"us": 300.0, "launches": 4} for d in dense}}}
+
+    def run(col_name):
+        return path_diff.grade_timing(
+            [{col_name: {"us": 3000.0, "launches": 3}}],
+            srv,
+            ("moe_gemm",),
+            labels.get,
+            lambda raw: raw.split("<")[0],
+            [4096],
+            lambda p: "prefill",
+        )
+
+    exact = run(moe)["points"][0]
+    assert (
+        exact["status"] == "pass"
+        and exact["ratio"] == 1.0
+        and exact["coverage"] == pytest.approx(2000 / 2600, abs=1e-3)
+    )
+    # another template (tactic or shape) of the collector's MoE GEMM: serving's three
+    # variants cannot be told apart, so none is paired
+    other = run("deep_gemm::fp8_gemm_kernel<4096u, 7168u, GroupedWithOffsetScheduler, 64u>")["points"][0]
+    assert other["status"] == "no-overlap" and other["ambiguous"][0]["serving"] == 3

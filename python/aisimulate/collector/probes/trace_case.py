@@ -17,8 +17,10 @@ once through the backend registry's run function under ``torch.profiler``, bindi
 collect.py binds, with its perf files in a discarded scratch directory. The result lists
 the CUDA kernels the row times (``timed_only``: inside benchmark_with_power; otherwise the
 whole run) and ``measured_kernels``, those of the timed runs alone (None when the row did
-not time through benchmark_with_power): the collector side of an opharness path gate. A
-collector that times its points in a child process (``helper.trace_child_argv``) runs that
+not time through benchmark_with_power): the collector side of an opharness path gate.
+``measured_timing`` gives the device time of those runs, one ``{kernel: {us, launches}}``
+table per benchmark_with_power call in launch order (one per swept point): the timing side
+of the gate. A collector that times its points in a child process (``helper.trace_child_argv``) runs that
 child under the profiler too, and its kernels are included (``measurement_children`` counts
 them).
 """
@@ -34,7 +36,7 @@ import tempfile
 from inspect import signature
 from pathlib import Path
 
-from collector.probes._traced_child import kernel_names
+from collector.probes._traced_child import kernel_names, measured_timing
 
 _RESTART_CODE = 10  # collector.helper.EXIT_CODE_RESTART: the worker recycles after the case ran
 
@@ -181,6 +183,7 @@ def run(args: dict[str, str], out_dir: Path) -> dict:
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
         own, own_timed, own_measured = kernel_names(prof)
+        own_timing = measured_timing(prof)
         child_records = [json.loads(f.read_text()) for f in sorted(children.glob("child_*.json"))]
     finally:
         for name, value in saved.items():
@@ -200,6 +203,11 @@ def run(args: dict[str, str], out_dir: Path) -> dict:
     # the timed runs alone, only when every process that timed completed its runs
     runs = [m for _, t, m in traced if t]
     measured = sorted(set().union(*map(set, runs))) if timed and None not in runs else None
+    # the per-window kernel times of every process that timed, in process order (one process
+    # times a case's points in practice)
+    windows = [own_timing] if own_timed else []
+    windows += [r.get("measured_timing") for r in child_records if r.get("timed")]
+    timing = [w for ws in windows for w in ws] if windows and None not in windows else None
     return {
         "backend": backend,
         "framework_version": version,
@@ -211,6 +219,7 @@ def run(args: dict[str, str], out_dir: Path) -> dict:
         "kernels": kernels,
         "timed_only": timed,
         "measured_kernels": measured,
+        "measured_timing": timing,
         "measurement_children": len(child_records),
         "error": error,
         "failed": error is not None or not kernels,

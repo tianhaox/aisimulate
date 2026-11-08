@@ -307,3 +307,23 @@ def test_a_roster_repo_without_a_dummy_needs_no_config(pd, tmp_path, monkeypatch
     monkeypatch.setattr(pd, "derive_profile", lambda repo, configs: "bf16")
     cks = {ck["repo"]: ck for ck in pd.derive_roster_checkpoints({}, {})}
     assert cks["org/built"]["variants"] == ["rep"] and cks["org/unbuilt"]["variants"] == []
+
+
+def test_serving_kernel_time_is_kept_per_phase_with_launch_counts(pd):
+    """The timing reference of a timed gate: each device-table kernel's time and launches in the
+    profiled prefill and decode steps; step markers and spans are not kernels."""
+    facts = {
+        "prefill_kernels": [
+            {"kernel": "step[EXTEND bs=1 toks=4096]", "calls": 1, "us": 9000.0},
+            {"kernel": "_matmul_ogs_NNT_bf16xbf16xmxfp4_128x256x128x1_swiglu", "launches": 2, "us": 2000.0},
+            {"kernel": "_matmul_ogs_NNT_bf16xbf16xmxfp4_64x256x128x1_swiglu", "launches": 2, "us": 1000.0},
+        ],
+        "decode_kernels": [{"kernel": "AIC::moe::FusedMoE", "launches": 2, "us": 80.0}],
+    }
+    assert pd.build_kernel_time(facts) == {
+        # full names: the timing check pairs on them first (path_diff.grade_timing)
+        "prefill": {
+            "_matmul_ogs_NNT_bf16xbf16xmxfp4_128x256x128x1_swiglu": {"us": 2000.0, "launches": 2},
+            "_matmul_ogs_NNT_bf16xbf16xmxfp4_64x256x128x1_swiglu": {"us": 1000.0, "launches": 2},
+        }
+    }
