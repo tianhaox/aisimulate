@@ -35,9 +35,10 @@ schema_version: 1
 
 mappings:
   # ---------------------------------------------------------------- sglang
-  # Attention backend pins (serving-truth per SM):
-  # collector/sglang/collect_attn.py — SM>=110 or (SM>=100 & head_dim=192) ->
-  # triton; SM>=100 -> TRTLLMHAAttnBackend; else FlashAttentionBackend (fa3).
+  # Attention backend pins (serving-truth per SM): collector/sglang/collect_attn.py
+  # records the plan's dispatch (case_generator.sglang_default_attention_backend,
+  # overridden by a model's sglang_backends) as kernel_source: fa3, fa4,
+  # flashinfer, trtllm_mha or triton.
   - {framework: sglang, kernel_source: flash_attention, backend: fa3, source: "collector/sglang/collect_attn.py + collect_mla.py (FlashAttentionBackend pin)"}
   - {framework: sglang, kernel_source: flash_attention_v3, backend: fa3, source: "collector/sglang/collect_attn_encoder.py"}
   - {framework: sglang, kernel_source: flash_attention_v4, backend: fa4, source: "collector/sglang/collect_attn_encoder.py"}
@@ -45,6 +46,7 @@ mappings:
   - {framework: sglang, kernel_source: trtllm_mla, backend: trtllm_mla, source: "collector/sglang/collect_mla.py (_select_default_mla_backend, SM100)"}
   - {framework: sglang, kernel_source: mla_trtllm_mla, backend: trtllm_mla, source: "collector/sglang/collect_mla_module.py (ordinary MLA module, server_args.attention_backend)"}
   - {framework: sglang, kernel_source: triton, backend: triton, source: "collector/sglang/collect_attn.py (TritonAttnBackend)"}
+  - {framework: sglang, kernel_source: fa4, backend: fa4, source: "collector/sglang/collect_attn.py (FlashAttentionBackend fa_impl_ver=4; MiMo-V2 on SM100/103)"}
   - {framework: sglang, kernel_source: fa3, backend: fa3, source: "collector/wideep/sglang (attn_backend arg)"}
   - {framework: sglang, kernel_source: flashinfer, backend: flashinfer, source: "collector/wideep/sglang (attn_backend arg)"}
   - {framework: sglang, kernel_source: flash_mla_with_kvcache, backend: flashmla, source: "collector/sglang/collect_dsv4_attn.py"}

@@ -2274,8 +2274,10 @@ def _vllm_attention_rows(phase: str):
     is_context = phase == "context"
 
     # vLLM's attention collector takes one head_dim and no sinks: it times
-    # MiMo-V2-Flash's head_dim 192 rows with V=192 (serving's V head is 128)
-    # and GPT-OSS's rows without attention sinks.
+    # MiMo-V2-Flash's head_dim 192 rows with V=192 on the native FLASH_ATTN
+    # path, where serving runs V=128 on FLASH_ATTN_DIFFKV or TRITON_ATTN_DIFFKV
+    # (vllm model_executor/models/mimo_v2.py:300-321), and GPT-OSS's rows
+    # without attention sinks.
     def rows(case: AttentionCase, sm_version: int | None, runner: str | None) -> list[list]:
         return [
             [

@@ -325,10 +325,17 @@ SKIPS: list[dict] = [
         "kv_cache_dtype": "fp8",
         "attn_dtype": "bfloat16",
     },
-    # SGLang: the flashinfer prefill plans BF16 Q against the FP8 KV cache
-    # (flashinfer_backend.py) and has no FP8-compute path, so an FP8-compute row
-    # would time BF16 compute under an fp8 label.
-    {"backend": "sglang", "op": "attention_context", "dispatch": "flashinfer", "attn_dtype": "fp8"},
+    # SGLang: flashinfer, triton and fa4 prefill run BF16 Q against the FP8 KV cache
+    # and have no FP8-compute path (flashinfer_backend.py; triton_backend.py
+    # forward_extend never quantizes Q; flashattention_backend.py
+    # prepare_paged_mha_query skips the Q cast for fa4 prefill), so an
+    # FP8-compute row would time BF16 compute under an fp8 label.
+    {
+        "backend": "sglang",
+        "op": "attention_context",
+        "dispatch": ["flashinfer", "triton", "fa4"],
+        "attn_dtype": "fp8",
+    },
     # vLLM: the attention collector has no FP8-compute (FP8 FMHA) input, so an
     # FP8-compute row would re-time the FP8-KV case under an fp8 label.
     {"backend": "vllm", "op": "attention_context", "attn_dtype": "fp8"},

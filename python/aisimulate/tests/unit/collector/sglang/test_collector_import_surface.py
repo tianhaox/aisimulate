@@ -29,6 +29,7 @@ dependencies, not the subject of this bug class; strictness is scoped to
 the sglang surface specifically, per the actual incident.
 """
 
+import contextlib
 import importlib.util
 import sys
 import types
@@ -302,6 +303,86 @@ class TestCollectGemmImportSurface:
         _install_fake_sglang(monkeypatch, SGLANG_0523_COMPUTESCALE_SURFACE)
         module = _import_fresh(monkeypatch, _COLLECT_COMPUTESCALE_DOTTED, _COLLECT_COMPUTESCALE_PATH)
         assert module.__compat__ == "sglang==0.5.23"
+
+
+# ---------------------------------------------------------------------------
+# collect_attn.py / collect_attn_encoder.py
+# ---------------------------------------------------------------------------
+# The sglang 0.5.23 names collect_attn.py touches at import time: the dense attention
+# layer and FlashAttention backend, the KV pools, the KV-index translator the runner
+# builds (mem_cache/kv_index_translator.py), the forward batch and context, and the
+# runtime-context parallel override (evaluated at import, as a decorator) plus the named
+# buffer the FlashInfer workspace lives in.
+class _NullContextDecorator(contextlib.ContextDecorator):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeParallel:
+    def __init__(self):
+        self.overrides: list[dict] = []
+
+    def override(self, **kwargs):
+        self.overrides.append(kwargs)
+        return _NullContextDecorator()
+
+
+_ATTENTION_PARALLEL = _FakeParallel()
+
+SGLANG_0523_ATTENTION_SURFACE = {
+    "sglang.srt.configs.model_config": {"AttentionArch": _Dummy},
+    "sglang.srt.layers.attention.flashattention_backend": {"FlashAttentionBackend": _Dummy},
+    "sglang.srt.layers.radix_attention": {"RadixAttention": _Dummy},
+    "sglang.srt.mem_cache.kv_index_translator": {"KVIndexTranslator": _Dummy},
+    "sglang.srt.mem_cache.memory_pool": {"MHATokenToKVPool": _Dummy, "ReqToTokenPool": _Dummy},
+    "sglang.srt.model_executor.forward_batch_info": {"ForwardBatch": _Dummy, "ForwardMode": _Dummy},
+    "sglang.srt.model_executor.forward_context": {"ForwardContext": _Dummy, "forward_context": _dummy},
+    "sglang.srt.runtime_context": {"get_buffer": _dummy, "get_parallel": lambda: _ATTENTION_PARALLEL},
+}
+
+_COLLECT_ATTN_PATH = COLLECTOR_DIR / "sglang" / "collect_attn.py"
+_COLLECT_ATTN_DOTTED = "collector.sglang.collect_attn"
+_COLLECT_ATTN_ENCODER_PATH = COLLECTOR_DIR / "sglang" / "collect_attn_encoder.py"
+_COLLECT_ATTN_ENCODER_DOTTED = "collector.sglang.collect_attn_encoder"
+_ATTN_LENIENT_EXTRAS = ("torch.nn",)
+
+
+class TestCollectAttnImportSurface:
+    def test_imports_cleanly_against_0523_shaped_sglang(self, monkeypatch):
+        _ATTENTION_PARALLEL.overrides.clear()
+        _install_fake_sglang(monkeypatch, SGLANG_0523_ATTENTION_SURFACE, lenient_extras=_ATTN_LENIENT_EXTRAS)
+        module = _import_fresh(monkeypatch, _COLLECT_ATTN_DOTTED, _COLLECT_ATTN_PATH)
+        assert callable(module.run_attention_torch)
+        # The kernel collector runs one attention rank: the override the decorator declares.
+        assert _ATTENTION_PARALLEL.overrides == [
+            {
+                "attn_tp_size": 1,
+                "attn_tp_rank": 0,
+                "attn_cp_size": 1,
+                "attn_cp_rank": 0,
+                "attn_dp_size": 1,
+                "attn_dp_rank": 0,
+            }
+        ]
+
+    def test_import_fails_without_the_0523_kv_index_translator(self, monkeypatch):
+        """The runner's translator is built from sglang's own class; there is no stand-in."""
+        surface = {
+            name: attrs
+            for name, attrs in SGLANG_0523_ATTENTION_SURFACE.items()
+            if name != "sglang.srt.mem_cache.kv_index_translator"
+        }
+        _install_fake_sglang(monkeypatch, surface, lenient_extras=_ATTN_LENIENT_EXTRAS)
+        with pytest.raises(ImportError):
+            _import_fresh(monkeypatch, _COLLECT_ATTN_DOTTED, _COLLECT_ATTN_PATH)
+
+    def test_encoder_imports_with_zero_sglang_modules_present(self, monkeypatch):
+        """collect_attn_encoder.py imports its kernels inside the per-SM lane only."""
+        _install_fake_sglang(monkeypatch, {})
+        _import_fresh(monkeypatch, _COLLECT_ATTN_ENCODER_DOTTED, _COLLECT_ATTN_ENCODER_PATH)
 
 
 # ---------------------------------------------------------------------------

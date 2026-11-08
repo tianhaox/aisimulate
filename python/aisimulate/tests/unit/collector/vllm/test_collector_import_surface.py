@@ -32,6 +32,8 @@ collector file actually under test, not on re-proving that separately-
 verified surface every time.
 """
 
+import contextlib
+import functools
 import importlib.util
 import re
 import sys
@@ -439,3 +441,180 @@ class TestCollectGdnImportSurface:
 
         _install_fake_vllm(monkeypatch, VLLM_0240_GDN_SURFACE)
         _import_fresh(monkeypatch, _COLLECT_GDN_DOTTED, scratch_file)
+
+
+# ---------------------------------------------------------------------------
+# collect_attn.py / collect_attn_encoder.py -- the vLLM 0.32.0 surface
+# ---------------------------------------------------------------------------
+class _StopRun(Exception):
+    """Raised by a fake to end run_*_torch() at the call under test."""
+
+
+class _FakeBackendEnum:
+    FLASH_ATTN = "FLASH_ATTN"
+    TRITON_ATTN = "TRITON_ATTN"
+    TORCH_SDPA = "TORCH_SDPA"
+
+
+def _with_exit_stack(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        with contextlib.ExitStack() as stack:
+            return func(stack, *args, **kwargs)
+
+    return wrapper
+
+
+def _batch_spec(seq_lens, query_lens):
+    return types.SimpleNamespace(seq_lens=seq_lens, query_lens=query_lens, compute_num_tokens=lambda: sum(query_lens))
+
+
+# The names collect_attn.py takes from its vLLM-only helper module.
+_ATTN_UTILS = {
+    "BatchSpec": _batch_spec,
+    "create_common_attn_metadata": _dummy,
+    "create_kv_cache_and_block_mappings": _dummy,
+    "create_standard_kv_cache_spec": _dummy,
+    "create_vllm_config": _dummy,
+    "framework_kv_block_size": _dummy,
+    "get_attention_backend": _dummy,
+    "with_exit_stack": _with_exit_stack,
+}
+
+# vLLM 0.32.0: selection goes through serving's get_attn_backend
+# (v1/attention/selector.py:105), not a hand-built AttentionSelectorConfig.
+VLLM_0320_ATTN_SURFACE = {
+    "vllm.version": {"__version__": "0.0.0"},
+    "vllm.config": {"set_current_vllm_config": _null_context},
+    "vllm.platforms": {"current_platform": _Dummy()},
+    "vllm.utils.torch_utils": {"set_random_seed": _dummy},
+    "vllm.v1.attention.backends.registry": {"AttentionBackendEnum": _FakeBackendEnum},
+    "vllm.v1.attention.backends.utils": {
+        "get_supported_kv_cache_layouts": _dummy,
+        "resolve_kv_cache_layout": _dummy,
+    },
+    "vllm.v1.attention.selector": {"get_attn_backend": _dummy},
+}
+
+# vLLM 0.32.0 ViT surface. vit_flash_attn_wrapper is deliberately absent: the
+# collector calls flash_attn_varlen_func as the wrapper's eager branch does.
+VLLM_0320_ENCODER_SURFACE = {
+    "vllm.version": {"__version__": "0.0.0"},
+    "vllm.model_executor.models.vision": {"get_vit_attn_backend": _dummy},
+    "vllm.v1.attention.backends.fa_utils": {
+        "flash_attn_varlen_func": _dummy,
+        "get_flash_attn_version": _dummy,
+    },
+    "vllm.v1.attention.backends.registry": {"AttentionBackendEnum": _FakeBackendEnum},
+    "vllm.v1.attention.ops.vit_attn_wrappers": {
+        "vit_torch_sdpa_wrapper": _dummy,
+        "vit_triton_attn_wrapper": _dummy,
+    },
+}
+
+_COLLECT_ATTN_PATH = COLLECTOR_DIR / "vllm" / "collect_attn.py"
+_COLLECT_ATTN_DOTTED = "collector.vllm.collect_attn"
+_COLLECT_ATTN_ENCODER_PATH = COLLECTOR_DIR / "vllm" / "collect_attn_encoder.py"
+_COLLECT_ATTN_ENCODER_DOTTED = "collector.vllm.collect_attn_encoder"
+
+
+def _import_collect_attn(monkeypatch, surface=VLLM_0320_ATTN_SURFACE, **utils_overrides):
+    _install_fake_vllm(monkeypatch, surface)
+    utils = types.SimpleNamespace(**{**_ATTN_UTILS, **utils_overrides})
+    monkeypatch.setitem(sys.modules, "collector.vllm.utils", utils)
+    return _import_fresh(monkeypatch, _COLLECT_ATTN_DOTTED, _COLLECT_ATTN_PATH)
+
+
+class TestCollectAttnImportSurface:
+    def test_imports_cleanly_against_0320_shaped_vllm(self, monkeypatch):
+        _import_collect_attn(monkeypatch)
+
+    @pytest.mark.parametrize(
+        ("batch_size", "window_size", "use_fp8_kv_cache", "max_num_seqs", "kv_cache_dtype"),
+        [(1, 0, False, 1024, "auto"), (64, 128, True, 1024, "fp8"), (2048, 0, False, 2048, "auto")],
+    )
+    def test_selects_like_serving_under_serving_scheduler_bound(
+        self, monkeypatch, batch_size, window_size, use_fp8_kv_cache, max_num_seqs, kv_cache_dtype
+    ):
+        """The builders read CUDA-graph capture sizes derived from max_num_seqs,
+        so the config carries serving's bound (or the case's larger batch), and
+        the backend comes from serving's get_attn_backend entry point."""
+        config_kwargs = {}
+        selector_calls = []
+
+        def create_vllm_config(**kwargs):
+            config_kwargs.update(kwargs)
+            return types.SimpleNamespace()
+
+        def get_attn_backend(*args, **kwargs):
+            selector_calls.append((args, kwargs))
+            raise _StopRun
+
+        module = _import_collect_attn(monkeypatch, create_vllm_config=create_vllm_config)
+        monkeypatch.setattr(module, "get_attn_backend", get_attn_backend)
+        with pytest.raises(_StopRun):
+            module.run_attention_torch(
+                batch_size, 64, 8, 8, 128, use_fp8_kv_cache, False, window_size, perf_filename="x"
+            )
+
+        assert config_kwargs["max_num_seqs"] == max_num_seqs
+        assert config_kwargs["block_size"] is None
+        ((args, kwargs),) = selector_calls
+        assert args[0] == 128 and args[2] == kv_cache_dtype
+        assert kwargs == {"has_sliding_window": window_size > 0}
+
+    @pytest.mark.parametrize(
+        ("window_size", "expected"),
+        [(0, (None, True)), (128, ((-1, -1), False))],
+    )
+    def test_fa_aot_schedule_matches_hybrid_sliding_window_models(self, monkeypatch, window_size, expected):
+        """Serving turns FA3's AOT scheduling off when the model's FlashAttention
+        layers carry more than one window config (flash_attn.py:834-848); every
+        planned sliding-window profile is such a model."""
+        module = _import_collect_attn(monkeypatch)
+        builder = types.SimpleNamespace(aot_sliding_window=None, aot_schedule=True)
+        module.match_serving_fa_aot_schedule(builder, window_size)
+        assert (builder.aot_sliding_window, builder.aot_schedule) == expected
+
+    def test_fa_aot_schedule_leaves_other_builders_alone(self, monkeypatch):
+        module = _import_collect_attn(monkeypatch)
+        builder = types.SimpleNamespace(aot_schedule=True)
+        module.match_serving_fa_aot_schedule(builder, 128)
+        assert vars(builder) == {"aot_schedule": True}
+
+
+class TestCollectAttnEncoderImportSurface:
+    def test_imports_cleanly_against_0320_shaped_vllm(self, monkeypatch):
+        _install_fake_vllm(monkeypatch, VLLM_0320_ENCODER_SURFACE)
+        _import_fresh(monkeypatch, _COLLECT_ATTN_ENCODER_DOTTED, _COLLECT_ATTN_ENCODER_PATH)
+
+    def test_flash_attn_rows_time_the_eager_wrapper_call(self, monkeypatch):
+        """vit_flash_attn_wrapper zero-fills its output under CUDA-graph capture
+        (vit_attn_wrappers.py:63-67); serving's eager encoder hands
+        flash_attn_varlen_func an empty preallocated buffer, and so must the
+        timed call."""
+        _install_fake_vllm(monkeypatch, VLLM_0320_ENCODER_SURFACE)
+        module = _import_fresh(monkeypatch, _COLLECT_ATTN_ENCODER_DOTTED, _COLLECT_ATTN_ENCODER_PATH)
+        fa_calls = []
+        logged = {}
+
+        @contextlib.contextmanager
+        def benchmark_with_power(*, kernel_func, **_kwargs):
+            kernel_func()
+            yield {"latency_ms": 1.0, "power_stats": None}
+
+        monkeypatch.setattr(module, "get_vit_attn_backend", lambda **_kwargs: _FakeBackendEnum.FLASH_ATTN)
+        monkeypatch.setattr(module, "get_flash_attn_version", lambda **_kwargs: 3)
+        monkeypatch.setattr(module, "flash_attn_varlen_func", lambda *args, **kwargs: fa_calls.append((args, kwargs)))
+        monkeypatch.setattr(module, "benchmark_with_power", benchmark_with_power)
+        monkeypatch.setattr(module, "log_perf", lambda **kwargs: logged.update(kwargs))
+
+        module.run_encoder_attention_torch(2, 1024, 16, 64, perf_filename="x")
+
+        ((args, kwargs),) = fa_calls
+        assert len(args) == 3
+        assert kwargs["out"] is module.torch.empty_like.return_value
+        assert kwargs["causal"] is False and kwargs["dropout_p"] == 0.0
+        assert kwargs["fa_version"] == 3
+        assert kwargs["max_seqlen_q"] == kwargs["max_seqlen_k"] == 1024
+        assert logged["kernel_source"] == "vllm_vit_flash_attn_fa3"

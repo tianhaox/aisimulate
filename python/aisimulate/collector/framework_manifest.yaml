@@ -39,6 +39,8 @@ frameworks:
       gemm: *sglang_0523_runtime
       quantize: *sglang_0523_runtime
       moe: *sglang_0523_runtime
+      attention: *sglang_0523_runtime
+      encoder_attention: *sglang_0523_runtime
     # Model-scoped collector runtime pins: when the resolved run model_path
     # exactly equals one of these keys, the pin overrides BOTH the family
     # pins above and the framework default for every op in the run — the
@@ -106,6 +108,8 @@ frameworks:
       gemm: *trtllm_140rc2_runtime
       quantize: *trtllm_140rc2_runtime
       moe: *trtllm_140rc2_runtime
+      attention: *trtllm_140rc2_runtime
+      encoder_attention: *trtllm_140rc2_runtime
   vllm:
     source_repo: "https://github.com/vllm-project/vllm.git"
     default:
@@ -125,7 +129,6 @@ frameworks:
         source_commit: "db9527a46873454610df6dbedf79a36d6bf1a7f6"
         images:
           default: "vllm/vllm-openai:v0.31.0@sha256:c1c9f6fd5c109ba7f0546a59f5b2f15fb87f64c77782e90a27b648b42a8e67c3"
-      attention: *vllm_0310_runtime
       # Op-by-op move to vLLM 0.32.0 (2026-11): a family moves here once its
       # gates align and its source check is done; the default follows the last one.
       kda: &vllm_0320_runtime
@@ -137,6 +140,8 @@ frameworks:
       gemm: *vllm_0320_runtime
       quantize: *vllm_0320_runtime
       moe: *vllm_0320_runtime
+      attention: *vllm_0320_runtime
+      encoder_attention: *vllm_0320_runtime
     # kda family pin RETIRED: the family ran on the
     # kimi-k3 preview image (0.1.dev19262) while the consumer's fused-decode
     # pricing did not match 0.27's packed-decode serving path.
