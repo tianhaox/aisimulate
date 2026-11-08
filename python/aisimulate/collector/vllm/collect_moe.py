@@ -667,9 +667,20 @@ def run_moe_torch(
         # quantization method, then let that method convert them to the exact
         # runtime layout and construct the production kernel.
         routed_experts = moe_module.routed_experts
+        dense = "wd" in _diag_tags()
+        print(f"DIAG weights: {'dense random' if dense else 'collector default'} tags={sorted(_diag_tags())}", flush=True)
         with torch.no_grad():
             for name, parameter in routed_experts.named_parameters(recurse=False):
-                if parameter.dtype == torch.uint8:
+                if dense and "scale" not in name and parameter.is_floating_point():
+                    if parameter.element_size() < 2:
+                        tmp = torch.randn(parameter.shape, dtype=torch.float32, device=parameter.device) * 64
+                        parameter.copy_(tmp.clamp_(-448, 448).to(parameter.dtype))
+                        del tmp
+                    else:
+                        parameter.normal_(0, 0.02)
+                elif dense and "scale" not in name and parameter.dtype == torch.int32:
+                    parameter.random_(-(2**31), 2**31 - 1)
+                elif parameter.dtype == torch.uint8:
                     if "scale" in name:
                         parameter.fill_(127)
                     else:
@@ -802,18 +813,16 @@ def run_moe_torch(
                 autotuned = flashinfer_autotuned(tune_tokens, run_single_iteration, label=source)
             else:
                 autotuned = contextlib.nullcontext()
-            with (
-                set_forward_context({}, vllm_config),
-                autotuned,
-                benchmark_with_power(
+            with set_forward_context({}, vllm_config), autotuned:
+                with benchmark_with_power(
                     device=device,
                     kernel_func=run_single_iteration,
                     num_warmups=num_warmups,
                     num_runs=num_runs,
                     repeat_n=1,
-                ) as results,
-            ):
-                pass
+                ) as results:
+                    pass
+                _diag_kernels(run_single_iteration, num_tokens, f"vllm {moe_type} {source}")
 
             latency = results["latency_ms"] / num_iter
             power_stats = results["power_stats"]
@@ -863,3 +872,29 @@ if __name__ == "__main__":
         except Exception as error:
             traceback.print_exc()
             print(f"Test case failed ({type(error).__name__}): {test_case}")
+
+
+def _diag_tags():
+    """DIAG ONLY: variant tags from the shard dir name (run_shards runs collect.py there)."""
+    import os as _os
+
+    return set(_os.path.basename(_os.getcwd()).split("__")[-1].split("_"))
+
+
+def _diag_kernels(fn, num_tokens, tag):
+    """DIAG ONLY (diag/moe-weight-ab): kernel names and device times of one more run."""
+    import torch.profiler as tprof
+
+    fn()
+    torch.cuda.synchronize()
+    with tprof.profile(activities=[tprof.ProfilerActivity.CUDA]) as prof:
+        fn()
+        torch.cuda.synchronize()
+    rows = []
+    for e in prof.events():
+        if e.device_type == torch.autograd.DeviceType.CUDA:
+            t = getattr(e, "device_time", None)
+            if t is None:
+                t = e.cuda_time
+            rows.append(f"{e.name}={t:.2f}")
+    print(f"DIAG kernels {tag} num_tokens={num_tokens}: " + " | ".join(rows), flush=True)
