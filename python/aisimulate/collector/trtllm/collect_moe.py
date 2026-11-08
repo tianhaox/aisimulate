@@ -650,21 +650,27 @@ def _run_moe_case(
             tensor_scales = tensor_scales.transpose(1, 2).contiguous()
             return tensor_fp4, tensor_scales
 
-        # Convert one weight tensor at a time to lower peak memory.
-        w1_weight = torch.randn((local_num_experts, inter_size, hidden_size), dtype=dtype, device=device)
-        w1_weight_fp4, w1_weight_scale = fp32_to_mxfp4(w1_weight)
-        del w1_weight
-        torch.cuda.empty_cache()
+        def random_mxfp4(rows, cols):
+            # Random weights for every local expert, converted about 1 GiB of experts at a
+            # time: the downcast holds several fp32 copies of its input, and a whole Kimi-K3
+            # layer at TP1/EP1 (896 experts) did not fit a 180 GB GPU that way (CUDA OOM in
+            # downcast_to_mxfp_torch). Serving loads already-quantized checkpoint weights.
+            step = max(1, (1 << 30) // (rows * cols * 4))
+            fp4, scales = [], []
+            for start in range(0, local_num_experts, step):
+                weight = torch.randn((min(step, local_num_experts - start), rows, cols), dtype=dtype, device=device)
+                q, s = fp32_to_mxfp4(weight)
+                del weight
+                fp4.append(q)
+                scales.append(s)
+            out = (torch.cat(fp4), torch.cat(scales))
+            del fp4, scales
+            torch.cuda.empty_cache()
+            return out
 
-        w2_weight = torch.randn((local_num_experts, hidden_size, inter_size), dtype=dtype, device=device)
-        w2_weight_fp4, w2_weight_scale = fp32_to_mxfp4(w2_weight)
-        del w2_weight
-        torch.cuda.empty_cache()
-
-        w3_weight = torch.randn((local_num_experts, inter_size, hidden_size), dtype=dtype, device=device)
-        w3_weight_fp4, w3_weight_scale = fp32_to_mxfp4(w3_weight)
-        del w3_weight
-        torch.cuda.empty_cache()
+        w1_weight_fp4, w1_weight_scale = random_mxfp4(inter_size, hidden_size)
+        w2_weight_fp4, w2_weight_scale = random_mxfp4(hidden_size, inter_size)
+        w3_weight_fp4, w3_weight_scale = random_mxfp4(inter_size, hidden_size)
 
         weights = {}
         for expert_id in range(local_num_experts):
