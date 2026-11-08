@@ -833,7 +833,7 @@ def _run_moe_case(
         del hidden_states
 
     # DIAG: recovery curve of the 1-token point after a heavy phase
-    for heavy in (num_tokens_lists[-1], 8192):
+    for heavy, heavy_s in ((8192, 0.5), (8192, 6.0), (65536, 0.5)):
         hs_h = torch.randn([heavy, hidden_size]).bfloat16().to(torch.device(device))
         lg_h = balanced_logits(heavy, num_experts, topk).to(device=torch.device(device), dtype=layer.router_logits_dtype)
         hs_1 = torch.randn([1, hidden_size]).bfloat16().to(torch.device(device))
@@ -848,24 +848,26 @@ def _run_moe_case(
         with torch.cuda.graph(g1):
             moe.forward(hs_1, lg_1, do_finalize=not min_latency_mode)
         for trial in range(2):
-            for _ in range(5):
+            t_end = time.perf_counter() + heavy_s
+            while time.perf_counter() < t_end:
                 moe.forward(hs_h, lg_h, do_finalize=not min_latency_mode)
-            torch.cuda.synchronize()
-            evs = [torch.cuda.Event(enable_timing=True) for _ in range(81)]
+                torch.cuda.synchronize()
+            nw = 300
+            evs = [torch.cuda.Event(enable_timing=True) for _ in range(nw + 1)]
             evs[0].record()
-            for w in range(80):
+            for w in range(nw):
                 for _ in range(5):
                     g1.replay()
                 evs[w + 1].record()
             torch.cuda.synchronize()
-            per = [evs[w].elapsed_time(evs[w + 1]) / 5 for w in range(80)]
+            per = [evs[w].elapsed_time(evs[w + 1]) / 5 for w in range(nw)]
             cum = 0.0
             pts = []
             for w, v in enumerate(per):
                 cum += v * 5
-                if w < 12 or w % 8 == 7:
+                if w < 8 or (w < 64 and w % 8 == 7) or w % 32 == 31:
                     pts.append(f"{cum:.1f}ms:{v * 1000:.0f}us")
-            print(f"DIAG recovery after {heavy} tokens trial {trial}: " + " ".join(pts), flush=True)
+            print(f"DIAG recovery after {heavy_s}s of {heavy} tokens trial {trial}: " + " ".join(pts), flush=True)
         del g1, hs_h, lg_h
 
     # DIAG: re-time the first points after the sweep (order effect check)
