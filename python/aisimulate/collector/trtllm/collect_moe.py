@@ -682,14 +682,19 @@ def _run_moe_case(
         w2_weight_fp4, w2_weight_scale = random_mxfp4(hidden_size, inter_size)
         w3_weight_fp4, w3_weight_scale = random_mxfp4(inter_size, hidden_size)
 
+        # The E8M0 block scales go under both names the MXFP4 loaders read: weight_scale
+        # (MXFP4WeightFusedMoEMethod and its CUTLASS/TRTLLM-Gen subclasses) and
+        # weight_scale_inv (WFP4A16FusedMoEMethod.load_quant_scales,
+        # moe/fused_moe/quantization.py:2279-2345, the Hopper CUTLASS W4A16 MXFP4
+        # leaf Kimi-K3 builds). Both entries hold the same tensor.
         weights = {}
         for expert_id in range(local_num_experts):
             weights[f"{expert_id}.w1.weight"] = w1_weight_fp4[expert_id]
             weights[f"{expert_id}.w2.weight"] = w2_weight_fp4[expert_id]
             weights[f"{expert_id}.w3.weight"] = w3_weight_fp4[expert_id]
-            weights[f"{expert_id}.w1.weight_scale"] = w1_weight_scale[expert_id]
-            weights[f"{expert_id}.w2.weight_scale"] = w2_weight_scale[expert_id]
-            weights[f"{expert_id}.w3.weight_scale"] = w3_weight_scale[expert_id]
+            for proj, scale in (("w1", w1_weight_scale), ("w2", w2_weight_scale), ("w3", w3_weight_scale)):
+                weights[f"{expert_id}.{proj}.weight_scale"] = scale[expert_id]
+                weights[f"{expert_id}.{proj}.weight_scale_inv"] = scale[expert_id]
         if layer.bias:
             # Only GPT-OSS checkpoints carry expert biases (bias=True,
             # models/modeling_gpt_oss.py:196).
