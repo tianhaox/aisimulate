@@ -870,6 +870,29 @@ def _run_moe_case(
             print(f"DIAG recovery after {heavy_s}s of {heavy} tokens trial {trial}: " + " ".join(pts), flush=True)
         del g1, hs_h, lg_h
 
+    # DIAG: does a longer replay warm-up remove the first-timing slowdown at 1 token?
+    hs_h = torch.randn([num_tokens_lists[-1], hidden_size]).bfloat16().to(torch.device(device))
+    lg_h = balanced_logits(num_tokens_lists[-1], num_experts, topk).to(device=torch.device(device), dtype=layer.router_logits_dtype)
+    hs_1 = torch.randn([1, hidden_size]).bfloat16().to(torch.device(device))
+    lg_1 = balanced_logits(1, num_experts, topk).to(device=torch.device(device), dtype=layer.router_logits_dtype)
+
+    def one():
+        moe.forward(hs_1, lg_1, do_finalize=not min_latency_mode)  # noqa: F821
+
+    for rnd in range(2):
+        for warm in (3, 50, 300, 1000):
+            t_end = time.perf_counter() + 0.5
+            while time.perf_counter() < t_end:
+                moe.forward(hs_h, lg_h, do_finalize=not min_latency_mode)
+                torch.cuda.synchronize()
+            with benchmark_with_power(device=device, kernel_func=one, num_warmups=warm, num_runs=6, repeat_n=1) as res:
+                pass
+            first = res["latency_ms"]
+            with benchmark_with_power(device=device, kernel_func=one, num_warmups=warm, num_runs=6, repeat_n=1) as res:
+                pass
+            print(f"DIAG warmup={warm} round={rnd} after-heavy first={first:.4f} second={res['latency_ms']:.4f}", flush=True)
+    del hs_h, lg_h
+
     # DIAG: re-time the first points after the sweep (order effect check)
     for num_tokens in num_tokens_lists[:3]:
         hidden_states = torch.randn([num_tokens, hidden_size]).bfloat16().to(torch.device(device))
