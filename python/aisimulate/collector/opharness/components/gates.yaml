@@ -9,7 +9,8 @@
 # `no_serving` names SMs where serving cannot run the model at all (a serving fact, not a
 # plan fact); `also` traces further planned cases into the same verdict; `env` is a
 # capture-only switch the collector reads; `isl` grades against a serving record probed at
-# that prompt length (default 4096; a prefill case's length must match it).
+# that prompt length (default 4096; a prefill case's length must match it); `row` picks the
+# row serving runs (index in plan order) of a case the plan runs as several.
 gates:
 - gate: gemm_fp8block_DeepSeek-V3.2
   backend: vllm
@@ -639,6 +640,9 @@ gates:
   backend: trtllm
   op: moe
   select: {moe_type: nvfp4, model_name: nvidia/DeepSeek-V3.1-NVFP4, hidden_size: 7168, inter_size: 2048, topk: 8, num_experts: 256, tp: 1, ep: 1, distribution: balanced, num_tokens: [1, 4096]}
+  # SM100/103 plan the case twice, min_latency_mode False then True; serving's default
+  # config enables no min-latency mode, so the gate traces row 0
+  row: 0
   repo: nvidia/DeepSeek-V3.1-NVFP4
   kv: auto
 - gate: moe_bf16_gemma4-26B-A4B

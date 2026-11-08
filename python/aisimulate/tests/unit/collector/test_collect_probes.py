@@ -257,6 +257,17 @@ def test_planned_row_narrows_a_sweep_field_to_a_subset_of_its_planned_values():
     assert [4096] in [list(x) for x in case_row if isinstance(x, (list, tuple))]
 
 
+def test_planned_row_picks_one_row_of_a_case_planned_as_several():
+    moe = dict(moe_type="nvfp4", model_name="nvidia/DeepSeek-V3.1-NVFP4", hidden_size=7168, inter_size=2048)
+    moe.update(topk=8, num_experts=256, tp=1, ep=1, distribution="balanced", num_tokens="1+4096")
+    with pytest.raises(ValueError, match="runs as 2 rows; name one with row"):
+        trace_case.planned_row("trtllm", "moe", 100, **moe)  # min_latency_mode False and True
+    default, min_latency = (trace_case.planned_row("trtllm", "moe", 100, row=i, **moe) for i in ("0", 1))
+    assert False in default and True in min_latency and list(default[1]) == [1, 4096]
+    with pytest.raises(ValueError, match="no row 2"):
+        trace_case.planned_row("trtllm", "moe", 100, row=2, **moe)
+
+
 def test_trace_case_sets_env_arguments_for_the_run_only(monkeypatch, tmp_path):
     _fake_torch(monkeypatch, [_Event("fused_kda")])
     _pinned(monkeypatch)

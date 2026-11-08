@@ -42,7 +42,19 @@ def test_every_gate_names_one_planned_case(gates, gate_id):
     assert planned_on, f"{gate_id}: select {gate['select']} matches no single planned case on SM90 or SM100"
     for _name, select in cases:
         op = select.pop("op", gate["op"])
-        gates.case_filter(backend, op, select, gate.get("env"))  # raises when it does not fit the pipeline
+        # raises when it does not fit the pipeline
+        gates.case_filter(backend, op, select, gate.get("env"), gate.get("row"))
+    # the traced case resolves to one row on every SM it is planned on (a case the plan runs
+    # as several rows needs the gate's `row`); rows that build framework objects (SGLang and
+    # TRT-LLM MLA) cannot be built on a CPU and are checked when the probe runs
+    from collector.probes import trace_case
+
+    for sm in planned_on:
+        row = {} if gate.get("row") is None else {"row": gate["row"]}
+        try:
+            trace_case.planned_row(backend, gate["op"], sm, **dict(gate["select"]), **row)
+        except ModuleNotFoundError:
+            continue
 
 
 def test_shard_plans_parse_as_pipeline_plans(gates, tmp_path):

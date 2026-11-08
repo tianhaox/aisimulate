@@ -62,9 +62,12 @@ def planned_row(backend: str, op: str, sm_version: int | None, **select):
     """The run arguments the collector queues for the ONE planned case whose fields equal
     ``select``. A sweep field (a list in the case, such as moe ``num_tokens`` or gdn
     ``seq_lens``) may be given a subset of its planned values; the case then sweeps only
-    those. A selection matching no planned case, or several, raises."""
+    those. A selection matching no planned case, or several, raises. ``row`` (an index in
+    plan order) picks one row of a case the plan runs as several, such as a TRT-LLM MoE
+    case with its min-latency twin; such a case without ``row`` raises."""
     from collector.op_plans import plan
 
+    pick = select.pop("row", None)
     op_plan = plan(op, backend, sm_version)
     picked = [i for i, case in enumerate(op_plan.cases) if _matches(case, select)]
     if len(picked) != 1:
@@ -83,8 +86,13 @@ def planned_row(backend: str, op: str, sm_version: int | None, **select):
         op_plan, cases=[case], dispatches=op_plan.dispatches[i : i + 1] if op_plan.dispatches else []
     )
     rows = one.rows
+    if pick is not None:
+        i = int(pick)
+        if not 0 <= i < len(rows):
+            raise ValueError(f"{backend} {op}: the planned case {case} has {len(rows)} rows, no row {i}")
+        return rows[i]
     if len(rows) != 1:
-        raise ValueError(f"{backend} {op}: the planned case {case} runs as {len(rows)} rows, want 1")
+        raise ValueError(f"{backend} {op}: the planned case {case} runs as {len(rows)} rows; name one with row=<index>")
     return rows[0]
 
 

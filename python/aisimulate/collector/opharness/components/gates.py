@@ -134,8 +134,10 @@ def _value(v) -> str:
     return "+".join(str(x) for x in v) if isinstance(v, (list, tuple)) else str(v)
 
 
-def case_filter(backend: str, op: str, select: dict, env: dict | None = None) -> str:
+def case_filter(backend: str, op: str, select: dict, env: dict | None = None, row: int | None = None) -> str:
     pairs = [f"backend={backend}", f"op={op}", *(f"{k}={_value(v)}" for k, v in select.items())]
+    if row is not None:  # which row of a case the plan runs as several (probe.trace_case planned_row)
+        pairs.append(f"row={int(row)}")
     pairs += [f"env.{k}={v}" for k, v in (env or {}).items()]
     text = ",".join(pairs)
     if not _CASE_FILTER.fullmatch(text):
@@ -167,7 +169,7 @@ def shard_plans(
         doc = plans.setdefault((g["backend"], gate_version(g)), {"backend": g["backend"], "shards": []})
         for name, select in _cases(g):
             case_op = select.pop("op", g["op"])
-            filt = case_filter(g["backend"], case_op, select, g.get("env"))
+            filt = case_filter(g["backend"], case_op, select, g.get("env"), g.get("row"))
             doc["shards"].append({"op": SHARD_OP, "name": name, "case_filter": filt})
     return plans
 
