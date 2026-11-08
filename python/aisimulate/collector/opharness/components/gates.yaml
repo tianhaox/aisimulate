@@ -657,6 +657,13 @@ gates:
   select: {moe_type: w4a16_mxfp4, model_name: openai/gpt-oss-120b, hidden_size: 2880, inter_size: 2880, topk: 4, num_experts: 128, tp: 1, ep: 1, distribution: balanced, num_tokens: [1, 4096]}
   repo: openai/gpt-oss-120b
   kv: auto
+# SM100 and newer serve GPT-OSS with MXFP8 activations (collector/skips.py): the W4A8 case
+- gate: moe_w4a8mxfp4_gpt-oss-120b
+  backend: sglang
+  op: moe
+  select: {moe_type: w4a8_mxfp4_mxfp8, model_name: openai/gpt-oss-120b, hidden_size: 2880, inter_size: 2880, topk: 4, num_experts: 128, tp: 1, ep: 1, distribution: balanced, num_tokens: [1, 4096]}
+  repo: openai/gpt-oss-120b
+  kv: auto
 - gate: moe_bf16_gemma4-26B-A4B
   backend: trtllm
   op: moe
@@ -667,5 +674,12 @@ gates:
   backend: trtllm
   op: moe
   select: {moe_type: w4a16_mxfp4, model_name: openai/gpt-oss-120b, hidden_size: 2880, inter_size: 2880, topk: 4, num_experts: 128, tp: 1, ep: 1, distribution: balanced, num_tokens: [1, 4096]}
+  repo: openai/gpt-oss-120b
+  kv: auto
+# SM100 and newer serve GPT-OSS with MXFP8 activations (collector/skips.py): the W4A8 case
+- gate: moe_w4a8mxfp4_gpt-oss-120b
+  backend: trtllm
+  op: moe
+  select: {moe_type: w4a8_mxfp4_mxfp8, model_name: openai/gpt-oss-120b, hidden_size: 2880, inter_size: 2880, topk: 4, num_experts: 128, tp: 1, ep: 1, distribution: balanced, num_tokens: [1, 4096]}
   repo: openai/gpt-oss-120b
   kv: auto

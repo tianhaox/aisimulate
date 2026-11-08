@@ -674,15 +674,16 @@ def test_deepseek_minimax_and_nemotron_moe_quantization_is_artifact_specific():
             assert allowed == expected, (backend, model_path)
 
 
-def test_gptoss_mxfp4_modes_are_additive_on_blackwell(monkeypatch):
+def test_gptoss_mxfp4_runs_w4a8_from_blackwell(monkeypatch):
     model_path = "openai/gpt-oss-120b"
 
+    # SGLang (flashinfer_mxfp4 at its default precision, gpt_oss.py:64-75) and TRT-LLM
+    # (ModelConfig.get_mxfp4_quant_algo) serve GPT-OSS MXFP4 with MXFP8 activations from
+    # SM100, so collector/skips.py leaves the W4A16 cases out there.
     for backend in ("sglang", "trtllm"):
         assert _planned_moe_modes(monkeypatch, backend, model_path, 90) == {"w4a16_mxfp4"}, backend
-        assert _planned_moe_modes(monkeypatch, backend, model_path, 100) == {"w4a16_mxfp4", "w4a8_mxfp4_mxfp8"}, backend
-    # SM120: SGLang serves GPT-OSS MXFP4 as MXFP8 x MXFP4 on flashinfer_mxfp4
-    # (gpt_oss.py:69-74, mxfp4.py:426-427) and no W4A16 lane (collector/skips.py).
-    assert _planned_moe_modes(monkeypatch, "sglang", model_path, 120) == {"w4a8_mxfp4_mxfp8"}
+        for sm in (100, 103, 120):
+            assert _planned_moe_modes(monkeypatch, backend, model_path, sm) == {"w4a8_mxfp4_mxfp8"}, (backend, sm)
     # vLLM serves gpt-oss MXFP4 experts with BF16 activations on every SM, and
     # its collector builds the MXFP8-activation path for DeepSeek-V4 only
     # (collector/skips.py).

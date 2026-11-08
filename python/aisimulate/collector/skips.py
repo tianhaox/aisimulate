@@ -93,6 +93,19 @@ SKIPS: list[dict] = [
         "sm": [120],
         "model_name": ["openai/gpt-oss-20b", "openai/gpt-oss-120b"],
     },
+    # SGLang serves GPT-OSS MXFP4 on SM100/103 on flashinfer_mxfp4 at every EP
+    # (model_overrides/gpt_oss.py:64-75) at the default precision, which quantizes
+    # activations to MXFP8 on the trtllm-gen leaf (arg_groups/fields/exec_.py:892-897,
+    # moe_runner/flashinfer_trtllm.py:1145-1166); the B200 serving probe of
+    # gpt-oss-120b ran bmm_*_MxE2m1MxE4m3 GEMMs (2026-11-08). A W4A16 case would time
+    # a mode serving does not run; the w4a8_mxfp4_mxfp8 cases are serving's.
+    {
+        "backend": "sglang",
+        "op": "moe",
+        "dtype": "w4a16_mxfp4",
+        "sm": [100, 103],
+        "model_name": ["openai/gpt-oss-20b", "openai/gpt-oss-120b"],
+    },
     # SGLang serves Kimi-K3 on SM120 with BF16 activations: its flashinfer_mxfp4
     # default is SM100/103/107 only (model_overrides/kimi_k3.py:172-190), and auto
     # resolves Mxfp4MoEMethod to the Triton runner on upcast BF16 experts
@@ -369,18 +382,14 @@ SKIPS: list[dict] = [
     # registers as "Step3p5ForCausalLM", _torch/models/modeling_step3p7.py:1557),
     # so serving cannot load it; the MoE collector refuses the architecture.
     {"backend": "trtllm", "op": "moe", "model": "Step3p7FlashForCausalLM"},
-    # Kimi-K3 on SM100/103 runs TRTLLM-Gen SiTu, which takes only NVFP4 or
-    # W4A8_MXFP4_MXFP8 (KimiK3MoERuntime._check_trtllm_situ_quant,
-    # modeling_kimi_linear.py); its MXFP4 checkpoint loads as W4A8_MXFP4_MXFP8 there
-    # (ModelConfig.get_mxfp4_quant_algo), so a W4A16 row would time a mode serving
-    # does not run.
-    {
-        "backend": "trtllm",
-        "op": "moe",
-        "sm": [100, 103],
-        "moe_type": "w4a16_mxfp4",
-        "model_name": "moonshotai/Kimi-K3",
-    },
+    # TRT-LLM loads every MXFP4 checkpoint as W4A8_MXFP4_MXFP8 on SM100 and newer
+    # unless the MoE backend is TRITON (ModelConfig.get_mxfp4_quant_algo,
+    # _torch/model_config.py:730-741); AUTO resolves GPT-OSS and Kimi-K3 to TRTLLM
+    # there (Kimi-K3's TRTLLM-Gen SiTu also takes only NVFP4 or W4A8_MXFP4_MXFP8,
+    # KimiK3MoERuntime._check_trtllm_situ_quant, modeling_kimi_linear.py). The B200
+    # serving probe of gpt-oss-120b ran bmm_*_MxE2m1MxE4m3 GEMMs (2026-11-08). A W4A16
+    # row would time a mode serving does not run.
+    {"backend": "trtllm", "op": "moe", "dtype": "w4a16_mxfp4", "sm": [100, 103]},
     # TRT-LLM serves fp8_block MoE on SM120 through run_triton_fp8_block_scale_moe,
     # whose moe_align_block_size launches _moe_prefix_kernel with NUM_EXPERTS = the
     # rank's expert count as a tl.arange length, which Triton requires to be a power

@@ -564,9 +564,10 @@ def test_moe_plan_reports_the_runner_sglang_picks_on_each_sm():
 
 def test_moe_plan_runs_gpt_oss_w4a16_on_the_runner_sglang_picks_by_ep():
     # SGLang's GPT-OSS override serves triton_kernel at EP1 and keeps auto
-    # (Triton) at EP>1 on SM89/90, and flashinfer_mxfp4 on SM100/103 at every
-    # EP (model_overrides/gpt_oss.py:64-68, 102-120); SM120 plans no GPT-OSS
-    # W4A16 case (collector/skips.py).
+    # (Triton) at EP>1 on SM89/90 (model_overrides/gpt_oss.py:102-120). From SM100
+    # it serves flashinfer_mxfp4 with MXFP8 activations at every EP (:64-75), so
+    # SM100/103/120 plan no GPT-OSS W4A16 case (collector/skips.py) and the W4A8
+    # cases run flashinfer_mxfp4.
     def gpt_oss_runners(sm):
         sglang = plan("moe", "sglang", sm)
         return {
@@ -582,11 +583,17 @@ def test_moe_plan_runs_gpt_oss_w4a16_on_the_runner_sglang_picks_by_ep():
             case for case, runners in zip(sglang.cases, sglang.dispatches, strict=True) if "triton_kernel" in runners
         ]
         assert kernel_cases and all(case.ep == 1 and "gpt-oss" in case.model_name for case in kernel_cases)
-    for sm in (100, 103):
-        assert {runners for _ep1, runners in gpt_oss_runners(sm)} == {("flashinfer_mxfp4",)}
+    for sm in (100, 103, 120):
+        assert gpt_oss_runners(sm) == set()
         assert "triton_kernel" not in plan("moe", "sglang", sm).by_dispatch
-    assert gpt_oss_runners(120) == set()
-    assert "triton_kernel" not in plan("moe", "sglang", 120).by_dispatch
+    for sm in (100, 103):
+        sglang = plan("moe", "sglang", sm)
+        w4a8 = {
+            runners
+            for case, runners in zip(sglang.cases, sglang.dispatches, strict=True)
+            if case.model_name.startswith("openai/gpt-oss") and case.moe_type == "w4a8_mxfp4_mxfp8"
+        }
+        assert w4a8 == {("flashinfer_mxfp4",)}
 
 
 @pytest.mark.parametrize("sm", SMS)

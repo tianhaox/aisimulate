@@ -474,12 +474,14 @@ def test_gptoss_w4a16_runs_triton_kernel_at_ep1_where_serving_keeps_auto(sm_vers
 
 
 @pytest.mark.parametrize("sm_version", [100, 103])
-def test_gptoss_w4a16_on_blackwell_keeps_flashinfer_mxfp4_at_every_ep(sm_version):
-    # gpt_oss.py:64-68 selects flashinfer_mxfp4 on SM100/103 before the EP check.
+def test_gptoss_on_blackwell_runs_w4a8_on_flashinfer_mxfp4_at_every_ep(sm_version):
+    # gpt_oss.py:64-75 selects flashinfer_mxfp4 on SM100/103 before the EP check, at
+    # MXFP8 activations: the W4A8 cases run it and collector/skips.py leaves W4A16 out.
     populated = _populate_gptoss_cases(
-        [_gptoss_case(tp=1, ep=1), _gptoss_case(tp=1, ep=8)], sm_version=sm_version, allowed_mode="w4a16_mxfp4"
+        [_gptoss_case(tp=1, ep=1), _gptoss_case(tp=1, ep=8)], sm_version=sm_version, allowed_mode="w4a8_mxfp4_mxfp8"
     )
     assert [case[12] for case in populated] == ["flashinfer_mxfp4", "flashinfer_mxfp4"]
+    assert not _populate_gptoss_cases([_gptoss_case(tp=1, ep=1)], sm_version=sm_version, allowed_mode="w4a16_mxfp4")
 
 
 def test_moe_population_rejects_an_architecture_sglang_builds_differently_under_one_key():
