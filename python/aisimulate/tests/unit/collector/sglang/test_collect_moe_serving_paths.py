@@ -31,6 +31,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from collector.helper import FIRST_POINT_WARMUP_SECONDS, MOE_WEIGHT_MATRIX_SUFFIXES
 from collector.op_plans import SGLANG_GEMMA4_ROUTING_ARCHITECTURES
 
 pytestmark = pytest.mark.unit
@@ -124,6 +125,19 @@ def test_parallel_patch_replaces_only_existing_bindings_and_restores():
 # ---------------------------------------------------------------------------
 # _benchmark_moe_layer against recording fakes
 # ---------------------------------------------------------------------------
+class _FakeParameter:
+    def __init__(self, name, record):
+        self.name = name
+        self.record = record
+        self.data = self
+
+    def fill_(self, value):
+        self.record.append(("fill", self.name, value))
+
+    def zero_(self):
+        self.record.append(("fill", self.name, 0))
+
+
 class _FakeLayer:
     def __init__(self, record, **kwargs):
         self.record = record
@@ -140,7 +154,9 @@ class _FakeLayer:
         return self
 
     def named_parameters(self):
-        return []
+        return [(name, _FakeParameter(name, self.record)) for name in self._PARAMETERS]
+
+    _PARAMETERS = ("w13_weight", "w2_weight", "w13_weight_scale", "w13_weight_shape", "w2_bias")
 
     def parameters(self):
         return []
@@ -209,7 +225,8 @@ def _run_layer_benchmark(
         yield True
 
     @contextlib.contextmanager
-    def benchmark_with_power(*, kernel_func, **_kwargs):
+    def benchmark_with_power(*, kernel_func, min_warmup_seconds, **_kwargs):
+        record.append(("warmup_seconds", min_warmup_seconds))
         kernel_func()
         yield {"latency_ms": 5.0, "power_stats": None}
 
@@ -251,6 +268,9 @@ def _run_layer_benchmark(
             "balanced_logits": lambda *_args: SimpleNamespace(to=lambda **_kwargs: "logits"),
             "power_law_logits_v3": lambda *_args: SimpleNamespace(to=lambda **_kwargs: "logits"),
             "benchmark_with_power": benchmark_with_power,
+            "FIRST_POINT_WARMUP_SECONDS": FIRST_POINT_WARMUP_SECONDS,
+            "MOE_WEIGHT_MATRIX_SUFFIXES": MOE_WEIGHT_MATRIX_SUFFIXES,
+            "fill_dense_weight_": lambda tensor: record.append(("fill", tensor.name, "dense")),
             "flashinfer_autotuned": flashinfer_autotuned,
             "flashinfer_tuning_bucket": _pow2_tuning_bucket(bucket_calls),
             "serving_memory_defaults": lambda tp_size: memory_calls.append(tp_size) or memory_defaults,
@@ -581,3 +601,19 @@ def test_dsv4_fp4_expert_methods_label_by_method():
         _kernel_source_fn()(layer, moe_type="w4a8_mxfp4_mxfp8", moe_backend="flashinfer_mxfp4", is_fp4_experts=True)
         == "sglang_mxfp4_flashinfer_trtllm_moe"
     )
+
+
+def test_expert_weights_are_dense_and_the_first_point_warms_up_for_a_fixed_time(monkeypatch):
+    run = _run_layer_benchmark(monkeypatch, moe_backend="flashinfer_trtllm", capability_major=10, num_tokens=(1, 8, 64))
+    fills = {name: value for kind, name, value in (e for e in run.record if e[0] == "fill")}
+    assert fills == {
+        "w13_weight": "dense",
+        "w2_weight": "dense",
+        "w13_weight_scale": 1,
+        "w13_weight_shape": 0,
+        "w2_bias": 0,
+    }
+    # Weights are filled before the load-time processing runs on them.
+    order = [e[0] for e in run.record if e[0] in ("fill", "process_weights")]
+    assert order.index("process_weights") > max(i for i, kind in enumerate(order) if kind == "fill")
+    assert [e[1] for e in run.record if e[0] == "warmup_seconds"] == [FIRST_POINT_WARMUP_SECONDS, 0.0, 0.0]

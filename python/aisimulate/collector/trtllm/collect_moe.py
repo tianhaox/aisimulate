@@ -28,6 +28,7 @@ import torch
 from collector.case_generator import get_common_moe_test_cases, get_moe_quantization_module_config
 from collector.helper import (
     EXIT_CODE_RESTART,
+    FIRST_POINT_WARMUP_SECONDS,
     balanced_logits,
     benchmark_with_power,
     get_sm_version,
@@ -54,6 +55,7 @@ from tensorrt_llm._torch.moe.fused_moe import (
     TritonFusedMoE,
     create_moe,
 )
+from tensorrt_llm._torch.pyexecutor.model_loader import initialize_dummy_weights
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -633,12 +635,20 @@ def _run_moe_case(
     # Both MXFP4 formats load real MXFP4 weights through load_weights() so the
     # TRTLLM-Gen shuffle/permutation (torch.ops.trtllm.shuffle_matrix) the
     # kernel's memory access expects is applied, as serving's loader does.
-    # Deviation note (every other quant mode): the weights are create_weights'
-    # uninitialized tensors and only post_load_weights runs, so a layout
-    # permutation load_weights would apply is skipped. The kernels and their
-    # shapes are serving's; only the data order differs, which their timing
-    # does not depend on.
-    if moe_type in _MXFP4_MOE_TYPES:
+    # Every other quant mode fills create_weights' tensors as serving's dummy
+    # load does, before its post-load walk: initialize_dummy_weights
+    # (pyexecutor/model_loader.py:357-437, called for LoadFormat.DUMMY at
+    # :1520-1523) draws FP8/INT8 from U(-3, 3), packed FP4 bytes from [0, 64),
+    # other floats from U(-1e-3, 1e-3) and keeps the calibration scalars. The
+    # weights must be dense: on create_weights' uninitialized memory the B200
+    # FP8 block-scale layer timed 9-13% faster from 1024 tokens than on these.
+    # Deviation note: load_weights is skipped for these modes, so a layout
+    # permutation it would apply is skipped too. The kernels and their shapes
+    # are serving's; only the data order differs, which their timing does not
+    # depend on.
+    if moe_type not in _MXFP4_MOE_TYPES:
+        initialize_dummy_weights(moe)
+    else:
         local_num_experts = num_experts // moe_ep_size
 
         from triton_kernels.numerics_details.mxfp import downcast_to_mxfp_torch
@@ -727,7 +737,7 @@ def _run_moe_case(
 
     del hidden_states_max_tokens, logits_max_tokens
 
-    for num_tokens in num_tokens_lists:
+    for point, num_tokens in enumerate(num_tokens_lists):
         hidden_states = torch.randn([num_tokens, hidden_size]).bfloat16().to(torch.device(device))
         num_iter = 5 if distributed == "power_law" else 1
         if distributed == "power_law":
@@ -766,6 +776,7 @@ def _run_moe_case(
             num_warmups=num_warmups,
             num_runs=num_runs,
             repeat_n=1,
+            min_warmup_seconds=FIRST_POINT_WARMUP_SECONDS if point == 0 else 0.0,
         ) as results:
             # Calculate per-iteration latency (accounting for internal iterations)
             latency = results["latency_ms"] / num_iter

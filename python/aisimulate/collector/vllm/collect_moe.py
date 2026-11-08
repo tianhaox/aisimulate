@@ -78,8 +78,11 @@ from types import SimpleNamespace
 import torch
 from collector.case_generator import get_moe_quantization_module_config
 from collector.helper import (
+    FIRST_POINT_WARMUP_SECONDS,
+    MOE_WEIGHT_MATRIX_SUFFIXES,
     balanced_logits,
     benchmark_with_power,
+    fill_dense_weight_,
     flashinfer_autotuned,
     flashinfer_tuning_bucket,
     get_sm_version,
@@ -665,11 +668,15 @@ def run_moe_torch(
 
         # Populate the checkpoint-native tensors created by the selected
         # quantization method, then let that method convert them to the exact
-        # runtime layout and construct the production kernel.
+        # runtime layout and construct the production kernel. Expert weight
+        # matrices get dense, checkpoint-like bits (helper.fill_dense_weight_ says
+        # why and how); the other tensors keep values every layout accepts.
         routed_experts = moe_module.routed_experts
         with torch.no_grad():
             for name, parameter in routed_experts.named_parameters(recurse=False):
-                if parameter.dtype == torch.uint8:
+                if "scale" not in name and name.endswith(MOE_WEIGHT_MATRIX_SUFFIXES):
+                    fill_dense_weight_(parameter.data)
+                elif parameter.dtype == torch.uint8:
                     if "scale" in name:
                         parameter.fill_(127)
                     else:
@@ -739,7 +746,7 @@ def run_moe_torch(
         max_tuned_tokens = vllm_config.scheduler_config.max_num_batched_tokens
 
         # Performance testing for each token count.
-        for num_tokens in num_tokens_lists:
+        for point, num_tokens in enumerate(num_tokens_lists):
             print("num_tokens", num_tokens)
             print("topk", topk)
             hidden_states = torch.randn([num_tokens, hidden_size], dtype=torch.bfloat16, device=device)
@@ -811,6 +818,7 @@ def run_moe_torch(
                     num_warmups=num_warmups,
                     num_runs=num_runs,
                     repeat_n=1,
+                    min_warmup_seconds=FIRST_POINT_WARMUP_SECONDS if point == 0 else 0.0,
                 ) as results,
             ):
                 pass

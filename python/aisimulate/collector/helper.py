@@ -433,6 +433,7 @@ def benchmark_with_power(
     *,
     explicit_graph_cleanup: bool = False,
     num_eager_warmups: int | None = None,
+    min_warmup_seconds: float = 0.0,
 ):
     """
     Context manager that handles warmup, graph capture, timing, and power monitoring.
@@ -460,6 +461,13 @@ def benchmark_with_power(
                          replay warmups stay at num_warmups. Set lower when the
                          kernel already ran (a dry run) and the measurement is
                          graph-based; eager measurements should keep the default.
+        min_warmup_seconds: Keep running the measured path (graph replays, or eager
+                         calls without a graph) after the warmups until this much wall
+                         time has passed. Right after seconds of heavy work (an
+                         autotune pass, a large shape) the GPU runs a short kernel up
+                         to ~30% slower for up to ~0.1 s: on B200 a 1-token MoE layer
+                         timed 0.110 ms after 3 replay warmups, 0.084 ms (steady)
+                         after ~0.1 s of them. Default 0 keeps the count-only warmup.
 
     Yields:
         dict with keys:
@@ -602,6 +610,15 @@ def benchmark_with_power(
             for _ in range(num_warmups):
                 g.replay()
             dev_mod.synchronize()
+        if min_warmup_seconds > 0:
+            warm_until = time.perf_counter() + min_warmup_seconds
+            while time.perf_counter() < warm_until:
+                for _ in range(8):
+                    if use_graph:
+                        g.replay()
+                    else:
+                        kernel_func()
+                dev_mod.synchronize()
         _close_phase("graph_warmup")
 
         # Initialize power monitor if enabled
@@ -1006,6 +1023,60 @@ def _flashinfer_device_tag() -> str:
     except Exception:  # diagnostics only
         pass
     return ""
+
+
+# Wall time to keep replaying the first point of a sweep before timing it: that point
+# follows the case's autotune pass or the previous case's largest shape, and a short
+# kernel right after seconds of heavy work runs up to ~30% slow for up to ~0.1 s
+# (benchmark_with_power, min_warmup_seconds). Later points follow a smaller one.
+FIRST_POINT_WARMUP_SECONDS = 0.1
+
+# Parameter names of the expert weight matrices themselves (w13_weight, w2_weight, the
+# compressed-tensors *_weight_packed, the GPTQ/AWQ *_qweight). Scales, zero points,
+# shapes and g_idx/sort-index tensors keep the values their caller gives them.
+MOE_WEIGHT_MATRIX_SUFFIXES = ("_weight", "_weight_packed", "_qweight")
+_DENSE_FILL_CHUNK = 1 << 27  # elements per float32 temporary (512 MiB)
+
+
+def fill_dense_weight_(tensor) -> None:
+    """Fill one expert weight matrix in place with dense, checkpoint-like bits.
+
+    A collector builds its layer without a checkpoint, and the grouped GEMMs' timing
+    depends on the weight bits. On B200 (DeepSeek-V3 MoE shapes, TP1 EP1) zero or
+    near-zero weights timed the layer 10-23% faster from 2048 tokens than dense ones for
+    FP8 block-scale on all three frameworks and for SGLang NVFP4, and moved FlashInfer's
+    tactic choice at 4096 tokens; real checkpoints are dense. vLLM's and SGLang's dummy
+    loaders do not give dense low-bit weights: they draw floats from U(-1e-3, 1e-3),
+    which rounds FP8 to zero or the smallest subnormal, and leave packed integer weights
+    untouched (vllm model_executor/model_loader/weight_utils.py
+    initialize_single_dummy_weight, sglang srt/model_loader/weight_utils.py
+    initialize_dummy_weights).
+
+    FP8 storage: N(0, 64) clamped to +-448, so the values spread over the e4m3
+    exponents; 16/32-bit floats: N(0, 0.02); 8-bit integer storage (packed FP4, MXFP4,
+    INT4/INT8): uniform random bytes; 32-bit integer storage (packed INT4): uniform
+    random bits. Every bit pattern of these storages is a finite value.
+    """
+    import torch
+
+    if tensor.is_floating_point():
+        if tensor.element_size() >= 2:
+            tensor.normal_(0.0, 0.02)
+            return
+        flat = tensor.view(-1)
+        for start in range(0, flat.numel(), _DENSE_FILL_CHUNK):
+            part = flat[start : start + _DENSE_FILL_CHUNK]
+            values = torch.randn(part.shape, dtype=torch.float32, device=part.device).mul_(64.0).clamp_(-448.0, 448.0)
+            part.copy_(values.to(part.dtype))
+            del values
+    elif tensor.dtype == torch.uint8:
+        tensor.random_(0, 256)
+    elif tensor.dtype == torch.int8:
+        tensor.random_(-128, 128)
+    elif tensor.dtype == torch.int32:
+        tensor.random_(-(2**31), 2**31 - 1)
+    else:
+        raise TypeError(f"no dense fill for an expert weight of dtype {tensor.dtype}")
 
 
 def _flashinfer_autotune_api():

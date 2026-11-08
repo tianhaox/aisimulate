@@ -214,6 +214,7 @@ def _run_sweep(
     failure = RuntimeError("native shape failed")
     tune_paths = []
     resolved = []
+    warmups = []
 
     def forward(hidden, logits, **kwargs):
         assert hidden.tokens == logits.tokens
@@ -230,6 +231,7 @@ def _run_sweep(
 
     @contextmanager
     def benchmark(**kwargs):
+        warmups.append(kwargs["min_warmup_seconds"])
         state["stage"] = "measurement"
         kwargs["kernel_func"]()
         yield {"latency_ms": calls[-1][1] / 1000, "power_stats": {}}
@@ -276,6 +278,7 @@ def _run_sweep(
         "create_moe": builder,
         "ConfigurableMoE": _ConfigurableMoE,
         "_moe_kernel_source": lambda moe, min_latency_mode: "label",
+        "initialize_dummy_weights": lambda moe: calls.append(("dummy_weights", None, None)),
         "_post_load_weights": lambda moe: calls.append(("post_load", None, None)),
         "balanced_logits": lambda count, experts, topk: _TokenTensor(count),
         "power_law_logits_v3": lambda count, experts, topk, ep, alpha: _TokenTensor(count),
@@ -283,6 +286,7 @@ def _run_sweep(
         "moe_tune_path": "/tune",
         "_TRTLLM_VERSION": "9.9",
         "benchmark_with_power": benchmark,
+        "FIRST_POINT_WARMUP_SECONDS": 0.1,
         "log_perf": lambda **kwargs: rows.extend((row, kwargs["kernel_source"]) for row in kwargs["item_list"]),
         "tensorrt_llm": SimpleNamespace(__version__="9.9"),
     }
@@ -301,6 +305,7 @@ def _run_sweep(
         failure=failure,
         tune_paths=tune_paths,
         resolved=resolved,
+        warmups=warmups,
         routing=routing,
     )
 
@@ -319,15 +324,18 @@ def test_moe_sweep_tunes_as_serving_warmup_then_measures_every_requested_shape()
     assert model_config.moe_backend == "CUTLASS"
     assert sweep.resolved == [("AUTO", "Qwen3MoeForCausalLM", "bfloat16")]
     assert sweep.builder.call_args.kwargs["allow_backend_degradation"] is True
-    # post_load_weights first, then serving's warmup (max_num_tokens, then 1) under
-    # autotune(), then one graph measurement per requested shape.
+    # Serving's dummy weights and post_load_weights first, then serving's warmup
+    # (max_num_tokens, then 1) under autotune(), then one graph measurement per
+    # requested shape.
     assert sweep.calls == (
-        [("post_load", None, None), ("tuning", 8192, True), ("tuning", 1, True)]
+        [("dummy_weights", None, None), ("post_load", None, None), ("tuning", 8192, True), ("tuning", 1, True)]
         + [("measurement", n, True) for n in tokens]
     )
     assert sweep.tune_paths == ["/tune/sm100_trtllm9.9_bfloat16_h4096_i1024_e4_k2.json"]
     assert [row["num_tokens"] for row, _ in sweep.rows] == tokens
     assert [row["latency"] for row, _ in sweep.rows] == [n / 1000 for n in tokens]
+    # Only the first point, right after the autotune pass, warms up for a fixed time.
+    assert sweep.warmups == [0.1, 0.0, 0.0]
     assert {source for _, source in sweep.rows} == {"label"}
     assert {
         (row["moe_tp_size"], row["moe_ep_size"], row["moe_dtype"], row["distribution"]) for row, _ in sweep.rows
@@ -347,7 +355,7 @@ def test_min_latency_row_pins_trtllm_without_degradation_and_skips_finalize():
     assert sweep.resolved == []
     assert sweep.builder.call_args.kwargs["model_config"].moe_backend == "TRTLLM"
     assert sweep.builder.call_args.kwargs["allow_backend_degradation"] is False
-    assert {call[2] for call in sweep.calls if call[0] != "post_load"} == {False}
+    assert {call[2] for call in sweep.calls if call[0] not in ("dummy_weights", "post_load")} == {False}
 
 
 def test_qwen3_routing_output_dtype_is_read_back_from_the_bound_backend():
