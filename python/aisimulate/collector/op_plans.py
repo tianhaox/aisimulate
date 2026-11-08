@@ -1305,8 +1305,7 @@ def _long_context_points(phase: str, sweep, max_position: int | None) -> list[tu
 
     Context follows serving's chunked prefill (the mla_module_plan comments): at most
     chunk_prefill_size new tokens and max_full_sequence_length KV tokens per forward,
-    prefix + seq_len within the model's context, and from long_prefix_min on only the
-    long-prefix sequence lengths. Generation is the decode grid plus the long KV lengths
+    and prefix + seq_len within the model's context. Generation is the decode grid plus the long KV lengths
     at small batch; a KV length leaves room for the decoded token.
     """
     if phase == "context":
@@ -1318,7 +1317,6 @@ def _long_context_points(phase: str, sweep, max_position: int | None) -> list[tu
             if batch * length <= sweep.context_chunk_prefill_size
             and batch * (length + prefix) <= sweep.context_max_full_sequence_length
             and (max_position is None or prefix + length <= max_position)
-            and (prefix < sweep.context_long_prefix_min or length in sweep.context_long_prefix_sequence_lengths)
         ]
     grid = {
         (batch, length)
