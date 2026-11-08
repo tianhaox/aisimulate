@@ -666,17 +666,16 @@ def _benchmark_moe_layer(
                             kernel_func()
 
                     tune = flashinfer_autotuned(tune_tokens, tune_fn, label=kernel_source)
-                with (
-                    tune,
-                    benchmark_with_power(
+                with tune:
+                    with benchmark_with_power(
                         device=device,
                         kernel_func=kernel_func,
                         num_warmups=5,
                         num_runs=10,
                         repeat_n=1,
-                    ) as results,
-                ):
-                    pass
+                    ) as results:
+                        pass
+                    _diag_kernels(kernel_func, num_tokens, f"sglang {moe_type} {kernel_source}")
                 on_result(num_tokens, results["latency_ms"] / len(logits), results["power_stats"], kernel_source)
             return kernel_source
     finally:
@@ -689,6 +688,25 @@ def _benchmark_moe_layer(
         gc.collect()
         torch.cuda.empty_cache()
 
+
+
+def _diag_kernels(fn, num_tokens, tag):
+    """DIAG ONLY (diag/moe-weight-ab): kernel names and device times of one more run."""
+    import torch.profiler as tprof
+
+    fn()
+    torch.cuda.synchronize()
+    with tprof.profile(activities=[tprof.ProfilerActivity.CUDA]) as prof:
+        fn()
+        torch.cuda.synchronize()
+    rows = []
+    for e in prof.events():
+        if e.device_type == torch.autograd.DeviceType.CUDA:
+            t = getattr(e, "device_time", None)
+            if t is None:
+                t = e.cuda_time
+            rows.append(f"{e.name}={t:.2f}")
+    print(f"DIAG kernels {tag} num_tokens={num_tokens}: " + " | ".join(rows), flush=True)
 
 # The SMs on which each version-sensitive lane's declared runner was traced to
 # what SGLang v0.5.23 serves; any other SM raises before building.

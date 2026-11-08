@@ -453,6 +453,25 @@ def _moe_kernel_source(moe, min_latency_mode: bool) -> str:
     return source
 
 
+
+def _diag_kernels(fn, num_tokens, tag):
+    """DIAG ONLY (diag/moe-weight-ab): kernel names and device times of one more run."""
+    import torch.profiler as tprof
+
+    fn()
+    torch.cuda.synchronize()
+    with tprof.profile(activities=[tprof.ProfilerActivity.CUDA]) as prof:
+        fn()
+        torch.cuda.synchronize()
+    rows = []
+    for e in prof.events():
+        if e.device_type == torch.autograd.DeviceType.CUDA:
+            t = getattr(e, "device_time", None)
+            if t is None:
+                t = e.cuda_time
+            rows.append(f"{e.name}={t:.2f}")
+    print(f"DIAG kernels {tag} num_tokens={num_tokens}: " + " | ".join(rows), flush=True)
+
 def _tuning_cache_path(sm_version, moe_type, hidden_size, inter_size, topk, num_experts, moe_tp_size, moe_ep_size):
     """Profiling-cache file shared by the workers that tune one layer shape.
 
@@ -465,7 +484,7 @@ def _tuning_cache_path(sm_version, moe_type, hidden_size, inter_size, topk, num_
     per-arch, per-release config table.
     """
     return (
-        f"{moe_tune_path}/sm{sm_version}_trtllm{_TRTLLM_VERSION}_{moe_type}_h{hidden_size}"
+        f"{moe_tune_path}/pid{os.getpid()}_sm{sm_version}_trtllm{_TRTLLM_VERSION}_{moe_type}_h{hidden_size}"
         f"_i{inter_size // moe_tp_size}_e{num_experts // moe_ep_size}_k{topk}.json"
     )
 
@@ -770,6 +789,7 @@ def _run_moe_case(
             # Calculate per-iteration latency (accounting for internal iterations)
             latency = results["latency_ms"] / num_iter
             power_stats = results["power_stats"]
+        _diag_kernels(run_forward_pass, num_tokens, f"trtllm {moe_type} {kernel_source}")
 
         log_perf(
             item_list=[
