@@ -1085,7 +1085,10 @@ def build_ops(facts: dict, sm: str) -> tuple[list[dict], list[str]]:
     # sgl_kernel / torch families: under CUDA graphs and torch.compile the Python
     # spans that used to attribute GEMM and quant kernels vanish, so those kernels
     # arrive here, and path_diff grades gemm-class ops on exactly their names.
-    signal = {n for n in orphans_t if label_kernels([n], sm)[0]}
+    # Labeled means any taxonomy match, framework_native and infra included: the
+    # aux-work check looks for the collector's routing / norm_rope / kvcache kernels
+    # among these (a capped-out cooperative_topk decode kernel read as aux drift).
+    signal = {n for n in orphans_t if kernel_role(n, sm)}
     rest = sorted((n for n in orphans_t if n not in signal), key=lambda n: -orphans_t[n])
     return ops, sorted(signal | set(rest[:_ORPHAN_REST_CAP]))
 

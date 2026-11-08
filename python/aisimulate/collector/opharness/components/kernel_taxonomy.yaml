@@ -22,7 +22,7 @@ rules:
   - {backend: flashmla, role: attention,
      match: "flash_fwd_splitkv_mla|flash_fwd_mla_combine|fwd_kvcache_mla|get_mla_metadata|flash_mla"}
   - {backend: dsa_nsa, role: attention,
-     match: "sparse_attn_fwd_kernel|_fused_indexer_q_rope_quant_kernel|indexer_k_quant_and_cache|cp_gather_indexer_k_quant_cache|topKPerRow|^_scatter_topk(_single_req)?_kernel$"}
+     match: "sparse_attn_fwd_kernel|_fused_indexer_q_rope_quant_kernel|indexer_k_quant_and_cache|cp_gather_indexer_k_quant_cache|topKPerRow|^_scatter_topk(_single_req)?_kernel$|^sparse_mla_index_remap_kernel$"}
   - {backend: triton, role: attention,
      match: "_flash_attn_fwd_with_block_score|^_decode_score_kernel"}
   - {backend: trtllm_mha, role: attention,
@@ -155,24 +155,23 @@ rules:
   - {backend: torch, role: infra,
      match: "^cunn_SoftMaxForward|^cunn_|^distribution_elementwise_grid_stride_kernel"}
   - {backend: framework_native, role: norm_rope,
-     match: "^fused_rope_kernel|^fused_rope_store_kernel"}
+     match: "^(sglang::)?fused_rope_kernel|^(sglang::)?fused_rope_store_kernel"}
   - {backend: framework_native, role: kvcache,
-     match: "^fused_store_indexer_cache|kernels::fusedCatFp8Kernel|^store_kv_index_kernel"}
+     match: "^(sglang::)?fused_store_indexer_cache|kernels::fusedCatFp8Kernel|^(sglang::)?store_kv_index_kernel"}
   - {backend: torch, role: infra,
      match: "^softmax_warp_forward|^softmax_warp_backward|^cunn_SoftMaxForwardSmem"}
   - {backend: dsa_nsa, role: attention,
-     match: "^flash_c4_(prefill|decode)$|^flash_c128_(prefill|decode)$"}
+     match: "^(sglang::)?flash_c4_(prefill|decode)$|^(sglang::)?flash_c128_(prefill|decode)$"}
   - {backend: sgl_kernel, role: dsa_indexer,
-     match: "^topk_plan$|^topk_small_batch_kernel$|^topk_main_kernel$|^topk_transform(_prefill)?_kernel$|^fast_hadamard_transform_kernel$|^fused_q_indexer_rope_hadamard_quant$|^fused_k_indexer_norm_rope_store$|^fused_norm_rope_indexer$"}
+     match: "^(sglang::)?topk_plan$|^(sglang::)?topk_small_batch(_cluster)?_kernel$|^(sglang::)?topk_main_kernel$|^(sglang::)?topk_transform(_prefill)?_kernel$|^(sglang::)?fast_hadamard_transform_kernel$|^(sglang::)?fused_q_indexer_rope_hadamard_quant$|^(sglang::)?fused_k_indexer_norm_rope_store$|^(sglang::)?fused_norm_rope_indexer$"}
   - {backend: sgl_kernel, role: norm_rope,
-     match: "^fused_qknorm_warp$|^fused_gemma_qknorm_rope_kernel$|^fused_q_norm_rope$|^fused_(k_)?norm_rope_flashmla$|^deepseek_rope_kernel$"}
+     match: "^(sglang::)?fused_qknorm_warp$|^(sglang::)?fused_gemma_qknorm_rope_kernel$|^(sglang::)?fused_q_norm_rope$|^(sglang::)?fused_(k_)?norm_rope_flashmla$|^(sglang::)?deepseek_rope_kernel$"}
   - {backend: sgl_kernel, role: kvcache,
-     # 0.5.23 moved the KV store under sglang.kernels: sglang::store_kvcache_kernel
-     match: "^(sglang::)?store_kvcache(_kernel)?$|^concat_mla_absorb_q_kernel$|^concat_mla_k_kernel$|^write_c4_prefill$|^get_mla_kv_buffer_kernel$"}
+     match: "^(sglang::)?store_kvcache(_kernel)?$|^(sglang::)?concat_mla_absorb_q_kernel$|^(sglang::)?concat_mla_k_kernel$|^(sglang::)?write_c4_prefill$|^(sglang::)?get_mla_kv_buffer_kernel$"}
   - {backend: sgl_kernel, role: quant,
-     match: "^per_tensor_quant_fp8_kernel$|^per_token_quant_fp8_kernel$"}
+     match: "^(sglang::)?per_tensor_quant_fp8_kernel$|^(sglang::)?per_token_quant_fp8_kernel$"}
   - {backend: sgl_kernel, role: activation,
-     match: "^act_kernel$|^silu_mul_clamp_kernel$"}
+     match: "^(sglang::)?act_kernel$|^(sglang::)?silu_mul_clamp_kernel$"}
   - {backend: sgl_kernel, role: infra,
      match: "^clamp_position_kernel$"}
   - {backend: framework_native, role: infra,
@@ -244,7 +243,7 @@ rules:
   - {backend: fla_triton, role: linear_attention, sms: [sm89],
      match: "^chunk_scaled_dot_kkt_fwd_kernel$|^merge_16x16_to_64x64_inverse_kernel$"}
   - {backend: trtllm_fmha, role: attention, sms: [sm100, sm103],
-     match: "^fmhaSm10[03][af]?Kernel_Qkv(Bfloat16|E4m3|Fp16)|^tensorrt_llm::kernels::fmhaReductionKernel$"}
+     match: "^fmhaSm10[03][af]?Kernel_Qkv(Bfloat16|E4m3|Fp16)|^tensorrt_llm::(_v1::)?kernels::fmhaReductionKernel$"}
   - {backend: torch, role: gemm, sms: [sm89],
      match: "^sm86_xmma_fprop_implicit_gemm"}
   - {backend: infra, role: infra, sms: [sm89],
@@ -278,3 +277,22 @@ rules:
      match: "^kernel_cutlass_kernel_flashinferquantizationkernelsnvfp4_quantize"}
   - {backend: trtllm_internal, role: quant,
      match: "^tensorrt_llm::_v1::kernels::quantize_with_block_size"}
+  # vLLM's DeepSeek-V4 CuTe DSL ops (models/deepseek_v4/nvidia/ops: dequant_gather_k,
+  # fused_indexer_q, sparse_attn_compress) all define `device_kernel`, so they normalize to
+  # one name once the tensor-spec suffix is dropped
+  - {backend: vllm_kernel, role: dsa_indexer,
+     match: "^kernel_cutlass_device_kernel$"}
+  # TRT-LLM rc2 (tensorrt_llm::_v1::kernels): the DeepSeek-V4 compressor, its Q norm and
+  # RoPE, the FP8 KV scatter and the top-k local-to-global remap; the FP8 MLA input copy
+  - {backend: trtllm_internal, role: attention,
+     match: "^tensorrt_llm::(_v1::)?kernels::compressor::"}
+  - {backend: trtllm_internal, role: norm_rope,
+     match: "^tensorrt_llm::(_v1::)?kernels::(deepseekV4QNormKernel|mlaRoPEInplaceKernel)$"}
+  - {backend: trtllm_internal, role: kvcache,
+     match: "^_quant_scatter_kernel$"}
+  - {backend: trtllm_internal, role: dsa_indexer,
+     match: "^_deepseek_v4_local_to_global_kernel$"}
+  - {backend: trtllm_internal, role: quant,
+     match: "^tensorrt_llm::(_v1::)?kernels::quantizeCopyInputToFp8Kernel$"}
+  - {backend: torch, role: infra,
+     match: "searchsorted_cuda_kernel"}
