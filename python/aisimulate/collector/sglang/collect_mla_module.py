@@ -2326,6 +2326,21 @@ def _run_decode(
         if graph_batch_size is not None and graph_batch_size != batch_size:
             forward_batch_decode = _padded_dsa_decode_batch(model_runner, forward_batch_decode, graph_batch_size)
             model_runner.attn_backend.init_forward_metadata(forward_batch_decode)
+        if attn_type == "dsa" and graph_batch_size is not None:
+            # A graph-covered decode step runs on the backend's CUDA-graph metadata:
+            # DecodeCudaGraphRunner allocates it (init_cuda_graph_state,
+            # model_executor/runner/decode_cuda_graph_runner.py:429), builds it at capture
+            # (init_forward_metadata_out_graph(in_capture=True), :1400) and refills it before
+            # every replay (init_forward_metadata_out_graph, :1812). Its page tables span
+            # req_to_token's full width (DSABackend.init_cuda_graph_state,
+            # layers/attention/dsa_backend.py), which the indexer passes to top-k as the
+            # max sequence length (dsa/dsa_indexer_kpool.py _get_topk_paged): past the
+            # cluster floor (topk_v2.cuh get_static_cluster_floor) serving runs
+            # topk_small_batch_cluster_kernel, where batch-sized eager metadata ran
+            # topk_main_kernel.
+            model_runner.attn_backend.init_cuda_graph_state(graph_batch_size, graph_batch_size)
+            model_runner.attn_backend.init_forward_metadata_out_graph(forward_batch_decode, in_capture=True)
+            model_runner.attn_backend.init_forward_metadata_out_graph(forward_batch_decode)
         execution_batch_size = forward_batch_decode.batch_size
 
         decode_hidden = torch.randn(
