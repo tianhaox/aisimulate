@@ -796,6 +796,10 @@ def run_dsv4_attn(
             device=torch_device,
             kernel_func=kernel_func,
             num_warmups=warming_up,
+            # A dry run of this seq_len already executed this forward (this point or
+            # an earlier one of the series); three eager passes cover lazily
+            # initialised paths before capture, as in the MLA and DSA modules.
+            num_eager_warmups=3,
             num_runs=test_ite,
             repeat_n=1,
             allow_graph_fail=False,
@@ -850,9 +854,9 @@ def run_dsv4_attn(
         return latency
     finally:
         _trtllm_utils._model_extra_attrs.attrs = saved_extra_attrs
+        # Shuts the KV pool down, empties the CUDA cache and collects garbage
+        # periodically (a full collection per point cost 0.2-0.4 s).
         _cleanup(kv_cache_manager)
-        gc.collect()
-        torch.cuda.empty_cache()
 
 
 def run_dsv4_attn_worker(
