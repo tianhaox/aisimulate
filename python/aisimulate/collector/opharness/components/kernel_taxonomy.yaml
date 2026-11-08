@@ -257,8 +257,10 @@ rules:
      match: "flashinfergemmkernelsdense_blockscaled_gemm_sm10|flashinferquantizationkernelsmxfp8_quantize|^vllm::cvt_fp16_to_fp4"}
   - {backend: infra, role: infra, sms: [sm89],
      match: "^trtllm::fused_qk_norm_rope$|kv_cache_manager_v2::copyBatchBlockOffsetsToDevice|^_finish_reasons_kernel$"}
+  # E2m1 output: the NVFP4 FC1 that writes FC2's FP4 input (vLLM 0.32.0 serving DeepSeek-V3.1-NVFP4
+  # on B200 runs it in prefill and decode; moe gate 2026-11-08)
   - {backend: trtllm_gen_moe, role: moe_gemm, sms: [sm100, sm103],
-     match: "^bmm_(MxE4m3|Bfloat16|E4m3)_(MxE2m1|E2m1E2m1|E4m3E4m3)|^moe::dev::"}
+     match: "^bmm_(MxE4m3|Bfloat16|E4m3|E2m1)_(MxE2m1|E2m1E2m1|E4m3E4m3)|^moe::dev::"}
   - {backend: torch_sdpa, role: attention, sms: [sm89],
      match: "^pytorch_flash::flash_fwd_kernel$"}
   # CuTe DSL dense GEMM / activation quant on Blackwell (2026-11-08, gemm gates at the new pins):
