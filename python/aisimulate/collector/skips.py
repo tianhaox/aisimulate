@@ -336,6 +336,13 @@ SKIPS: list[dict] = [
         "dispatch": ["flashinfer", "triton", "fa4"],
         "attn_dtype": "fp8",
     },
+    # SGLang: fa4 prefill leaves Q in BF16 on an FP8 KV cache
+    # (flashattention_backend.py prepare_paged_mha_query skips the Q cast for fa4
+    # prefill) and the FA4 kernel requires Q and K to share a dtype
+    # (kernels/ops/attention/flash_attn/cute/interface.py _flash_attn_fwd asserts
+    # it), so serving cannot run an FP8-KV prefill on fa4 (MiMo-V2 on SM100/103);
+    # every such case fails (B200 attention smoke: 119 of 119).
+    {"backend": "sglang", "op": "attention_context", "dispatch": "fa4", "kv_cache_dtype": "fp8"},
     # vLLM: the attention collector has no FP8-compute (FP8 FMHA) input, so an
     # FP8-compute row would re-time the FP8-KV case under an fp8 label.
     {"backend": "vllm", "op": "attention_context", "attn_dtype": "fp8"},

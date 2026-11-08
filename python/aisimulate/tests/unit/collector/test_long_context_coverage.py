@@ -21,9 +21,10 @@ PKG_ROOT = Path(__file__).resolve().parents[3]
 # Generated from actual plans at #676 69232f77ce94de85e8ca7c40da8c2e484a6bdff4; the DSA and MSA
 # context entries regenerated after the context grid gained prefix 1, 1536, 3072, 6144, 10240 and
 # 12288 and every sequence length at prefixes from 16k on; SGLang attention_context regenerated
-# after the FP8-compute skip widened to triton and fa4 prefill (no FP8-compute path there).
+# after the FP8-compute skip widened to triton and fa4 prefill (no FP8-compute path there) and
+# fa4's FP8-KV prefill was left out (serving cannot run it).
 BASELINE = {
-    "sglang:attention_context": [30277, "adc518cf00f8ad613335adac837339263ce6926358aedb7769756ff49de19f9d"],
+    "sglang:attention_context": [28645, "6c0dfd64be096af68aee88ce03a86bb4e104e9e8ff536c56b04e8c9853681267"],
     "sglang:attention_generation": [36096, "403666ff16ab29e96d2ef9a79c7c1595a64d8208f2c4ce5c1d3abc7274994653"],
     "sglang:dsa_context_module": [32940, "0774184fcb3fc62175675a77e5d5d63c9dee99efb1840ecbb0d7be28c018c82f"],
     "sglang:dsa_generation_module": [5700, "995f99c01c986b3fa038f21eb7c3f306965cad81b18516c7bf8f774d1d8b1d13"],
