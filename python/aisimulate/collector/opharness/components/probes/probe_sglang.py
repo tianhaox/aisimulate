@@ -201,6 +201,11 @@ def main() -> None:
         "slower and it has broken tvm_ffi kernels); kernels+spans "
         "are captured either way",
     )
+    ap.add_argument(
+        "--framework-dummy",
+        action="store_true",
+        help="keep SGLang's own near-zero low-bit dummy weights (A/B only; default refills them densely, _dense_dummy)",
+    )
     args = ap.parse_args()
 
     rec: dict = {"model_path": args.model, "errors": {}}
@@ -366,6 +371,13 @@ def main() -> None:
             except Exception:
                 pass
 
+            # dense low-bit dummy weights: the kernel times are the timing reference of the
+            # path gates (_dense_dummy explains why SGLang's own dummy draw is not)
+            rec["probe_framework_dummy"] = bool(args.framework_dummy)
+            if not args.framework_dummy:
+                import _dense_dummy
+
+                _dense_dummy.install_sglang(rec)
             ret, _tok = load_model(sa, PortArgs.init_new(sa), 0, 0)
             # 0.5.16 wraps ModelRunner in _TorchBenchRunner(.torch_runner)
             model_runner = getattr(ret, "torch_runner", ret)
