@@ -167,7 +167,8 @@ rules:
   - {backend: sgl_kernel, role: norm_rope,
      match: "^fused_qknorm_warp$|^fused_gemma_qknorm_rope_kernel$|^fused_q_norm_rope$|^fused_(k_)?norm_rope_flashmla$|^deepseek_rope_kernel$"}
   - {backend: sgl_kernel, role: kvcache,
-     match: "^store_kvcache$|^concat_mla_absorb_q_kernel$|^concat_mla_k_kernel$|^write_c4_prefill$|^get_mla_kv_buffer_kernel$"}
+     # 0.5.23 moved the KV store under sglang.kernels: sglang::store_kvcache_kernel
+     match: "^(sglang::)?store_kvcache(_kernel)?$|^concat_mla_absorb_q_kernel$|^concat_mla_k_kernel$|^write_c4_prefill$|^get_mla_kv_buffer_kernel$"}
   - {backend: sgl_kernel, role: quant,
      match: "^per_tensor_quant_fp8_kernel$|^per_token_quant_fp8_kernel$"}
   - {backend: sgl_kernel, role: activation,
