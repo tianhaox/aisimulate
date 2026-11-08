@@ -134,8 +134,9 @@ common_case_values:
       nvfp4: {100: flashinfer_trtllm, 103: flashinfer_trtllm, 120: flashinfer_cutlass}
       # SGLang 0.5.23 leaves SM89/SM90 GPT-OSS at EP>1 on auto, whose
       # Mxfp4MoEMethod resolves to Triton (layers/quantization/mxfp4.py:
-      # 1443-1450); at EP1 it serves triton_kernel, which this per-SM pin
-      # cannot express (deviation note in collector/sglang/collect_moe.py).
+      # 1443-1450); at EP1 it serves triton_kernel (arg_groups/model_overrides/
+      # gpt_oss.py:102-120), which the op plan's dispatch picks where this pin
+      # is Triton (collector/op_plans.py _sglang_moe_runner).
       # SM100/103 select FlashInfer MXFP4 (arg_groups/model_overrides/
       # gpt_oss.py:64-68). SM120 serves GPT-OSS as MXFP8 x MXFP4 (the w4a8 pin
       # below), so collector/skips.py leaves the SM120 GPT-OSS W4A16 cases out

@@ -405,13 +405,35 @@ class MoeCase(NamedTuple):
 _MOE_SMS = (80, 86, 89, 90, 100, 103, 120)
 _FP4_EXPERT_MODES = frozenset({"w4a16_mxfp4", "w4a8_mxfp4_mxfp8"})
 
+# SGLang serves these architectures' MoE on triton_kernel at EP1 where the per-SM
+# pin is Triton (_sglang_moe_runner). Source: sglang v0.5.23. GPT-OSS's model
+# override turns an auto runner into triton_kernel when ep_size == 1, the
+# triton_kernels package is installed and no --quantization is passed
+# (srt/arg_groups/model_overrides/gpt_oss.py:102-120): sglang-kernel ships the
+# package (kernels/aot/CMakeLists.txt:548-553; is_triton_kernels_available,
+# srt/utils/common.py:4814-4815) and GPT-OSS checkpoints are served without the
+# flag. SM100/103 and SM120 take flashinfer_mxfp4 first (gpt_oss.py:64-75). At
+# EP>1 the runner stays auto, which Mxfp4MoEMethod resolves to Triton
+# (srt/layers/quantization/mxfp4.py:1443-1450): the per-SM pin
+# (cases/base_ops/moe.yaml moe_sglang.backends.w4a16_mxfp4, Triton on SM89/90).
+SGLANG_EP1_TRITON_KERNELS_ARCHITECTURES = frozenset({"GptOssForCausalLM"})
+# SGLang routes these architectures' experts with the model's own routing
+# function, not the row's routing fields; collector/sglang/collect_moe.py builds
+# that TopK (_gemma4_routing_function).
+SGLANG_GEMMA4_ROUTING_ARCHITECTURES = frozenset({"Gemma4ForConditionalGeneration"})
+_SGLANG_ARCHITECTURE_SPECIFIC_MOE = SGLANG_EP1_TRITON_KERNELS_ARCHITECTURES | SGLANG_GEMMA4_ROUTING_ARCHITECTURES
+
 
 def _is_fp4_experts(layer: MoeCommonTestCase, moe_type: str) -> bool:
     return layer.architecture == "DeepseekV4ForCausalLM" and moe_type in _FP4_EXPERT_MODES
 
 
 def _moe_layer_identity(layer: MoeCommonTestCase, moe_type: str) -> tuple:
-    """What a MoE case times besides its consumer key: routing and activation, runner pins, quant config."""
+    """What a MoE case times besides its consumer key: routing and activation, runner pins, quant config.
+
+    An architecture SGLang builds its own way (EP1 runner, routing function)
+    is part of what the case times.
+    """
     routing = tuple(
         (field.name, getattr(layer, field.name))
         for field in dataclasses.fields(layer)
@@ -427,7 +449,8 @@ def _moe_layer_identity(layer: MoeCommonTestCase, moe_type: str) -> tuple:
         json.dumps(get_moe_quantization_module_config(backend, moe_type, model_name=layer.model_name), sort_keys=True)
         for backend in ("sglang", "trtllm", "vllm")
     )
-    return routing, tuple(runners), module_configs, _is_fp4_experts(layer, moe_type)
+    sglang_architecture = layer.architecture if layer.architecture in _SGLANG_ARCHITECTURE_SPECIFIC_MOE else None
+    return routing, tuple(runners), module_configs, _is_fp4_experts(layer, moe_type), sglang_architecture
 
 
 def _expand_moe() -> list[MoeCase]:
@@ -488,9 +511,15 @@ def _sglang_moe_runner(case: MoeCase, sm_version: int | None) -> str:
     """The MoE runner SGLang serving picks for this case's checkpoint and quant mode on this SM.
 
     Pinned in cases/base_ops/moe.yaml moe_sglang.backends and a model row's
-    sglang_moe_backends.
+    sglang_moe_backends; an EP1 case of SGLANG_EP1_TRITON_KERNELS_ARCHITECTURES
+    runs triton_kernel where that pin is Triton, as serving's model override
+    decides by EP size.
     """
-    return get_sglang_moe_backend(_moe_layer_of(case), case.moe_type, sm_version)
+    layer = _moe_layer_of(case)
+    runner = get_sglang_moe_backend(layer, case.moe_type, sm_version)
+    if runner == "triton" and case.ep == 1 and layer.architecture in SGLANG_EP1_TRITON_KERNELS_ARCHITECTURES:
+        return "triton_kernel"
+    return runner
 
 
 def _sglang_moe_rows(case: MoeCase, sm_version: int | None, runner: str | None) -> list[list]:

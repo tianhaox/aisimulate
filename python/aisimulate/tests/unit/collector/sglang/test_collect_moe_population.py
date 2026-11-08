@@ -408,9 +408,10 @@ def test_sm120_population_runs_gptoss_as_w4a8_and_skips_w4a16():
     assert all(case[12] == "flashinfer_mxfp4" for case in populated)
 
 
-def _k3_case():
-    k3 = _gptoss_case(tp=1, ep=1)
+def _k3_case(*, tp: int = 1, ep: int = 1):
+    k3 = _gptoss_case(tp=tp, ep=ep)
     k3.model_name = "moonshotai/Kimi-K3"
+    k3.architecture = "KimiK3ForConditionalGeneration"
     return k3
 
 
@@ -447,6 +448,45 @@ def test_sm100_population_runs_kimi_k3_as_w4a8_only(sm_version):
         [_k3_case()], sm_version=sm_version, allowed_mode={"w4a16_mxfp4", "w4a8_mxfp4_mxfp8"}
     )
     assert {case[0] for case in populated} == {"w4a8_mxfp4_mxfp8"}
+
+
+@pytest.mark.parametrize("sm_version", [89, 90])
+def test_gptoss_w4a16_runs_triton_kernel_at_ep1_where_serving_keeps_auto(sm_version):
+    # SGLang's GPT-OSS override serves triton_kernel at ep_size 1 and leaves
+    # auto (Triton, the per-SM pin) at EP>1 (model_overrides/gpt_oss.py:102-120).
+    populated = _populate_gptoss_cases(
+        [_gptoss_case(tp=1, ep=1), _gptoss_case(tp=4, ep=1), _gptoss_case(tp=1, ep=8)],
+        sm_version=sm_version,
+        allowed_mode="w4a16_mxfp4",
+        resolved_backend="triton",
+    )
+    assert {(case[6], case[7]): case[12] for case in populated} == {
+        (1, 1): "triton_kernel",
+        (4, 1): "triton_kernel",
+        (1, 8): "triton",
+    }
+
+    # Kimi-K3 has no such override: auto stays Triton at every EP.
+    k3 = _populate_gptoss_cases(
+        [_k3_case()], sm_version=sm_version, allowed_mode="w4a16_mxfp4", resolved_backend="triton"
+    )
+    assert [case[12] for case in k3] == ["triton"]
+
+
+@pytest.mark.parametrize("sm_version", [100, 103])
+def test_gptoss_w4a16_on_blackwell_keeps_flashinfer_mxfp4_at_every_ep(sm_version):
+    # gpt_oss.py:64-68 selects flashinfer_mxfp4 on SM100/103 before the EP check.
+    populated = _populate_gptoss_cases(
+        [_gptoss_case(tp=1, ep=1), _gptoss_case(tp=1, ep=8)], sm_version=sm_version, allowed_mode="w4a16_mxfp4"
+    )
+    assert [case[12] for case in populated] == ["flashinfer_mxfp4", "flashinfer_mxfp4"]
+
+
+def test_moe_population_rejects_an_architecture_sglang_builds_differently_under_one_key():
+    # GPT-OSS (EP1 runner) and Gemma-4 (routing function) build a different
+    # layer than another architecture's row with the same fields.
+    with pytest.raises(ValueError, match="time different layers under one consumer key"):
+        _populate_gptoss_cases([_gptoss_case(tp=1, ep=1), _k3_case()], sm_version=90, allowed_mode="w4a16_mxfp4")
 
 
 @pytest.mark.parametrize(("tp", "ep"), [(4, 8), (32, 1), (32, 8)])

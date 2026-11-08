@@ -73,10 +73,17 @@ rules:
      match: "^tinygemm_kernel|^cutlass::Kernel2"}
   - {backend: triton_fused_moe, role: moe_gemm,
      match: "^fused_moe_kernel$"}
+  # triton_kernels' MoE matmul: _matmul_ogs_<layout>_... before, _matmul_<layout>_... (e.g.
+  # _matmul_NNT_bf16xbf16xmxfp4_swiglu) in the releases SGLang 0.5.23 and TRT-LLM 1.4.0rc2 ship
   - {backend: triton_fused_moe, role: moe_gemm,
-     match: "^_matmul_ogs_|^fused_moe_oss::"}
+     match: "^_matmul_ogs_|^_matmul_[NT]{3}_|^fused_moe_oss::"}
   - {backend: sgl_kernel, role: moe_infra,
      match: "^(sgl_kernel::)?moe_(align_block_size|sum_reduce)|^count_and_sort_expert_tokens|^moe_align_block_size"}
+  # SGLang's Triton versions of the two above (sglang 0.5.23 python/sglang/kernels/ops/moe/):
+  # the one-launch align for top-k numel <= 64 (moe_align_small_numel.py) and the top-k
+  # sum-reduce (fused_moe_triton_kernels.py, moe_sum_reduce_triton)
+  - {backend: sgl_kernel, role: moe_infra,
+     match: "^_moe_align_small_numel_kernel$|^_moe_sum_reduce_kernel$"}
   - {backend: vllm_kernel, role: moe_infra,
      match: "^vllm::moe::"}
   - {backend: trtllm_internal, role: moe_infra,

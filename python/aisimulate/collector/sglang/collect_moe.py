@@ -28,7 +28,12 @@ point of its sweep on one layer build.
 # flashinfer_cutlass for modelopt_fp4 on SM120
 # (srt/arg_groups/overrides.py:1513-1521), Triton for Fp8MoEMethod and
 # UnquantizedFusedMoEMethod under auto without an all-to-all backend
-# (srt/layers/quantization/fp8.py:2962-2972, unquant.py:1169-1193).
+# (srt/layers/quantization/fp8.py:2962-2972, unquant.py:1169-1193). The op
+# plan's dispatch also follows a model override that depends on EP size:
+# GPT-OSS at EP1 on SM89/90 serves triton_kernel (op_plans._sglang_moe_runner).
+#
+# Routing. TopK is built as the model builds it: from the row's routing fields,
+# or with the model's own routing function for Llama-4 and Gemma-4.
 #
 # Where this table times a different path than SGLang serving (the direction
 # of each error is unknown unless stated):
@@ -41,16 +46,6 @@ point of its sweep on one layer build.
 #   shared-expert output. The table times FusedMoE.forward, finalize
 #   included: it overstates the routed-MoE time by that finalize. Retire it by
 #   timing forward_deferred_finalize plus the fused finalize as one op.
-# - gemma-4 routing: serving's TopK runs Gemma4's custom routing function
-#   (gemma4_fused_routing, models/gemma4_causal.py:251-283); the case row has
-#   no custom-routing field, so the table times the plain softmax top-k
-#   (select_experts). Both are one small routing kernel per forward.
-# - GPT-OSS W4A16 on SM89/90 at EP1: serving runs the triton_kernel runner
-#   (model_overrides/gpt_oss.py:100-117; sglang-kernel ships triton_kernels,
-#   kernels/aot/CMakeLists.txt:548-553), and Triton only at EP>1. The case
-#   dispatch is per quant mode and SM (cases/base_ops/moe.yaml), so the EP1
-#   rows time the Triton runner on BF16-upcast experts. Direction unknown.
-#   Retire it with an EP-aware dispatch for this lane.
 # - MiniMax-M3: serving hands the routed scaling factor to TopK only, applied
 #   to the top-k weights (apply_routed_scaling_factor_on_output=True), and
 #   builds FusedMoE without it and with gate_up_interleaved=False
@@ -85,7 +80,7 @@ from collector.helper import (
     log_perf,
     power_law_logits_v3,
 )
-from collector.op_plans import plan_cases
+from collector.op_plans import SGLANG_GEMMA4_ROUTING_ARCHITECTURES, plan_cases
 from collector.sglang.moe_config_observation import append_record as append_triton_config_record
 from collector.sglang.moe_config_observation import observe_triton_config_selection
 from collector.sglang.runtime_limits import serving_memory_defaults
@@ -444,6 +439,30 @@ def _kernel_source(moe_layer, *, moe_type: str, moe_backend: str, is_fp4_experts
     return _KERNEL_SOURCE_BY_RUNNER[moe_backend]
 
 
+def _gemma4_routing_function(num_experts: int, device: str) -> Callable:
+    """Gemma4MoE's custom routing function, as SGLang serving builds it.
+
+    Serving's TopK routes Gemma-4 through a closure Gemma4MoE.__init__ builds
+    (srt/models/gemma4_causal.py:251-277), which select_experts calls in place
+    of its own top-k (srt/layers/moe/topk.py:3092-3103). On CUDA 2-D float
+    router logits, which this collector always passes, the closure is
+    gemma4_fused_routing (gemma4_causal.py:259-265): one _gemma4_routing_kernel
+    launch that takes the top-k of all logits, softmaxes them and multiplies
+    by per_expert_scale (kernels/ops/moe/gemma4_routing.py:75-186).
+    per_expert_scale is a parameter of ones in the model dtype
+    (gemma4_causal.py:246, created under model_loader/loader.py
+    set_default_torch_dtype); the checkpoint's values do not change the work.
+    """
+    from sglang.kernels.ops.moe.gemma4_routing import gemma4_fused_routing
+
+    per_expert_scale = torch.ones(num_experts, dtype=torch.bfloat16, device=device)
+
+    def routing_function(hidden_states, gating_output, topk, renormalize):
+        return gemma4_fused_routing(gating_output, per_expert_scale, topk)
+
+    return routing_function
+
+
 def _benchmark_moe_layer(
     *,
     moe_type: str,
@@ -548,6 +567,14 @@ def _benchmark_moe_layer(
                     layer_id=0,
                     renormalize=False,
                     custom_routing_function=Llama4MoE.custom_routing_function,
+                )
+            elif architecture in SGLANG_GEMMA4_ROUTING_ARCHITECTURES:
+                # Gemma4MoE builds its TopK from the custom routing function
+                # alone (models/gemma4_causal.py:279-283).
+                topk_layer = TopK(
+                    top_k=topk,
+                    layer_id=0,
+                    custom_routing_function=_gemma4_routing_function(num_experts, device),
                 )
             else:
                 topk_layer = TopK(
@@ -674,10 +701,11 @@ def _benchmark_moe_layer(
 #   On SM89/90 an EP>1 GPT-OSS server keeps auto, which Mxfp4MoEMethod resolves
 #   to Triton (srt/layers/quantization/mxfp4.py:1443-1450) on experts upcast to
 #   BF16 at load (:1115-1133); an EP1 server runs triton_kernel (gpt_oss.py:
-#   100-117), because sglang-kernel installs the triton_kernels package
+#   102-120) on the MXFP4 experts swizzled for triton_kernels (mxfp4.py:
+#   1046-1076), because sglang-kernel installs the triton_kernels package
 #   (kernels/aot/CMakeLists.txt:548-553; is_triton_kernels_available,
-#   srt/utils/common.py:4814-4815). The plan's per-SM pin cannot follow the EP
-#   split: see the GPT-OSS deviation note in this file's header. Kimi-K3 keeps
+#   srt/utils/common.py:4814-4815). The op plan's dispatch follows that EP
+#   split (op_plans._sglang_moe_runner). Kimi-K3 keeps
 #   auto off SM100/103/107 (model_overrides/kimi_k3.py:172-190), so SM89, SM90
 #   and SM120 serve it on the same Triton path, SiTU applied from gemm1_alpha /
 #   gemm1_clamp_limit (moe_runner/triton.py:162-170, 208-215;

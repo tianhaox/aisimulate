@@ -77,6 +77,7 @@ mappings:
 
   # MoE families (label names the constructed serving method).
   - {framework: sglang, kernel_source: sglang_fused_moe_triton, backend: triton_fused_moe, source: "collector/sglang/collect_moe.py"}
+  - {framework: sglang, kernel_source: sglang_triton_kernel_moe, backend: triton_fused_moe, source: "collector/sglang/collect_moe.py (triton_kernel runner: triton_kernels matmul_ogs MoE; GPT-OSS W4A16 at EP1 on SM89/90, arg_groups/model_overrides/gpt_oss.py:102-120 @v0.5.23)"}
   - {framework: sglang, kernel_source: sglang_marlin_moe, backend: marlin, source: "collector/sglang/collect_moe.py (w4a16_mxfp4 GPT-OSS)"}
   - {framework: sglang, kernel_source: sglang_flashinfer_cutedsl_moe, backend: flashinfer_cutedsl, source: "collector/sglang/collect_moe.py (nvfp4)"}
   - {framework: sglang, kernel_source: sglang_flashinfer_mxfp4_moe, backend: flashinfer_trtllm_gen, source: "collector/sglang/collect_moe.py (w4a8_mxfp4_mxfp8)"}

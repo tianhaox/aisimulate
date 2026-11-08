@@ -76,12 +76,32 @@ def test_normalize_drops_denied_names(pd):
         ("nvjet_sm90_tst_128x256_64x4_2x1_v_bz_coopA_TNN", "cublas"),
         ("fmha_v2_flash_attention_bf16_64_128_S_qkv_128_causal_tma_ws_sm90_kernel", "trtllm_mha"),
         ("fused_moe_kernel", "triton_fused_moe"),
+        # triton_kernels' MoE matmul under its current name (SGLang triton_kernel runner,
+        # TRT-LLM TritonFusedMoE), and the earlier _matmul_ogs_ one
+        ("_matmul_NNT_bf16xbf16xmxfp4_swiglu", "triton_fused_moe"),
+        ("_matmul_NNT_bf16xbf16xmxfp4", "triton_fused_moe"),
+        ("_matmul_ogs_NNT_bf16xbf16xmxfp4", "triton_fused_moe"),
         ("chunk_kda_fwd_kernel_inter_solve_fused", "fla_triton"),
     ],
 )
 def test_taxonomy_labels_identity_kernels(pd, kernel, family):
     labels, unmatched = pd.label_kernels([kernel], "sm90")
     assert family in labels and not unmatched
+
+
+@pytest.mark.parametrize("sm", ["sm89", "sm90", "sm100", "sm103", "sm120"])
+@pytest.mark.parametrize(
+    "kernel",
+    [
+        "moe_align_block_size_kernel",
+        "moe_sum_reduce_kernel",
+        # SGLang's Triton align (top-k numel <= 64) and sum-reduce
+        "_moe_align_small_numel_kernel",
+        "_moe_sum_reduce_kernel",
+    ],
+)
+def test_taxonomy_labels_moe_align_and_sum_reduce_as_moe_infra(pd, kernel, sm):
+    assert pd.kernel_role(kernel, sm) == ("sgl_kernel", "moe_infra")
 
 
 @pytest.mark.parametrize(

@@ -14,7 +14,8 @@ pinned SGLang release that the timed path depends on:
 * TopK is bound to the built experts (``TopK.bind_runner_backend``) with no
   explicit output format, as a model binds it, which is what picks bypassed
   versus materialized routing; Kimi-K3's SiTU experts materialize it and load
-  gate/up non-interleaved, as models/kimi_k3.py builds them;
+  gate/up non-interleaved, as models/kimi_k3.py builds them; Gemma-4's TopK
+  routes through Gemma4MoE's routing function (gemma4_fused_routing);
 * FlashInfer runners are tuned like serving's warm-up (``autotune_v2`` inside
   the tuning pass) at the bucket serving tuned, untuned past the warm-up's
   list, and other runners are not tuned;
@@ -30,6 +31,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from collector.op_plans import SGLANG_GEMMA4_ROUTING_ARCHITECTURES
 
 pytestmark = pytest.mark.unit
 SOURCE_PATH = Path(__file__).resolve().parents[4] / "collector" / "sglang" / "collect_moe.py"
@@ -252,6 +254,8 @@ def _run_layer_benchmark(
             "flashinfer_autotuned": flashinfer_autotuned,
             "flashinfer_tuning_bucket": _pow2_tuning_bucket(bucket_calls),
             "serving_memory_defaults": lambda tp_size: memory_calls.append(tp_size) or memory_defaults,
+            "SGLANG_GEMMA4_ROUTING_ARCHITECTURES": SGLANG_GEMMA4_ROUTING_ARCHITECTURES,
+            "_gemma4_routing_function": lambda num_experts, device: ("gemma4-routing", num_experts, device),
         },
     )
     rows = []
@@ -404,6 +408,59 @@ def test_glm53_flash_trtllm_experts_are_also_tuned_at_the_prefill_chunk(monkeypa
         kernel_source="sglang_mxfp4_flashinfer_trtllm_moe",
     )
     assert run.bucket_calls == [(4, 512, None)]
+
+
+def test_gemma4_topk_routes_through_the_models_routing_function(monkeypatch):
+    # models/gemma4_causal.py:279-283 builds TopK(top_k, layer_id,
+    # custom_routing_function) and :298 binds it without a routing method.
+    run = _run_layer_benchmark(
+        monkeypatch,
+        moe_backend="triton",
+        capability_major=9,
+        architecture="Gemma4ForConditionalGeneration",
+        activation="gelu",
+    )
+
+    (topk_kwargs,) = [event[1] for event in run.record if event[0] == "topk_init"]
+    assert topk_kwargs == {
+        "top_k": 2,
+        "layer_id": 0,
+        "custom_routing_function": ("gemma4-routing", 8, "cuda:0"),
+    }
+    assert [event[1:] for event in run.record if event[0] == "bind"] == [("triton", None)]
+
+    # Every other architecture keeps TopK built from the row's routing fields.
+    run = _run_layer_benchmark(monkeypatch, moe_backend="triton", capability_major=9, architecture="MixtralForCausalLM")
+    (topk_kwargs,) = [event[1] for event in run.record if event[0] == "topk_init"]
+    assert "custom_routing_function" not in topk_kwargs and topk_kwargs["scoring_func"] == "softmax"
+
+
+def test_gemma4_routing_function_is_the_fused_gemma4_router(monkeypatch):
+    # The CUDA branch of Gemma4MoE's closure (gemma4_causal.py:259-265):
+    # gemma4_fused_routing(gating_output, per_expert_scale, topk), per_expert_scale
+    # a ones parameter in the model dtype (:246).
+    calls = []
+
+    def gemma4_fused_routing(gating_output, per_expert_scale, topk):
+        calls.append((gating_output, per_expert_scale, topk))
+        return "weights", "ids"
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.kernels.ops.moe.gemma4_routing",
+        types.SimpleNamespace(gemma4_fused_routing=gemma4_fused_routing),
+    )
+    fake_torch = SimpleNamespace(
+        bfloat16="bf16",
+        ones=lambda *shape, dtype, device: ("ones", shape, dtype, device),
+    )
+    routing_function = _load("_gemma4_routing_function", namespace={"torch": fake_torch})["_gemma4_routing_function"](
+        128, "cuda:0"
+    )
+
+    # select_experts calls it by keyword (srt/layers/moe/topk.py:3098-3103).
+    assert routing_function(hidden_states="h", gating_output="logits", topk=8, renormalize=True) == ("weights", "ids")
+    assert calls == [("logits", ("ones", (128,), "bf16", "cuda:0"), 8)]
 
 
 @pytest.mark.parametrize(("moe_backend", "standard"), [("flashinfer_mxfp4", True), ("marlin", False)])
