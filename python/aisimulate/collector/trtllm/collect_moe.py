@@ -832,6 +832,26 @@ def _run_moe_case(
             del actual_logits
         del hidden_states
 
+    # DIAG: re-time the first points after the sweep (order effect check)
+    for num_tokens in num_tokens_lists[:3]:
+        hidden_states = torch.randn([num_tokens, hidden_size]).bfloat16().to(torch.device(device))
+        actual_logits = balanced_logits(num_tokens, num_experts, topk).to(
+            device=torch.device(device), dtype=layer.router_logits_dtype
+        )
+
+        def rerun():
+            moe.forward(hidden_states, actual_logits, do_finalize=not min_latency_mode)  # noqa: F821
+
+        for rep in range(2):
+            with benchmark_with_power(device=device, kernel_func=rerun, num_warmups=3, num_runs=6, repeat_n=1) as res:
+                pass
+            print(f"DIAG retime num_tokens={num_tokens} rep={rep} latency_ms={res['latency_ms']:.4f}", flush=True)
+        with benchmark_with_power(
+            device=device, kernel_func=rerun, num_warmups=3, num_runs=6, repeat_n=1, use_cuda_graph=False
+        ) as res:
+            pass
+        print(f"DIAG retime-eager num_tokens={num_tokens} latency_ms={res['latency_ms']:.4f}", flush=True)
+
 
 # ── Worker recycling ─────────────────────────────────────────────────────────
 # AIConfigurator's collector (40bc989a9) exited the worker after EVERY case so the
