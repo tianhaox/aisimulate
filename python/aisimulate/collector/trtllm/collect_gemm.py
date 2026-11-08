@@ -234,6 +234,18 @@ def run_gemm(gemm_type, m, n, k, *, perf_filename, device="cuda:0"):
     torch.set_default_device(device)
     sm_version = get_sm_version()
 
+    # FIXME(kernel-limit): fp8_block weight scales are 128-column blocks, and the
+    # CUTLASS block-scale GEMM needs K in whole blocks. fp8_block_scaling_gemm
+    # checks it on SM89 and SM120 (TORCH_CHECK k % 128,
+    # cpp/tensorrt_llm/thop/fp8BlockScalingGemm.cpp:99, 138) but only k % 16 on
+    # SM90 (:170), where such a case then faults the worker and costs a worker
+    # restart (about a minute) instead of a classified failure. Raised before
+    # the build; the SM100/103 DeepGEMM path takes these shapes.
+    if gemm_type == "fp8_block" and sm_version == 90 and k % 128 != 0:
+        raise ValueError(
+            f"FIXME(kernel-limit): fp8_block GEMM on SM90 needs K in whole 128-column scale blocks; got K={k}"
+        )
+
     dtype = torch.bfloat16
     x = torch.randn((m, k), dtype=dtype).to(torch.device(device))
 

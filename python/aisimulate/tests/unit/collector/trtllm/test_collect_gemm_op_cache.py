@@ -273,6 +273,19 @@ def test_fp8_block_post_load_runs_once_per_copy_and_is_tagged_deepgemm_on_sm100(
     assert all(row["item_list"][0]["latency"] == pytest.approx(0.5) for row in published)
 
 
+def test_fp8_block_with_k_off_the_128_blocks_is_refused_before_the_build_on_sm90_only():
+    namespace, built, _, _, published, _ = _load()
+    namespace["get_sm_version"] = lambda: 90
+    with pytest.raises(ValueError, match=r"^FIXME\(kernel-limit\): fp8_block GEMM on SM90"):
+        _run(namespace, "fp8_block", 64, 4096, 1856)
+    assert built == [] and published == []
+    _run(namespace, "fp8_block", 64, 4096, 1920)  # whole blocks run
+    assert set(built) == {("fp8_block", 4096, 1920, 128)}
+    namespace["get_sm_version"] = lambda: 100
+    _run(namespace, "fp8_block", 64, 4096, 1856)  # DeepGEMM takes it on SM100
+    assert built[-1] == ("fp8_block", 4096, 1856, 128)
+
+
 def test_nvfp4_kernel_source_names_the_backend_the_tuner_picked_for_the_case_m():
     namespace, _, _, _, published, tuner = _load({64: ("cutedsl", 7), 8: ("cuda_core", 0), 1: ("cublaslt", 2)})
     for m in (64, 8, 1):
