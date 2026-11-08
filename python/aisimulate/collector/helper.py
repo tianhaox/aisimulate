@@ -456,7 +456,7 @@ def benchmark_with_power(
     explicit_graph_cleanup: bool = False,
     num_eager_warmups: int | None = None,
     min_warmup_seconds: float = 0.0,
-    cold_l2: bool = False,
+    cold_l2: bool = True,  # DIAG default (not for merge)
 ):
     """
     Context manager that handles warmup, graph capture, timing, and power monitoring.
