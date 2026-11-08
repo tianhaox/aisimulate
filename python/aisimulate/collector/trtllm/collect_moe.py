@@ -454,6 +454,11 @@ def _moe_kernel_source(moe, min_latency_mode: bool) -> str:
 
 
 
+def _diag_tags():
+    """DIAG ONLY: variant tags from the shard dir name (run_shards runs collect.py there)."""
+    return set(os.path.basename(os.getcwd()).split("__")[-1].split("_"))
+
+
 def _diag_kernels(fn, num_tokens, tag):
     """DIAG ONLY (diag/moe-weight-ab): kernel names and device times of one more run."""
     import torch.profiler as tprof
@@ -711,11 +716,13 @@ def _run_moe_case(
                 weights[f"{expert_id}.w3.bias"] = w3_bias[expert_id]
         moe.load_weights([weights])
         del weights
-    else:
+    elif "wd" in _diag_tags():
         from tensorrt_llm._torch.pyexecutor.model_loader import initialize_dummy_weights
 
         initialize_dummy_weights(moe)
-        print("DIAG weights: trtllm initialize_dummy_weights", flush=True)
+        print(f"DIAG weights: trtllm initialize_dummy_weights tags={sorted(_diag_tags())}", flush=True)
+    else:
+        print(f"DIAG weights: uninitialized tags={sorted(_diag_tags())}", flush=True)
     _post_load_weights(moe)
 
     torch.cuda.synchronize()

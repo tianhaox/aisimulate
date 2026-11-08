@@ -772,7 +772,10 @@ def flashinfer_autotune_budget() -> FlashInferTuneBudget | None:
     (returns ``None``)."""
     raw = os.environ.get(FLASHINFER_AUTOTUNE_BUDGET_ENV, "").strip()
     if not raw:
-        return None  # DIAG: FlashInfer's own 3/10/5000 budget
+        tags = set(os.path.basename(os.getcwd()).split("__")[-1].split("_"))
+        if "bd" in tags:
+            return None  # DIAG: FlashInfer's own 3/10/5000 budget
+        return FlashInferTuneBudget()
     if raw.lower() == FLASHINFER_AUTOTUNE_BUDGET_FLASHINFER:
         return None
     parts = [part.strip() for part in raw.split(",")]

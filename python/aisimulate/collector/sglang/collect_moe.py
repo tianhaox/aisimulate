@@ -545,8 +545,11 @@ def _benchmark_moe_layer(
                 gate_up_interleaved=not situ,
             ).to(device)
             with torch.no_grad():
+                dense = "wd" in _diag_tags()
                 for name, parameter in moe_layer.named_parameters():
-                    if "scale" in name or "alpha" in name:
+                    if not dense:
+                        parameter.fill_(1) if "scale" in name or "alpha" in name else parameter.zero_()
+                    elif "scale" in name or "alpha" in name:
                         parameter.fill_(1)
                     elif parameter.is_floating_point() and parameter.element_size() < 2:
                         tmp = torch.randn(parameter.shape, dtype=torch.float32, device=parameter.device) * 64
@@ -562,7 +565,7 @@ def _benchmark_moe_layer(
                         parameter.random_(-(2**31), 2**31 - 1)
                     else:
                         parameter.zero_()
-                print("DIAG weights: dense random", flush=True)
+                print(f"DIAG weights: {'dense random' if dense else 'zeros'} tags={sorted(_diag_tags())}", flush=True)
             kernel_source = _kernel_source(
                 moe_layer, moe_type=moe_type, moe_backend=moe_backend, is_fp4_experts=is_fp4_experts
             )
@@ -704,6 +707,11 @@ def _benchmark_moe_layer(
         gc.collect()
         torch.cuda.empty_cache()
 
+
+
+def _diag_tags():
+    """DIAG ONLY: variant tags from the shard dir name (run_shards runs collect.py there)."""
+    return set(os.path.basename(os.getcwd()).split("__")[-1].split("_"))
 
 
 def _diag_kernels(fn, num_tokens, tag):
