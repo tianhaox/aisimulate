@@ -711,6 +711,11 @@ def _run_moe_case(
                 weights[f"{expert_id}.w3.bias"] = w3_bias[expert_id]
         moe.load_weights([weights])
         del weights
+    else:
+        from tensorrt_llm._torch.pyexecutor.model_loader import initialize_dummy_weights
+
+        initialize_dummy_weights(moe)
+        print("DIAG weights: trtllm initialize_dummy_weights", flush=True)
     _post_load_weights(moe)
 
     torch.cuda.synchronize()

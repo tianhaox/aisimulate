@@ -546,7 +546,23 @@ def _benchmark_moe_layer(
             ).to(device)
             with torch.no_grad():
                 for name, parameter in moe_layer.named_parameters():
-                    parameter.fill_(1) if "scale" in name or "alpha" in name else parameter.zero_()
+                    if "scale" in name or "alpha" in name:
+                        parameter.fill_(1)
+                    elif parameter.is_floating_point() and parameter.element_size() < 2:
+                        tmp = torch.randn(parameter.shape, dtype=torch.float32, device=parameter.device) * 64
+                        parameter.copy_(tmp.clamp_(-448, 448).to(parameter.dtype))
+                        del tmp
+                    elif parameter.is_floating_point():
+                        parameter.normal_(0, 0.02)
+                    elif parameter.dtype == torch.uint8:
+                        parameter.random_(0, 256)
+                    elif parameter.dtype == torch.int8:
+                        parameter.random_(-128, 128)
+                    elif parameter.dtype == torch.int32:
+                        parameter.random_(-(2**31), 2**31 - 1)
+                    else:
+                        parameter.zero_()
+                print("DIAG weights: dense random", flush=True)
             kernel_source = _kernel_source(
                 moe_layer, moe_type=moe_type, moe_backend=moe_backend, is_fp4_experts=is_fp4_experts
             )
