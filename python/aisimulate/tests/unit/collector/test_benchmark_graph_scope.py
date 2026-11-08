@@ -125,6 +125,7 @@ def trace_benchmark(
         "os": os,
         "time": time,
         "worker_heartbeat": lambda: events.append("heartbeat"),
+        "_cold_l2_delta_ms": lambda device, dev_mod, one_call, repeat_n: (events.append("cold_l2"), one_call(), 0.5)[2],
         "TRACE_CHILD_DIR_ENV": TRACE_CHILD_DIR_ENV,
         "TRACE_TIMED_RANGE": TRACE_TIMED_RANGE,
         "TRACE_MEASURED_RANGE": TRACE_MEASURED_RANGE,
@@ -304,3 +305,55 @@ def test_only_vllm_mla_module_binds_explicit_graph_cleanup():
     assert namespace["benchmark_with_power"](kernel_func=kernel, num_runs=30) == "native-context"
     assert calls == [{"explicit_graph_cleanup": True, "kernel_func": kernel, "num_runs": 30}]
     assert namespace["_benchmark_with_power"] is shared_benchmark
+
+
+def test_cold_l2_adds_the_per_call_cost_of_a_cleared_l2_after_the_timed_block(monkeypatch):
+    """Serving reads a layer's weights from HBM: other layers run between its calls. With cold_l2
+    the batched time gains the cold-minus-warm per-call difference, measured after the timed
+    block on the same graph (the fake reports 0.5 ms; the fake events report 12 ms)."""
+    warm = trace_benchmark(monkeypatch)
+    assert "cold_l2" not in warm["events"] and warm["result"]["cold_l2_delta_ms"] is None
+    cold = trace_benchmark(monkeypatch, cold_l2=True)
+    ev = cold["events"]
+    assert cold["result"]["latency_ms"] == 12.0 / 3 + 0.5 and cold["result"]["cold_l2_delta_ms"] == 0.5
+    # after the measured block's closing timing event, replaying the same graph
+    assert ev.index("cold_l2") > max(i for i, e in enumerate(ev) if e == "event:record")
+    assert ev[ev.index("cold_l2") + 1] == "graph:replay"
+    # the capture and the measured block are unchanged
+    assert ev[: ev.index("cold_l2")] == warm["events"][: ev.index("cold_l2")]
+
+
+def test_cold_l2_delta_is_cold_minus_warm_medians_and_never_negative():
+    import types
+
+    from collector import helper
+
+    clock = [0.0]
+
+    class _Ev:
+        def __init__(self, **kw):
+            self.t = None
+
+        def record(self):
+            self.t = clock[0]
+
+        def elapsed_time(self, other):
+            return other.t - self.t
+
+    state = {"cleared": False}
+    buf = types.SimpleNamespace(sum=lambda: state.update(cleared=True))
+    dev = types.SimpleNamespace(Event=_Ev, synchronize=lambda: None)
+
+    def one_call():
+        clock[0] += 2.0 if state["cleared"] else 1.5
+        state["cleared"] = False
+
+    orig = helper._l2_flush_buffer
+    helper._l2_flush_buffer = lambda device, dev_mod: buf
+    try:
+        assert helper._cold_l2_delta_ms(None, dev, one_call, repeat_n=1, calls=5) == 0.5
+        faster = lambda: clock.__setitem__(0, clock[0] + (1.0 if state.pop("cleared", False) else 1.5))
+        state["cleared"] = False
+        assert helper._cold_l2_delta_ms(None, dev, faster, repeat_n=1, calls=5) == 0.0
+    finally:
+        helper._l2_flush_buffer = orig

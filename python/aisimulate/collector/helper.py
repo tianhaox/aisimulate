@@ -419,6 +419,58 @@ class PeriodicGarbageCollector:
         return True
 
 
+# L2 residency between timed calls. Back-to-back graph replays keep an op's weights in L2;
+# serving runs every other layer between two calls of one layer, which reads them from HBM. On
+# B200 (126 MB L2) a 1-token MoE layer whose active experts fit in L2 timed 12-42% faster warm
+# than cold (gpt-oss +21%, close to the +16% vLLM serving showed against the warm row) and
+# GEMMs under 20 us +14-17%, 20-100 us +4%, above 0.1 ms within 1.3%; DeepSeek-V3 experts do
+# not fit and read the same (L2 A/B, 2026-11-09). Cold is measured per call: L2 is cleared by
+# reading a buffer twice its size (a write leaves dirty lines the op then pays to write back,
+# +14% on DeepSeek-V3 where nothing is cached), and the timing events hold the op alone.
+COLD_L2_CALLS = 25
+_L2_FLUSH_BUFFERS: dict = {}
+
+
+def _l2_flush_buffer(device, dev_mod):
+    """A cached int32 buffer of twice the device's L2 size (at least 64 MiB); summing it evicts L2."""
+    import torch
+
+    index = getattr(device, "index", None) or 0
+    buf = _L2_FLUSH_BUFFERS.get(index)
+    if buf is None:
+        l2 = int(getattr(dev_mod.get_device_properties(index), "L2_cache_size", 0) or 0)
+        buf = torch.ones(max(2 * l2, 64 << 20) // 4, dtype=torch.int32, device=f"cuda:{index}")
+        _L2_FLUSH_BUFFERS[index] = buf
+    return buf
+
+
+def _cold_l2_delta_ms(device, dev_mod, one_call, repeat_n: int, calls: int = COLD_L2_CALLS) -> float:
+    """Median per-call time with L2 cleared before each call minus with L2 warm.
+
+    Both series time single calls between events the same way (the clear finishes before the
+    start event), so the event and launch overhead cancels in the difference, which is added to
+    the batched measurement. A negative difference is noise and counts as zero."""
+    buf = _l2_flush_buffer(device, dev_mod)
+
+    def series(clear: bool) -> float:
+        times = []
+        for _ in range(calls):
+            if clear:
+                buf.sum()
+            dev_mod.synchronize()
+            start, end = dev_mod.Event(enable_timing=True), dev_mod.Event(enable_timing=True)
+            start.record()
+            one_call()
+            end.record()
+            dev_mod.synchronize()
+            times.append(start.elapsed_time(end) / repeat_n)
+        times.sort()
+        return times[len(times) // 2]
+
+    warm = series(False)
+    return max(series(True) - warm, 0.0)
+
+
 @contextmanager
 def benchmark_with_power(
     device,
@@ -434,6 +486,7 @@ def benchmark_with_power(
     explicit_graph_cleanup: bool = False,
     num_eager_warmups: int | None = None,
     min_warmup_seconds: float = 0.0,
+    cold_l2: bool = False,
 ):
     """
     Context manager that handles warmup, graph capture, timing, and power monitoring.
@@ -468,6 +521,10 @@ def benchmark_with_power(
                          to ~30% slower for up to ~0.1 s: on B200 a 1-token MoE layer
                          timed 0.110 ms after 3 replay warmups, 0.084 ms (steady)
                          after ~0.1 s of them. Default 0 keeps the count-only warmup.
+        cold_l2: Add the per-call cost of an L2 cleared before each call (as serving runs
+                         other layers between two calls of one layer) to the batched time:
+                         the median of single calls after an L2 clear minus the median of
+                         single calls back to back (_cold_l2_delta_ms).
 
     Yields:
         dict with keys:
@@ -688,6 +745,19 @@ def benchmark_with_power(
 
         # Calculate latency
         latency_ms = start_event.elapsed_time(end_event) / actual_num_runs / repeat_n
+        cold_delta_ms = None
+        if cold_l2:
+
+            def _one_call():
+                if use_graph:
+                    g.replay()
+                else:
+                    for _ in range(repeat_n):
+                        kernel_func()
+
+            cold_delta_ms = _cold_l2_delta_ms(device, dev_mod, _one_call, repeat_n)
+            latency_ms += cold_delta_ms
+            _close_phase("cold_l2")
 
         if timed is not None:
             timed.__exit__(None, None, None)
@@ -700,6 +770,7 @@ def benchmark_with_power(
             "num_runs_executed": actual_num_runs,
             "used_cuda_graph": use_graph,  # NEW: Inform caller which path was used
             "phase_seconds": phase_seconds,
+            "cold_l2_delta_ms": cold_delta_ms,
         }
     finally:
         if timed is not None:
