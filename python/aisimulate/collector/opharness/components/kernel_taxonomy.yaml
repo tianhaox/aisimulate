@@ -86,6 +86,11 @@ rules:
      match: "^_moe_align_small_numel_kernel$|^_moe_sum_reduce_kernel$"}
   - {backend: vllm_kernel, role: moe_infra,
      match: "^vllm::moe::"}
+  # triton_kernels' MoE gather/scatter helpers around _matmul_*: the gather row indices
+  # and the top-k combine (TRT-LLM 1.4.0rc2 TRITON MoE serving gpt-oss-120b on H200 runs
+  # both in prefill and decode, moe gate 2026-11-08)
+  - {backend: triton_fused_moe, role: moe_infra,
+     match: "^_create_row_idxs$|^_reduce_forward$"}
   - {backend: trtllm_internal, role: moe_infra,
      match: "cutlass_kernels::(expandInputRows|finalizeMoeRouting|doActivation|blockExpertPrefixSum|mergeExpertPrefixSum|globalExpertPrefixSum|computeStrides|fusedBuildExpertMaps)"}
   - {backend: framework_native, role: routing,
