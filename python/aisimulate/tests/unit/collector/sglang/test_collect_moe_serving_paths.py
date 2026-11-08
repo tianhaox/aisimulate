@@ -225,8 +225,9 @@ def _run_layer_benchmark(
         yield True
 
     @contextlib.contextmanager
-    def benchmark_with_power(*, kernel_func, min_warmup_seconds, **_kwargs):
+    def benchmark_with_power(*, kernel_func, min_warmup_seconds, num_warmups, num_runs, **_kwargs):
         record.append(("warmup_seconds", min_warmup_seconds))
+        record.append(("protocol", num_warmups, num_runs))
         kernel_func()
         yield {"latency_ms": 5.0, "power_stats": None}
 
@@ -342,8 +343,8 @@ def test_topk_is_bound_to_the_built_experts_like_a_model(monkeypatch, routing_me
     assert layer_kwargs["gate_up_interleaved"] is True
     assert [event[1:] for event in record if event[0] == "bind"] == [("flashinfer_trtllm", bound_routing)]
     assert source == "sglang_flashinfer_trtllm"
-    # Five router inputs per timed call: the row is per forward.
-    assert rows == [(4, 1.0, "sglang_flashinfer_trtllm"), (8, 1.0, "sglang_flashinfer_trtllm")]
+    # Balanced routing is one router input per timed call: the row is the call's latency.
+    assert rows == [(4, 5.0, "sglang_flashinfer_trtllm"), (8, 5.0, "sglang_flashinfer_trtllm")]
 
 
 def test_flashinfer_runners_are_tuned_like_serving_warmup(monkeypatch):
@@ -617,3 +618,5 @@ def test_expert_weights_are_dense_and_the_first_point_warms_up_for_a_fixed_time(
     order = [e[0] for e in run.record if e[0] in ("fill", "process_weights")]
     assert order.index("process_weights") > max(i for i, kind in enumerate(order) if kind == "fill")
     assert [e[1] for e in run.record if e[0] == "warmup_seconds"] == [FIRST_POINT_WARMUP_SECONDS, 0.0, 0.0]
+    # Balanced routing is one deterministic router input, timed as vLLM and TRT-LLM time it.
+    assert {e[1:] for e in run.record if e[0] == "protocol"} == {(3, 6)}

@@ -624,11 +624,11 @@ def _benchmark_moe_layer(
             for point, num_tokens in enumerate(num_tokens_list):
                 print(f"num_tokens {num_tokens} ({kernel_source})")
                 hidden_states = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+                # The vLLM and TRT-LLM MoE collectors' protocol: balanced routing is one
+                # deterministic router input timed after 3 warm-ups over 6 runs; a random
+                # routing averages 5 draws in one run after one warm-up.
                 if distributed == "balanced":
-                    logits = [
-                        balanced_logits(num_tokens, num_experts, topk).to(device=device, dtype=torch.float32)
-                        for _ in range(5)
-                    ]
+                    logits = [balanced_logits(num_tokens, num_experts, topk).to(device=device, dtype=torch.float32)]
                 elif distributed == "power_law":
                     logits = [
                         power_law_logits_v3(num_tokens, num_experts, topk, moe_ep_size, power_law_alpha).to(
@@ -681,8 +681,8 @@ def _benchmark_moe_layer(
                     benchmark_with_power(
                         device=device,
                         kernel_func=kernel_func,
-                        num_warmups=5,
-                        num_runs=10,
+                        num_warmups=3 if len(logits) == 1 else 1,
+                        num_runs=6 if len(logits) == 1 else 1,
                         repeat_n=1,
                         min_warmup_seconds=FIRST_POINT_WARMUP_SECONDS if point == 0 else 0.0,
                     ) as results,
