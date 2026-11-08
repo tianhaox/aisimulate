@@ -16,7 +16,7 @@ pytestmark = pytest.mark.unit
 COLLECTOR = Path(__file__).resolve().parents[4] / "collector" / "trtllm"
 
 
-@pytest.mark.parametrize("sm", [80, 89, 90, 100, 103, 120, 121])
+@pytest.mark.parametrize("sm", [80, 89, 90, 100, 103, 107, 120, 121])
 @pytest.mark.parametrize("kv_dtype", ["bfloat16", "fp8"])
 @pytest.mark.parametrize("context", [True, False])
 def test_mla_logged_compute_precision(sm, kv_dtype, context):
@@ -43,4 +43,5 @@ def test_mla_logged_compute_precision(sm, kv_dtype, context):
             "get_sm_version": lambda: sm,
         },
     )
-    assert actual == (kv_dtype if context and sm in (90, 100, 103, 120) else "bfloat16")
+    # thop/attentionOp.cpp:1466-1470 at the pin: FP8 context MLA on SM90/100/103/107/120.
+    assert actual == (kv_dtype if context and sm in (90, 100, 103, 107, 120) else "bfloat16")

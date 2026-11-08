@@ -84,7 +84,7 @@ def test_benchmarks_do_not_silently_fall_back_from_cuda_graph(relative_path):
         ),
         (
             "collector/sglang/collect_mla_bmm.py",
-            {"sglang_torch_bmm", "sglang_sgl_kernel_bmm_fp8"},
+            {"sglang_torch_bmm", "sglang_flashinfer_bmm_fp8"},
         ),
         (
             "collector/sglang/collect_mhc_module.py",

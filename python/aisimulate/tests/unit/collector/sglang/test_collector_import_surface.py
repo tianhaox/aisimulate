@@ -406,3 +406,247 @@ class TestCollectGdnImportSurface:
         monkeypatch.delitem(sys.modules, "sglang", raising=False)
         _install_fake_sglang(monkeypatch, {})  # torch/pkg_resources only, no sglang.* entries
         _import_fresh(monkeypatch, _COLLECT_GDN_DOTTED, _COLLECT_GDN_PATH)
+
+
+# ---------------------------------------------------------------------------
+# collect_mla.py / collect_mla_bmm.py
+# ---------------------------------------------------------------------------
+# The sglang 0.5.23 names collect_mla.py touches at import time: the three MLA attention
+# backends serving selects per SM (trtllm_mla, fa3, triton), the attention layer, the MLA
+# KV pool and request map, the KV-index translator the runner builds
+# (mem_cache/kv_index_translator.py), the forward batch and context, and the
+# runtime-context parallel override (evaluated at import, as a decorator).
+_MLA_PARALLEL = _FakeParallel()
+
+SGLANG_0523_MLA_SURFACE = {
+    "sglang.srt.configs.model_config": {"AttentionArch": _Dummy},
+    "sglang.srt.layers.attention.flashattention_backend": {"FlashAttentionBackend": _Dummy},
+    "sglang.srt.layers.attention.triton_backend": {"TritonAttnBackend": _Dummy},
+    "sglang.srt.layers.attention.trtllm_mla_backend": {"TRTLLMMLABackend": _Dummy},
+    "sglang.srt.layers.radix_attention": {"RadixAttention": _Dummy},
+    "sglang.srt.mem_cache.kv_index_translator": {"KVIndexTranslator": _Dummy},
+    "sglang.srt.mem_cache.memory_pool": {"MLATokenToKVPool": _Dummy, "ReqToTokenPool": _Dummy},
+    "sglang.srt.model_executor.forward_batch_info": {"ForwardBatch": _Dummy, "ForwardMode": _Dummy},
+    "sglang.srt.model_executor.forward_context": {"ForwardContext": _Dummy, "forward_context": _dummy},
+    "sglang.srt.runtime_context": {"get_parallel": lambda: _MLA_PARALLEL},
+}
+
+
+def _serving_bmm_fp8(*args, **kwargs):
+    return None
+
+
+# collect_mla_bmm.py: serving's absorbed-MLA BMM imports (forward_mla.py:10-13, :95-96
+# @v0.5.23): the kernel-registry bmm_fp8 under sglang.kernels.ops.gemm (the 0.5.21
+# srt/layers/quantization/fp8_utils.bmm_fp8 is gone), the Triton per-tensor quant under
+# sglang.kernels.ops.quantization, and the cuBLAS-version probe that decides whether the
+# quant's scale slot is a fresh torch.zeros per call.
+SGLANG_0523_MLA_BMM_SURFACE = {
+    "sglang.kernels.ops.gemm": {"bmm_fp8": _serving_bmm_fp8},
+    "sglang.kernels.ops.quantization.fp8_kernel": {"per_tensor_quant_mla_fp8": _dummy},
+    "sglang.srt.utils": {"is_nvidia_cublas_version_ge_12_9": lambda: True},
+}
+
+_COLLECT_MLA_PATH = COLLECTOR_DIR / "sglang" / "collect_mla.py"
+_COLLECT_MLA_DOTTED = "collector.sglang.collect_mla"
+_COLLECT_MLA_BMM_PATH = COLLECTOR_DIR / "sglang" / "collect_mla_bmm.py"
+_COLLECT_MLA_BMM_DOTTED = "collector.sglang.collect_mla_bmm"
+
+
+class TestCollectMlaImportSurface:
+    def test_imports_cleanly_against_0523_shaped_sglang(self, monkeypatch):
+        _MLA_PARALLEL.overrides.clear()
+        _install_fake_sglang(monkeypatch, SGLANG_0523_MLA_SURFACE)
+        module = _import_fresh(monkeypatch, _COLLECT_MLA_DOTTED, _COLLECT_MLA_PATH)
+        assert callable(module.run_mla)
+        # The serving backend class itself, never a collector subclass of it.
+        assert module.TRTLLMMLABackend is _Dummy
+        # The kernel collector runs one attention rank: the override the decorator declares.
+        assert _MLA_PARALLEL.overrides == [
+            {
+                "attn_tp_size": 1,
+                "attn_tp_rank": 0,
+                "attn_cp_size": 1,
+                "attn_cp_rank": 0,
+                "attn_dp_size": 1,
+                "attn_dp_rank": 0,
+            }
+        ]
+
+    def test_import_fails_without_the_0523_kv_index_translator(self, monkeypatch):
+        """The runner's translator is built from sglang's own class; there is no stand-in."""
+        surface = {
+            name: attrs
+            for name, attrs in SGLANG_0523_MLA_SURFACE.items()
+            if name != "sglang.srt.mem_cache.kv_index_translator"
+        }
+        _install_fake_sglang(monkeypatch, surface)
+        with pytest.raises(ImportError):
+            _import_fresh(monkeypatch, _COLLECT_MLA_DOTTED, _COLLECT_MLA_PATH)
+
+    def test_bmm_imports_serving_bmm_fp8(self, monkeypatch):
+        _install_fake_sglang(monkeypatch, SGLANG_0523_MLA_BMM_SURFACE)
+        module = _import_fresh(monkeypatch, _COLLECT_MLA_BMM_DOTTED, _COLLECT_MLA_BMM_PATH)
+        assert module.bmm_fp8 is _serving_bmm_fp8
+        assert module._BMM_FP8_SOURCE == "sglang_flashinfer_bmm_fp8"
+        assert module._FRESH_ZERO_SCALE is True
+
+    def test_bmm_import_fails_on_the_retired_fp8_utils_location(self, monkeypatch):
+        """0.5.21's fp8_utils.bmm_fp8 (and sgl_kernel's) are not fallbacks any more."""
+        surface = {
+            name: attrs for name, attrs in SGLANG_0523_MLA_BMM_SURFACE.items() if name != "sglang.kernels.ops.gemm"
+        }
+        surface["sglang.srt.layers.quantization.fp8_utils"] = {"bmm_fp8": _serving_bmm_fp8}
+        _install_fake_sglang(monkeypatch, surface, lenient_extras=("sgl_kernel",))
+        with pytest.raises(ImportError):
+            _import_fresh(monkeypatch, _COLLECT_MLA_BMM_DOTTED, _COLLECT_MLA_BMM_PATH)
+
+
+# ---------------------------------------------------------------------------
+# collect_mla_module.py (DSA) / glm5_dsa_sparse_modules.py
+# ---------------------------------------------------------------------------
+# Neither module touches sglang at import time; every sglang name is imported where the
+# DSA module or the GLM-5 sparse kernels run. The surfaces below are the sglang 0.5.23
+# names those paths resolve, checked strictly by calling the code that imports them.
+# ChunkCache is gone (mem_cache/chunk_cache.py, sglang #43201): a radix-disabled server
+# builds a UnifiedRadixCache with disable=True (mem_cache/registry.py:91-99). The DSA
+# act_quant moved to kernels/ops/quantization/act_quant_triton.py:88, FlashMLA's sparse
+# prefill to kernels/ops/attention/flash_mla_interface.py (the sgl-flash-mla wheel), and
+# decode top-k runs kernels/ops/attention/dsv4/topk.py's v2 kernel.
+class _FakeCacheInitParams:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+class _FakeUnifiedRadixCache:
+    def __init__(self, params):
+        self.params = params
+
+
+class _FakeScheduleBatch:
+    @staticmethod
+    def init_new(**kwargs):
+        return kwargs
+
+
+def _fake_checkpoint_kv_cache(req, tree_cache):
+    req.prefix_len = req.extend_end
+
+
+SGLANG_0523_DSA_MODULE_SURFACE = {
+    "sglang.srt.mem_cache.cache_init_params": {"CacheInitParams": _FakeCacheInitParams},
+    "sglang.srt.mem_cache.unified_cache.components": {"ComponentType": types.SimpleNamespace(FULL="FULL")},
+    "sglang.srt.mem_cache.unified_radix_cache": {"UnifiedRadixCache": _FakeUnifiedRadixCache},
+    "sglang.srt.mem_cache.common": {"checkpoint_kv_cache": _fake_checkpoint_kv_cache},
+    "sglang.srt.managers.schedule_batch": {"Req": _Dummy, "ScheduleBatch": _FakeScheduleBatch},
+    "sglang.srt.speculative.spec_info": {"SpeculativeAlgorithm": types.SimpleNamespace(NONE="NONE")},
+    "sglang.kernels.ops.quantization.act_quant_triton": {"act_quant": _dummy},
+}
+
+_COLLECT_MLA_MODULE_PATH = COLLECTOR_DIR / "sglang" / "collect_mla_module.py"
+_COLLECT_MLA_MODULE_DOTTED = "collector.sglang.collect_mla_module"
+
+
+class _EnvFlag:
+    def __init__(self, value):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+
+SGLANG_0523_GLM5_SPARSE_SURFACE = {
+    "sglang.srt.environ": {
+        "envs": types.SimpleNamespace(
+            SGLANG_DSA_FUSE_TOPK=_EnvFlag(True),
+            SGLANG_OPT_USE_TOPK_V2=_EnvFlag(True),
+            SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION=_EnvFlag(0.2),
+        )
+    },
+    "sglang.kernels.ops.attention.flash_mla_interface": {"flash_mla_sparse_fwd": _dummy},
+    "sglang.kernels.ops.attention.dsv4.topk": {"plan_topk_v2": _dummy, "topk_transform_paged_v2": _dummy},
+}
+
+_GLM5_SPARSE_PATH = COLLECTOR_DIR / "sglang" / "glm5_dsa_sparse_modules.py"
+_GLM5_SPARSE_DOTTED = "collector.sglang.glm5_dsa_sparse_modules"
+
+
+class TestCollectDsaModuleImportSurface:
+    def test_imports_without_sglang_at_module_level(self, monkeypatch):
+        _install_fake_sglang(monkeypatch, {})
+        module = _import_fresh(monkeypatch, _COLLECT_MLA_MODULE_DOTTED, _COLLECT_MLA_MODULE_PATH)
+        assert callable(module.run_mla_module_worker)
+
+    def test_disabled_tree_cache_and_batch_resolve_against_0523_shaped_sglang(self, monkeypatch):
+        _install_fake_sglang(monkeypatch, SGLANG_0523_DSA_MODULE_SURFACE)
+        module = _import_fresh(monkeypatch, _COLLECT_MLA_MODULE_DOTTED, _COLLECT_MLA_MODULE_PATH)
+        allocator = types.SimpleNamespace(page_size=64)
+        runner = types.SimpleNamespace(
+            req_to_token_pool=object(), token_to_kv_pool_allocator=allocator, model_config=object()
+        )
+        cache = module._radix_disabled_tree_cache(runner)
+        assert isinstance(cache, _FakeUnifiedRadixCache)
+        assert cache.params.kwargs == {
+            "disable": True,
+            "req_to_token_pool": runner.req_to_token_pool,
+            "token_to_kv_pool_allocator": allocator,
+            "page_size": 64,
+            "tree_components": ("FULL",),
+        }
+        batch = module._new_schedule_batch(runner, ["req"], cache)
+        assert batch["tree_cache"] is cache
+        assert batch["enable_overlap"] is False
+        assert batch["spec_algorithm"] == "NONE"
+
+    def test_disabled_tree_cache_fails_without_the_0523_unified_radix_cache(self, monkeypatch):
+        """There is no ChunkCache stand-in to fall back to."""
+        surface = dict(SGLANG_0523_DSA_MODULE_SURFACE)
+        del surface["sglang.srt.mem_cache.unified_radix_cache"]
+        surface["sglang.srt.mem_cache.chunk_cache"] = {"ChunkCache": _Dummy}
+        _install_fake_sglang(monkeypatch, surface)
+        module = _import_fresh(monkeypatch, _COLLECT_MLA_MODULE_DOTTED, _COLLECT_MLA_MODULE_PATH)
+        runner = types.SimpleNamespace(
+            req_to_token_pool=object(), token_to_kv_pool_allocator=types.SimpleNamespace(page_size=64)
+        )
+        with pytest.raises(ImportError):
+            module._radix_disabled_tree_cache(runner)
+
+
+class TestGlm5SparseImportSurface:
+    def test_topk_switches_resolve_against_0523_shaped_sglang(self, monkeypatch):
+        _install_fake_sglang(monkeypatch, SGLANG_0523_GLM5_SPARSE_SURFACE)
+        module = _import_fresh(monkeypatch, _GLM5_SPARSE_DOTTED, _GLM5_SPARSE_PATH)
+        assert module._glm5_fuse_topk_enabled() is True
+        assert module._glm5_topk_v2_enabled() is True
+        assert callable(module.run_glm5_dsa_sparse_kernel_worker)
+
+
+# ---------------------------------------------------------------------------
+# collect_dsv4_attn.py / deepseekv4_sparse_modules.py
+# ---------------------------------------------------------------------------
+# Neither touches sglang at import time. Their sglang 0.5.23 names resolve where the DSV4
+# module and kernel paths run: mem_cache.registry (TreeCacheBuildContext, create_tree_cache;
+# ChunkCache is gone), cache_init_params, kv_cache_builder.uses_ssm_state,
+# allocator.swa.is_swa_req_ring, deepseek_v4_memory_pool, unified_cache.component_type,
+# configs.model_config / configs.deepseek_v4, managers.schedule_batch, model_executor
+# (forward_batch_info, forward_context, runner.model_capture_mode, model_runner,
+# pool_configurator.DSV4PoolConfigurator), runtime_context.get_context / get_schedule,
+# layers.attention.flashmla_backend.PAGE_SIZE, kernels.ops.attention.dsv4.attn
+# (get_paged_mqa_logits_metadata) and dsv4.topk (plan_topk_v2, topk_transform_paged[_v2]);
+# the 0.5.21 jit_kernel.dsv4.topk path is gone.
+_COLLECT_DSV4_ATTN_PATH = COLLECTOR_DIR / "sglang" / "collect_dsv4_attn.py"
+_COLLECT_DSV4_ATTN_DOTTED = "collector.sglang.collect_dsv4_attn"
+_DSV4_SPARSE_PATH = COLLECTOR_DIR / "sglang" / "deepseekv4_sparse_modules.py"
+_DSV4_SPARSE_DOTTED = "collector.sglang.deepseekv4_sparse_modules"
+
+
+class TestDsv4ImportSurface:
+    def test_attn_imports_without_sglang_at_module_level(self, monkeypatch):
+        _install_fake_sglang(monkeypatch, {})
+        module = _import_fresh(monkeypatch, _COLLECT_DSV4_ATTN_DOTTED, _COLLECT_DSV4_ATTN_PATH)
+        assert callable(module.run_dsv4_attn_worker)
+
+    def test_sparse_kernels_import_without_sglang_at_module_level(self, monkeypatch):
+        _install_fake_sglang(monkeypatch, {})
+        module = _import_fresh(monkeypatch, _DSV4_SPARSE_DOTTED, _DSV4_SPARSE_PATH)
+        assert callable(module._sglang_chunked_prefill_size)
