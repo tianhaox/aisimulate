@@ -56,6 +56,13 @@ _MSA_MODULE_OPS = ["msa_context_module", "msa_generation_module"]
 _ATTENTION_OPS = ["attention_context", "attention_generation"]
 
 SKIPS: list[dict] = [
+    # SGLang shards DeepSeek-V4 attention by its published parallel context only
+    # (MQALayer reads get_parallel().attn_tp_size; srt/models/deepseek_v4.py), which a
+    # single-process collector cannot publish, so collect_dsv4_attn refuses every TP>1
+    # row before building the model (_refuse_tp_emulation): the whole TP>1 block fails.
+    # Earlier tables timed the TP=1 module under the TP>1 label. Delete this entry when
+    # the collector times one rank of a TP>1 module.
+    {"backend": "sglang", "op": _DSV4_ATTENTION_OPS, "tp_size": lambda tp: int(tp) > 1},
     # The sparse-attention (DSA) modules and the DeepSeek-V4 and GLM-5 sparse
     # kernels (DeepGEMM fp8_mqa_logits, FlashMLA sparse, JIT top-k) need Hopper
     # (SM90) or newer.
