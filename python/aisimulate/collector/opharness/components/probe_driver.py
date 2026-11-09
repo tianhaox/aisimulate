@@ -175,13 +175,17 @@ def _cea(v, sm: str):
     """cli_extra_args entry: plain list, or {args: [...], fact: "<evidence>",
     sms: [sm120, ...]} — ``sms`` (optional) limits the customization to those
     SMs (an entry keyed (repo, fw) used to ride along to every SM; sm120 needs
-    bf16 KV for NVFP4 MLA checkpoints, which sm90/sm100 must not inherit)."""
+    bf16 KV for NVFP4 MLA checkpoints, which sm90/sm100 must not inherit). A list of
+    such dicts applies each entry on its own SMs (DeepSeek-V4's page size holds on every
+    SM, its fp8_ds_mla KV only on Hopper)."""
     if not v:
         return []
     if isinstance(v, dict):
         if v.get("sms") and sm not in [str(x) for x in v["sms"]]:
             return []
         return list(v["args"])
+    if all(isinstance(x, dict) for x in v):
+        return [a for x in v for a in _cea(x, sm)]
     return list(v)
 
 

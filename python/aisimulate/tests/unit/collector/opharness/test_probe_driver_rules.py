@@ -229,6 +229,22 @@ def test_customization_sms_scope(pd, monkeypatch):
     assert pd._cea(["-b"], "sm120") == ["-b"]
 
 
+def test_customization_list_scopes_each_entry(pd):
+    """A list of entries applies each on its own SMs: DeepSeek-V4's page size holds on
+    every SM, its fp8_ds_mla KV only on Hopper (rc2 takes it off Hopper only at 256)."""
+    entries = [
+        {"args": ["--generator-set", "params.agg.tokens_per_block=128"], "fact": "f"},
+        {"args": ["--generator-set", "params.agg.kv_cache_dtype=fp8_ds_mla"], "fact": "f", "sms": ["sm90"]},
+    ]
+    assert pd._cea(entries, "sm90") == [
+        "--generator-set",
+        "params.agg.tokens_per_block=128",
+        "--generator-set",
+        "params.agg.kv_cache_dtype=fp8_ds_mla",
+    ]
+    assert pd._cea(entries, "sm100") == ["--generator-set", "params.agg.tokens_per_block=128"]
+
+
 def test_run_id_carries_the_system_and_kv(pd):
     ck = {"repo": "org/m", "profile": "fp8"}
     ids = {

@@ -296,3 +296,16 @@ rules:
      match: "^tensorrt_llm::(_v1::)?kernels::quantizeCopyInputToFp8Kernel$"}
   - {backend: torch, role: infra,
      match: "searchsorted_cuda_kernel"}
+  # SM100 DSA / DeepSeek-V4: FlashInfer's fused RoPE + FP8 Q quantization, SGLang 0.5.23's
+  # wo_a activation quant and MLA KV-set + Q concat, cuBLAS GEMV, and TRT-LLM rc2's CuTe DSL
+  # Blackwell paged MQA logits
+  - {backend: flashinfer, role: norm_rope,
+     match: "^flashinfer::RopeQuantizeKernel"}
+  - {backend: sgl_kernel, role: quant,
+     match: "^(sglang::)?fp8_wo_a_group_major_quant_ue8m0_kernel$"}
+  - {backend: sgl_kernel, role: kvcache,
+     match: "^(sglang::)?set_mla_kv_concat_q_kernel$"}
+  - {backend: cublas, role: gemm,
+     match: "^gemv2[NT]_kernel"}
+  - {backend: trtllm_internal, role: dsa_indexer, sms: [sm100, sm103],
+     match: "^kernel_cutlass_kernel_tensorrt_llm_torchattentionkernelsblackwellpaged_mqa_logit"}
