@@ -69,10 +69,11 @@ _EQUIV_RULES = (
     ("moe_gemm", r"^(nvjet_sm\d+_\w+?)_\d[\w]*?_([A-Z]{3})$", r"\1_\2"),
     ("gemm", r"_tilesize\d+x\d+x\d+\S*", ""),  # xmma tile
     ("gemm", r"_\d+x\d+x\d+(x\d+)?(_|$)", r"\2"),  # cutlass tile shapes
+    ("gemm", r"_cta\d+x\d+x\d+_2cta\d", ""),  # CuTe DSL tile + 2-CTA cluster (SGLang TGV)
     # sgl_kernel DSA top-k selection dispatches on batch size (small_batch vs
     # main): one op, two instantiations — the probe's decode batch is small,
     # the collector's case batch is not
-    ("dsa_indexer", r"^topk_(main|small_batch)_kernel$", "topk_kernel"),
+    ("dsa_indexer", r"^(sglang::)?topk_(main|small_batch(_cluster)?)_kernel$", "topk_kernel"),
     # flashinfer -> TRT-LLM FMHA cubins (Blackwell dense attention / MLA decode): the family is
     # (sm, qkv dtypes, head dims, paged-kv kind, PAGE SIZE); the tail — HVPerCta<n>, MultiCtasKv[Cga],
     # VarSeqQ<n>Kv<n>, Persistent/Static/Grouped/SwapsAbForGen — is the tile/CTA split the runtime picks

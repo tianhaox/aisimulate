@@ -24,7 +24,7 @@ rules:
   - {backend: dsa_nsa, role: attention,
      match: "sparse_attn_fwd_kernel|_fused_indexer_q_rope_quant_kernel|indexer_k_quant_and_cache|cp_gather_indexer_k_quant_cache|topKPerRow|^_scatter_topk(_single_req)?_kernel$|^sparse_mla_index_remap_kernel$"}
   - {backend: triton, role: attention,
-     match: "_flash_attn_fwd_with_block_score|^_decode_score_kernel"}
+     match: "_flash_attn_fwd_with_block_score|^_decode_score(_paged)?_kernel"}
   - {backend: trtllm_mha, role: attention,
      match: "^fmha_v2_flash_attention|^kernel_mha$|masked_multihead_attention_kernel"}
   - {backend: triton, role: attention,
@@ -315,3 +315,19 @@ rules:
      match: "^tensorrt_llm::(_v1::)?kernels::mlaKvNormRopeQuant(Context|Generation)Kernel$"}
   - {backend: cutlass, role: gemm, sms: [sm100, sm103],
      match: "^kernel_cutlass_kernel_tensorrt_llm_torchkernelsblackwellblockwise_gemm"}
+  # MiniMax-M3 MSA: SGLang 0.5.23's decode block top-k; TRT-LLM rc2's Triton reference
+  # (block max score, sparse softmax), FP8/BF16 paged scatter and block selection; the
+  # fmha_sm100 MSA package (k2q CSR build, sparse forward + combine) as TRT-LLM and vLLM
+  # vendor it, and their CuTe DSL index scorers; cuBLAS small-N GEMM
+  - {backend: sgl_kernel, role: attention,
+     match: "^(sglang::)?minimax_decode_topk_block_kernel"}
+  - {backend: triton, role: attention,
+     match: "^_block_max_score_kernel$|^_sparse_softmax_kernel$"}
+  - {backend: trtllm_internal, role: kvcache,
+     match: "^_fused_paged_scatter_kernel$"}
+  - {backend: trtllm_internal, role: attention,
+     match: "^tensorrt_llm::(_v1::)?kernels::minimaxM3SelectBlocks\\d*Kernel$|^kernel_cutlass_kernel_srcsm100fwd|^kernel_cutlass_kernel_tensorrt_llm_torchattentionkernelsblackwellminimax_m3"}
+  - {backend: vllm_kernel, role: attention,
+     match: "^k2q_(build_row_map|hist|row_prefix|scatter|tile_prefix_smem)_kernel$|^kernel_cutlass_kernel_srcblackwell_prefill|^kernel_cutlass_kernel_vllmmodelsminimax_m3nvidiaops"}
+  - {backend: cublas, role: gemm,
+     match: "^gemmSN_[NT]{2}_kernel"}
