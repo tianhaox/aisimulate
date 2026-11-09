@@ -171,10 +171,20 @@ mappings:
   - {framework: sglang, kernel_source: sglang_tilelang_mhc_pre, backend: tilelang, source: "PR#1342 collect_mhc_module.py"}
   - {framework: sglang, kernel_source: sglang_tilelang_mhc_post, backend: tilelang, source: "PR#1342 collect_mhc_module.py"}
   - {framework: sglang, kernel_source: sglang_torch_mhc_pre, backend: torch, source: "PR#1342 collect_mhc_module.py (torch fallback leaf)"}
-  # GLM-5.3-Flash (Glm5Next) mHC labels at 0.5.20 (collector/sglang/collect_mhc_module.py
-  # _glm5next_kernel_source; mhc.py mhc_pre L1034-1044 DeepGEMM tf32_hc_prenorm_gemm + TileLang big_fuse_with_norm).
-  - {framework: sglang, kernel_source: "sglang.hc_pre[tilelang,prenorm_gemm=deepgemm,norm=fused]", backend: deepgemm, source: "collector/sglang/collect_mhc_module.py (GLM; observed norm_fused=True)"}
-  - {framework: sglang, kernel_source: "sglang.hc_post[tilelang]", backend: tilelang, source: "collector/sglang/collect_mhc_module.py (GLM; kernels/ops/layernorm/mhc.py mhc_post_tilelang)"}
+  # SGLang mHC labels: DeepSeek-V4 from 0.5.23 (collector/sglang/collect_mhc_module.py
+  # _kernel_source) and GLM-5.3-Flash at 0.5.20. hc_pre's TileLang path is mhc_pre:
+  # DeepGEMM tf32_hc_prenorm_gemm or TileLang GEMM + TileLang big_fuse_with_norm
+  # (kernels/ops/layernorm/mhc.py:1118-1256@v0.5.23); its torch path is F.linear +
+  # hc_split_sinkhorn + Triton mhc_combine, then RMSNorm (models/deepseek_v4.py:3458-3503@v0.5.23).
+  - {framework: sglang, kernel_source: "sglang.hc_pre[tilelang,prenorm_gemm=deepgemm,norm=fused]", backend: deepgemm, source: "collector/sglang/collect_mhc_module.py (observed norm_fused=True)"}
+  - {framework: sglang, kernel_source: "sglang.hc_pre[tilelang,prenorm_gemm=tilelang,norm=fused]", backend: tilelang, source: "collector/sglang/collect_mhc_module.py; mhc.py:1139-1200@v0.5.23 (no JIT DeepGEMM)"}
+  - {framework: sglang, kernel_source: "sglang.hc_pre[torch,norm=separate]", backend: torch, source: "collector/sglang/collect_mhc_module.py; deepseek_v4.py:3480-3503@v0.5.23 (SM120 serving)"}
+  - {framework: sglang, kernel_source: "sglang.hc_pre[torch,prenorm_gemm=deepgemm,norm=separate]", backend: deepgemm, source: "collector/sglang/collect_mhc_module.py; deepseek_v4.py:3461-3479@v0.5.23 (>= 1024 tokens)"}
+  - {framework: sglang, kernel_source: "sglang.hc_post[tilelang]", backend: tilelang, source: "collector/sglang/collect_mhc_module.py (kernels/ops/layernorm/mhc.py mhc_post_tilelang)"}
+  - {framework: sglang, kernel_source: "sglang.hc_post[torch]", backend: torch, source: "collector/sglang/collect_mhc_module.py; models/deepseek_v4_mhc.py:600-608@v0.5.23"}
+  - {framework: sglang, kernel_source: "sglang.mhc_fused_post_pre[fused_post_gemm,norm=fused]", backend: tilelang, source: "collector/sglang/collect_mhc_module.py; mhc.py:1693-1731@v0.5.23 (fused post+GEMM TileLang kernel, <= 32 tokens)"}
+  - {framework: sglang, kernel_source: "sglang.mhc_fused_post_pre[post+prenorm_gemm=deepgemm,norm=fused]", backend: deepgemm, source: "collector/sglang/collect_mhc_module.py; mhc.py:1733-1755@v0.5.23 (TileLang post + DeepGEMM prenorm GEMM)"}
+  - {framework: sglang, kernel_source: "sglang.mhc_fused_post_pre[post+prenorm_gemm=tilelang,norm=fused]", backend: tilelang, source: "collector/sglang/collect_mhc_module.py; mhc.py:1733-1745,1756-1774@v0.5.23 (TileLang post + TileLang prenorm GEMM, SM120)"}
   - {framework: sglang, kernel_source: "sglang.kernels.ops.layernorm.mhc.hc_expand", backend: torch, source: "kernels/ops/layernorm/mhc.py:1762 x.repeat @v0.5.20"}
   - {framework: sglang, kernel_source: "sglang.kernels.ops.layernorm.mhc.hc_contract", backend: torch, source: "kernels/ops/layernorm/mhc.py:1766 mean @v0.5.20"}
 
@@ -226,13 +236,13 @@ mappings:
 
   # DeepSeek-V4 mHC module labels. The collector observes the actual
   # pre_mapping dispatch per row (AutoTuner tactic -> mhc_gemm_rms_fma_cuda /
-  # mhc_gemm_rms_dg_cuda, tensorrt_llm/_torch/modules/mhc/mhc_cuda.py:333-347),
+  # mhc_gemm_rms_dg_cuda, tensorrt_llm/_torch/modules/mhc/mhc_cuda.py:363-373@v1.4.0rc2),
   # so these labels name the real kernel family per row —
   # no trtllm_internal coarseness.
   - {framework: trtllm, kernel_source: trtllm_mhc_pre_fma, backend: trtllm_mhc, source: "collector/trtllm/collect_mhc_module.py (observed FMA tactic: mhc_gemm_sqrsum_fma + mhc_big_fuse CUDA kernels)"}
   - {framework: trtllm, kernel_source: trtllm_mhc_pre_dg_splitk, backend: deepgemm, source: "collector/trtllm/collect_mhc_module.py (observed dg_splitk tactic: deep_gemm tf32_hc_prenorm_gemm split-K + mhc_big_fuse)"}
   - {framework: trtllm, kernel_source: trtllm_mhc_pre_dg_nosplit, backend: deepgemm, source: "collector/trtllm/collect_mhc_module.py (observed dg_nosplit tactic: deep_gemm tf32_hc_prenorm_gemm + mhc_big_fuse)"}
-  - {framework: trtllm, kernel_source: trtllm_mhc_post_mapping, backend: trtllm_mhc, source: "collector/trtllm/collect_mhc_module.py (single kernel torch.ops.trtllm.mhc_post_mapping, mhc_cuda.py:472-510 @1.3.0rc20)"}
+  - {framework: trtllm, kernel_source: trtllm_mhc_post_mapping, backend: trtllm_mhc, source: "collector/trtllm/collect_mhc_module.py (single kernel torch.ops.trtllm.mhc_post_mapping, mhc_cuda.py:532-570@v1.4.0rc2)"}
 
   # DeepSeek-V4 attention module label: the attention backend class TRT-LLM's
   # own selector returns for sparse algorithm "deepseek_v4"
@@ -365,14 +375,14 @@ mappings:
   - {framework: vllm, kernel_source: fused_recurrent_gated_delta_rule_packed_decode, backend: fla_triton, source: "PR#1344 collect_gdn.py"}
   - {framework: vllm, kernel_source: "vllm.model_executor.kernels.mhc.tilelang.mhc_pre_tilelang", backend: tilelang, source: "PR#1344 collect_mhc_module.py"}
   - {framework: vllm, kernel_source: "vllm.model_executor.kernels.mhc.tilelang.mhc_post_tilelang", backend: tilelang, source: "PR#1344 collect_mhc_module.py"}
-  # GLM-5.3-Flash (Glm5Next) mHC labels at 0.31.0 (collector/vllm/collect_mhc_module.py
+  # GLM-5.3-Flash (Glm5Next) mHC labels at 0.32.0 (collector/vllm/collect_mhc_module.py
   # _glm5next_kernel_source; kernels/mhc/tilelang.py _hc_prenorm_gemm_outputs L22-71, fused split L814-983; tilelang_kernels.py split config L67-95 (<=32 tokens)).
   - {framework: vllm, kernel_source: "vllm.mhc_pre_tilelang[prenorm_gemm=deepgemm,norm=fused]", backend: deepgemm, source: "collector/vllm/collect_mhc_module.py (GLM)"}
   - {framework: vllm, kernel_source: "vllm.mhc_post_tilelang", backend: tilelang, source: "collector/vllm/collect_mhc_module.py (GLM)"}
   - {framework: vllm, kernel_source: "vllm.mhc_fused_post_pre_tilelang[fused_post_gemm,norm=fused]", backend: tilelang, source: "collector/vllm/collect_mhc_module.py (GLM; fused post+GEMM TileLang kernel, small token counts)"}
   - {framework: vllm, kernel_source: "vllm.mhc_fused_post_pre_tilelang[post+prenorm_gemm=deepgemm,norm=fused]", backend: deepgemm, source: "collector/vllm/collect_mhc_module.py (GLM; post + DeepGEMM prenorm GEMM, large token counts)"}
-  - {framework: vllm, kernel_source: "vllm.model_executor.layers.mhc.hc_expand", backend: torch, source: "vllm/model_executor/layers/mhc.py:969 @v0.31.0 (byte-identical to 0.30.0)"}
-  - {framework: vllm, kernel_source: "vllm.model_executor.layers.mhc.hc_contract", backend: torch, source: "vllm/model_executor/layers/mhc.py:974 @v0.31.0 (byte-identical to 0.30.0)"}
+  - {framework: vllm, kernel_source: "vllm.model_executor.layers.mhc.hc_expand", backend: torch, source: "vllm/model_executor/layers/mhc.py:1013 @v0.32.0"}
+  - {framework: vllm, kernel_source: "vllm.model_executor.layers.mhc.hc_contract", backend: torch, source: "vllm/model_executor/layers/mhc.py:1018 @v0.32.0"}
   - {framework: vllm, kernel_source: "vllm.utils.deep_gemm.fp8_fp4_paged_mqa_logits", backend: deepgemm, source: "PR#1344 collect_dsv4_attn.py"}
 
   # --- Kimi-K3 labels: KDA kernels from the vLLM kimi-k3 preview

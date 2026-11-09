@@ -339,14 +339,12 @@ REGISTRY: list[OpEntry] = [
         get_func="get_mhc_module_test_cases",
         run_func="run_mhc_module_worker",
         perf_filename=PerfFile.MHC_MODULE,
-        # L40S probe both directions crash in stock 0.5.14 —
-        # the server_args DeepseekV4 hook (server_args.py:3786-3810) turns
-        # SGLANG_OPT_DEEPGEMM_HC_PRENORM off only for SM120/HIP, so SM89
-        # keeps the default True (environ.py:781) and the pre/post paths
-        # call deep_gemm.tf32_hc_prenorm_gemm with deep_gemm never imported
-        # (ENABLE_JIT_DEEPGEMM=False on SM89) -> NameError at
-        # deep_gemm_wrapper/entrypoint.py:197. Serving crashes identically;
-        # park SM89 until a framework fix ships.
+        # SM89 was parked on a NameError (deep_gemm never imported, the prenorm
+        # GEMM called anyway). Since then mhc_pre and mhc_fused_post_pre gate
+        # DeepGEMM on ENABLE_JIT_DEEPGEMM (kernels/ops/layernorm/mhc.py:218-224,
+        # deep_gemm_wrapper/configurer.py:39, False below SM90), so SM89 runs the
+        # TileLang prenorm GEMM; whether those TileLang kernels build for sm_89
+        # is untested. Re-admit after a targeted L40S run.
         unverified_sms=(89,),
     ),
 ]

@@ -45,6 +45,7 @@ frameworks:
       mla_bmm: *sglang_0523_runtime
       sparse_attention: *sglang_0523_runtime
       msa: *sglang_0523_runtime
+      mhc: *sglang_0523_runtime
     # Model-scoped collector runtime pins: when the resolved run model_path
     # exactly equals one of these keys, the pin overrides BOTH the family
     # pins above and the framework default for every op in the run — the
@@ -118,25 +119,17 @@ frameworks:
       mla_bmm: *trtllm_140rc2_runtime
       sparse_attention: *trtllm_140rc2_runtime
       msa: *trtllm_140rc2_runtime
+      mhc: *trtllm_140rc2_runtime
   vllm:
     source_repo: "https://github.com/vllm-project/vllm.git"
     default:
       version: "0.30.0"
       images:
         default: "vllm/vllm-openai:v0.30.0@sha256:8a69ffad015f138d7170c4ddc429e230a3bc1c1719f67e14324749df200a4b90"
-    # mhc / attention moved to vLLM 0.31.0 (gemm, kda and moe since moved on to 0.32.0):
-    # GLM-5.3-Flash collects these families on 0.31.0, and each collector file
-    # targets exactly one release, so the families upgrade instead of carrying
-    # 0.30.0 and 0.31.0 side by side. A family pin moves the family for every
-    # model. The 0.30.0 tables stay under their version key; the 0.30.0
-    # collectors are `git log` away. Same stock image as the GLM-5.3-Flash
-    # model pin below (multi-arch index; amd64 a4a4c043..., arm64 3f7dd5b7...).
+    # A family pin moves the family for every model; each collector file targets
+    # exactly one release. The 0.30.0 and 0.31.0 tables stay under their version
+    # keys; their collectors are `git log` away.
     families:
-      mhc: &vllm_0310_runtime
-        version: "0.31.0"
-        source_commit: "db9527a46873454610df6dbedf79a36d6bf1a7f6"
-        images:
-          default: "vllm/vllm-openai:v0.31.0@sha256:c1c9f6fd5c109ba7f0546a59f5b2f15fb87f64c77782e90a27b648b42a8e67c3"
       # Op-by-op move to vLLM 0.32.0 (2026-11): a family moves here once its
       # gates align and its source check is done; the default follows the last one.
       kda: &vllm_0320_runtime
@@ -154,6 +147,7 @@ frameworks:
       mla_bmm: *vllm_0320_runtime
       sparse_attention: *vllm_0320_runtime
       msa: *vllm_0320_runtime
+      mhc: *vllm_0320_runtime
     # kda family pin RETIRED: the family ran on the
     # kimi-k3 preview image (0.1.dev19262) while the consumer's fused-decode
     # pricing did not match 0.27's packed-decode serving path.
@@ -209,25 +203,12 @@ frameworks:
     # their declared runtime.
     models:
       # GLM-5.3-Flash (Glm5NextForConditionalGeneration) standalone per-op
-      # collection runs on the stock official v0.31.0 release (no overlay),
-      # tag commit db9527a46873454610df6dbedf79a36d6bf1a7f6. v0.31.0 moves
-      # the GLM layers from vllm/models/glm5next/nvidia/ to
-      # vllm/models/glm5next/common/ and the KPool indexer from
-      # model_executor/layers/sparse_attn_indexer_kpool.py to
-      # models/glm5next/nvidia/sparse_indexer.py; it also carries the KPool
-      # tail slot-mapping fix (v1/kv_cache_interface.py:1036-1038). Docker Hub reported the
-      # multi-arch index digest below for v0.31.0; its
-      # linux/arm64 child (also tag v0.31.0-aarch64; the GB300 platform
-      # image, imported for collection as 3f7dd5b7...2b971.sqsh) is
-      # sha256:3f7dd5b777d34d1724456ce71f87385dca288c3bb23029ab27dee358f5d2b971
-      # and the linux/amd64 child is
-      # sha256:a4a4c0437bf7240089da5f08aa370c4aee17ae5290f7a3b468825ee26c4c3a6b.
-      "zai-org/GLM-5.3-Flash": &glm53flash_vllm_runtime
-        version: "0.31.0"
-        source_commit: "db9527a46873454610df6dbedf79a36d6bf1a7f6"
-        images:
-          default: "vllm/vllm-openai:v0.31.0@sha256:c1c9f6fd5c109ba7f0546a59f5b2f15fb87f64c77782e90a27b648b42a8e67c3"
-      "nvidia/GLM-5.3-Flash-NVFP4": *glm53flash_vllm_runtime
+      # collection runs on the stock release every GLM op is collected with
+      # (pin consolidation: the 0.31.0 model pin moved with its families).
+      # vLLM 0.32.0 serves it from vllm/models/glm5next/common/ with the
+      # transformers Glm5NextConfig; the 0.31.0 tables stay under their key.
+      "zai-org/GLM-5.3-Flash": *vllm_0320_runtime
+      "nvidia/GLM-5.3-Flash-NVFP4": *vllm_0320_runtime
   vllm_xpu:
     base_framework: vllm
     data_backend: vllm

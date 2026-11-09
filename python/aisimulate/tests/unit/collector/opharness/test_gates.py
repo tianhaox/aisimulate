@@ -72,7 +72,6 @@ def test_a_gate_runs_at_the_release_its_op_is_collected_with(gates):
     shares its gate's release."""
     plans = gates.shard_plans("sm90", "vllm")
     gemm_release = gates.op_version("vllm", "gemm")
-    assert gemm_release != gates.op_version("vllm", "mhc_module")  # true while the families differ
     assert set(plans) == {("vllm", gates.gate_version(g)) for g in gates.gates_in_scope("vllm", "sm90")}
     gemm = {s["name"] for s in plans[("vllm", gemm_release)]["shards"]}
     assert "gemm_fp8block_DeepSeek-V3.2" in gemm

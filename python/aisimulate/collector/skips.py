@@ -386,14 +386,20 @@ SKIPS: list[dict] = [
     {"backend": "trtllm", "model": "MiMoV2FlashForCausalLM"},
     # TRT-LLM cannot serve Muse Glimmer: it registers no model class for it.
     {"backend": "trtllm", "model": "MuseGlimmerForConditionalGeneration"},
-    # TRT-LLM cannot serve GLM-5.3-Flash on the release mhc_module and kda are
-    # pinned to: it registers no model class for it, and the mHC collector drives
-    # only DeepSeek-V4's module API. The release gemm and moe are pinned to
+    # TRT-LLM cannot serve GLM-5.3-Flash on the release kda is pinned to: it
+    # registers no model class for it. The release gemm and moe are pinned to
     # registers it (_torch/models/modeling_glm5_next.py:400,
     # modeling_glm5_next_vision.py:995) and the MoE collector builds its layer
-    # (Glm5NextMoE), so neither is listed; drop an op from the list when its pin
-    # moves to a release with the class.
-    {"backend": "trtllm", "op": ["mhc_module", "kda"], "model": "Glm5NextForConditionalGeneration"},
+    # (Glm5NextMoE), so neither is listed; drop kda when its pin moves to a
+    # release with the class.
+    {"backend": "trtllm", "op": "kda", "model": "Glm5NextForConditionalGeneration"},
+    # TRT-LLM's mHC collector drives only DeepSeek-V4's sites and its rows carry
+    # no architecture: GLM-5.3-Flash pre/post cases would be timed as DeepSeek-V4
+    # rows, and fused_post_pre / expand / contract fail as a block. Serving runs
+    # them through the same mHC module (modeling_glm5_next.py
+    # Glm5NextModel._forward_single_phase_fused_hc, glm5_next_expand_streams,
+    # glm5_next_hyper_head).
+    {"backend": "trtllm", "op": "mhc_module", "model": "Glm5NextForConditionalGeneration"},
     # TRT-LLM registers no Step3p7FlashForCausalLM (the Step3p7 text model
     # registers as "Step3p5ForCausalLM", _torch/models/modeling_step3p7.py:1557),
     # so serving cannot load it; the MoE collector refuses the architecture.

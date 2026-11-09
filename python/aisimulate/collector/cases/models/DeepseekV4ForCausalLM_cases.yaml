@@ -375,13 +375,11 @@ framework_specific_op_cases:
     mhc_module:
       cases: all
   trtllm:
-    # TRT-LLM 1.3.0rc20 ships the mHC module + torch.ops.trtllm.mhc_* kernels
-    # (tensorrt_llm/_torch/modules/mhc/) but no DeepseekV4 model class yet, so
-    # there is no full-module layer to benchmark; the SDK DeepSeekV4 model
-    # queries mhc pre/post rows on every backend
-    # (aic-core .../sdk/models/deepseek_v4.py DeepSeekV4MHCModule), which is
-    # exactly what collector/trtllm/collect_mhc_module.py produces — schedule
-    # it.
+    # The SDK DeepSeekV4 model queries mhc pre/post rows on every backend
+    # (src/aisimulate_core/sdk/models/deepseek_v4.py DeepSeekV4MHCModule);
+    # collector/trtllm/collect_mhc_module.py times them on sites built by
+    # serving's DeepseekV4DecoderLayer._make_mhc (its docstring holds the
+    # fused_hc deviation note) — schedule it.
     mhc_module:
       cases: all
     # The four DSV4 attention module tables the SDK queries on every backend.

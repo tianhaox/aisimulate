@@ -1969,6 +1969,16 @@ _DSV4_ARCHITECTURE = "DeepseekV4ForCausalLM"
 # The mHC call sites each architecture's serving forward runs. GLM-5.3-Flash also
 # fuses the previous sublayer's post into the next pre and expands/contracts the
 # residual stream once per forward (collector/vllm/collect_mhc_module.py).
+#
+# DeepSeek-V4 is collected as separate pre (no fused norm) and post on purpose,
+# although serving fuses post + next pre (+ norm) at every layer boundary but the
+# first and last, on all three frameworks. Measured on H20 (hc_mult 4, hidden 4096,
+# 1k/8k tokens, 2026-07): fused post+pre+norm is within 1-2% of pre + post, and the
+# fused norm adds 2-3% to pre; the SDK's DeepSeekV4 model prices pre + attn_norm +
+# post per layer. Collecting fused_post_pre for DeepSeek-V4 is a producer + consumer
+# contract change (SDK pricing, aiconfigurator#1580), not a pin-bump item: a pin
+# bump keeps these two sites and only notes framework-specific gaps at the
+# collectors. Reopen it with an end-to-end measurement that shows the gap.
 _MHC_SITES = {
     _DSV4_ARCHITECTURE: ("pre", "post"),
     "Glm5NextForConditionalGeneration": ("pre", "post", "fused_post_pre", "expand", "contract"),
