@@ -1523,8 +1523,7 @@ def _run_prefill(
 
             resolve_forward_inputs(batch, _dsa_forward_input_relay(model_runner, batch))
         # sglang 0.5.16 made return_hidden_states_before_norm a required
-        # keyword (ForwardBatch.init_new); older pins do not accept it —
-        # same dispatch collect_msa_module.py:1015 uses.
+        # keyword (ForwardBatch.init_new); older pins do not accept it.
         import inspect as _inspect
 
         _fb_kw = (

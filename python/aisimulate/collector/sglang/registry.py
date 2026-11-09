@@ -283,22 +283,18 @@ REGISTRY: list[OpEntry] = [
         perf_filename=PerfFile.GLM5_DSA_ATTN_MODULE,
         unverified_sms=(120,),
     ),
-    # MiniMax-M3 MSA sparse-attention modules — need models/minimax_m3.py,
-    # first shipped in the official v0.5.16 release (the module declares
-    # __compat__ = "sglang>=0.5.16"; the 0.5.14-era framework_manifest carried
-    # an msa family pin to v0.5.16, retired when the default moved to 0.5.21).
-    # Hardware-validated per SM:
-    # SM90 (h100/h200 — SGLang's own M3 server-args override selects
-    # fa3 + page 128 and the Triton sparse path,
-    # arg_groups/overrides.py:521-537), SM100/103
-    # (b200/b300/gb200/gb300 — same Triton sparse path on the official
-    # image; the fmha_sm100 upgrade is wheel-gated and kernel_source
-    # records what actually ran). SM89/SM120/SM121: v0.5.16's M3
-    # server-args handler has no CC-8.9/12 branch, the flashinfer+page-1
-    # default crashes at backend init, and serving cannot initialize —
-    # cases fail classified and no tables ship for those SMs (an earlier
-    # escape-hatch collection was withdrawn, review 4969690316); SM121
-    # additionally stays marked, mirroring the trtllm msa entries.
+    # MiniMax-M3 MSA sparse-attention modules (models/minimax_m3.py). SGLang's
+    # M3 server-args override resolves per SM
+    # (arg_groups/model_overrides/minimax_m3.py:147-192 @v0.5.23): SM90
+    # (h100/h200) fa3 + page 128, Triton sparse path; SM100/103
+    # (b200/b300/gb200/gb300) fa4 + page 128 for a BF16 KV cache, trtllm_mha +
+    # page 128 with fp8 attention GEMMs for fp8_e4m3; the fmha_sm100 main step
+    # runs only when the image ships it, and kernel_source records what ran.
+    # SM89/SM120/SM121 take the generic flashinfer + page-1 default. Through
+    # v0.5.16 it crashed at backend init and the escape-hatch tables were
+    # withdrawn (review 4969690316); the crash is fixed since v0.5.17
+    # (MiniMaxSparseKVPool.get_kv_cache_quant_method), not GPU-verified at
+    # this pin. SM121 stays marked, mirroring the trtllm msa entries.
     OpEntry(
         op="msa_context_module",
         module="collector.sglang.collect_msa_module",

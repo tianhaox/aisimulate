@@ -267,8 +267,10 @@ SKIPS: list[dict] = [
         "sm": [80, 86, 89, 90],
         "model_path": ["nvidia/GLM-5.2-NVFP4", "nvidia/GLM-5-NVFP4"],
     },
-    # TRT-LLM's MiniMax-M3 sparse attention takes a BF16 KV cache only
-    # (run_msa_module), so every FP8-KV case would fail.
+    # The TRT-LLM MSA collector builds a BF16 KV cache only (run_msa_module), so
+    # every FP8-KV case would fail. TRT-LLM serves FP8 and NVFP4 KV on the MSA
+    # backend on SM100/103 (modeling_minimaxm3.py main_kv_is_fp8/main_kv_is_nvfp4),
+    # so this is a collector gap.
     {"backend": "trtllm", "op": _MSA_MODULE_OPS, "kv_cache_dtype": "fp8"},
     # TRT-LLM runs MSA off SM100/103 on its Triton reference (triton_backend.py),
     # a masked dense FP32 attention whose cost grows with isl x (isl + prefix): an

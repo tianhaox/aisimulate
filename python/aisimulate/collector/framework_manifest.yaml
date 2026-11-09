@@ -44,6 +44,7 @@ frameworks:
       mla: *sglang_0523_runtime
       mla_bmm: *sglang_0523_runtime
       sparse_attention: *sglang_0523_runtime
+      msa: *sglang_0523_runtime
     # Model-scoped collector runtime pins: when the resolved run model_path
     # exactly equals one of these keys, the pin overrides BOTH the family
     # pins above and the framework default for every op in the run — the
@@ -116,6 +117,7 @@ frameworks:
       mla: *trtllm_140rc2_runtime
       mla_bmm: *trtllm_140rc2_runtime
       sparse_attention: *trtllm_140rc2_runtime
+      msa: *trtllm_140rc2_runtime
   vllm:
     source_repo: "https://github.com/vllm-project/vllm.git"
     default:
@@ -151,6 +153,7 @@ frameworks:
       mla: *vllm_0320_runtime
       mla_bmm: *vllm_0320_runtime
       sparse_attention: *vllm_0320_runtime
+      msa: *vllm_0320_runtime
     # kda family pin RETIRED: the family ran on the
     # kimi-k3 preview image (0.1.dev19262) while the consumer's fused-decode
     # pricing did not match 0.27's packed-decode serving path.
