@@ -31,6 +31,9 @@ families:
         - sms: [sm90]
           args: [--generator-set, params.agg.kv_cache_dtype=fp8_ds_mla]
           fact: 'Hopper requires kv_cache_config.dtype=fp8_ds_mla (A/B 2026-10-01: auto fails, fp8_ds_mla loads); off Hopper rc2 takes fp8_ds_mla only with tokens_per_block=256, and serving and the collector keep the default KV with 128 there.'
+        - sms: [sm100, sm103]
+          args: [--generator-set, params.agg.kv_cache_dtype=fp8]
+          fact: 'Blackwell serving runs FP8 KV as the DeepSeek-V4 example recommends (examples/models/core/deepseek_v4/README.md, kv_cache_config.dtype: fp8); the collector DSV4 rows are FP8 KV on every SM.'
     - repo: deepseek-ai/DeepSeek-V4-Flash-0731
       profile: fp8
       aic_registered: deepseek-ai--DeepSeek-V4-Flash
@@ -41,6 +44,9 @@ families:
         - sms: [sm90]
           args: [--generator-set, params.agg.kv_cache_dtype=fp8_ds_mla]
           fact: 'Hopper requires kv_cache_config.dtype=fp8_ds_mla (A/B 2026-10-01: auto fails, fp8_ds_mla loads); off Hopper rc2 takes fp8_ds_mla only with tokens_per_block=256, and serving and the collector keep the default KV with 128 there.'
+        - sms: [sm100, sm103]
+          args: [--generator-set, params.agg.kv_cache_dtype=fp8]
+          fact: 'Blackwell serving runs FP8 KV as the DeepSeek-V4 example recommends (examples/models/core/deepseek_v4/README.md, kv_cache_config.dtype: fp8); the collector DSV4 rows are FP8 KV on every SM.'
     - repo: nvidia/DeepSeek-V4-Pro-NVFP4
       profile: nvfp4
       aic_registered: false
@@ -58,6 +64,9 @@ families:
         - sms: [sm90]
           args: [--generator-set, params.agg.kv_cache_dtype=fp8_ds_mla]
           fact: 'Hopper requires kv_cache_config.dtype=fp8_ds_mla (A/B 2026-10-01: auto fails, fp8_ds_mla loads); off Hopper rc2 takes fp8_ds_mla only with tokens_per_block=256, and serving and the collector keep the default KV with 128 there.'
+        - sms: [sm100, sm103]
+          args: [--generator-set, params.agg.kv_cache_dtype=fp8]
+          fact: 'Blackwell serving runs FP8 KV as the DeepSeek-V4 example recommends (examples/models/core/deepseek_v4/README.md, kv_cache_config.dtype: fp8); the collector DSV4 rows are FP8 KV on every SM.'
     - repo: nvidia/DeepSeek-V4-Flash-NVFP4
       profile: nvfp4
       aic_registered: false
@@ -71,6 +80,9 @@ families:
         - sms: [sm90]
           args: [--generator-set, params.agg.kv_cache_dtype=fp8_ds_mla]
           fact: 'Hopper requires kv_cache_config.dtype=fp8_ds_mla (A/B 2026-10-01: auto fails, fp8_ds_mla loads); off Hopper rc2 takes fp8_ds_mla only with tokens_per_block=256, and serving and the collector keep the default KV with 128 there.'
+        - sms: [sm100, sm103]
+          args: [--generator-set, params.agg.kv_cache_dtype=fp8]
+          fact: 'Blackwell serving runs FP8 KV as the DeepSeek-V4 example recommends (examples/models/core/deepseek_v4/README.md, kv_cache_config.dtype: fp8); the collector DSV4 rows are FP8 KV on every SM.'
     dummy_variants:
     - csa
     - hca
@@ -397,6 +409,9 @@ families:
           - sms: [sm90]
             args: [--generator-set, params.agg.kv_cache_dtype=fp8_ds_mla]
             fact: 'Hopper requires kv_cache_config.dtype=fp8_ds_mla (A/B 2026-10-01: auto fails, fp8_ds_mla loads); off Hopper rc2 takes fp8_ds_mla only with tokens_per_block=256, and serving and the collector keep the default KV with 128 there.'
+          - sms: [sm100, sm103]
+            args: [--generator-set, params.agg.kv_cache_dtype=fp8]
+            fact: 'Blackwell serving runs FP8 KV as the DeepSeek-V4 example recommends (examples/models/core/deepseek_v4/README.md, kv_cache_config.dtype: fp8); the collector DSV4 rows are FP8 KV on every SM.'
       deepseek-ai/DeepSeek-V4-Pro:
         dummy_overrides:
           family: dsv4

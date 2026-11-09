@@ -287,7 +287,7 @@ rules:
   - {backend: trtllm_internal, role: attention,
      match: "^tensorrt_llm::(_v1::)?kernels::compressor::"}
   - {backend: trtllm_internal, role: norm_rope,
-     match: "^tensorrt_llm::(_v1::)?kernels::(deepseekV4QNormKernel|mlaRoPEInplaceKernel)$"}
+     match: "^tensorrt_llm::(_v1::)?kernels::(deepseekV4QNorm(Fused)?Kernel|mlaRoPEInplaceKernel|inverseRopeFp8QuantKernel(Pipelined)?)$"}
   - {backend: trtllm_internal, role: kvcache,
      match: "^_quant_scatter_kernel$"}
   - {backend: trtllm_internal, role: dsa_indexer,
@@ -309,3 +309,9 @@ rules:
      match: "^gemv2[NT]_kernel"}
   - {backend: trtllm_internal, role: dsa_indexer, sms: [sm100, sm103],
      match: "^kernel_cutlass_kernel_tensorrt_llm_torchattentionkernelsblackwellpaged_mqa_logit"}
+  # TRT-LLM rc2 DeepSeek-V4 on Blackwell: the fused KV norm + RoPE + quant cache write, and the
+  # CuTe DSL blockwise FP8 GEMM
+  - {backend: trtllm_internal, role: kvcache,
+     match: "^tensorrt_llm::(_v1::)?kernels::mlaKvNormRopeQuant(Context|Generation)Kernel$"}
+  - {backend: cutlass, role: gemm, sms: [sm100, sm103],
+     match: "^kernel_cutlass_kernel_tensorrt_llm_torchkernelsblackwellblockwise_gemm"}
