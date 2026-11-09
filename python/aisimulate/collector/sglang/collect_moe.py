@@ -848,15 +848,23 @@ def run_moe_torch(
         moe_backend == "triton"
         and is_gated
         and activation in ("gelu", "silu")
+        and gemm1_alpha is None
+        and gemm1_clamp_limit is None
         and local_inter_size % activation_vector_size != 0
     ):
         # The Triton runner's gated activation is the JIT act_and_mul kernel
         # (srt/layers/moe/moe_runner/triton_utils/fused_moe.py:61-66), which checks
         # hidden_size % kVecSize == 0 (kernels/jit/csrc/elementwise/activation.cuh:219),
         # kVecSize = kMaxVecBytes / sizeof(bf16) with kMaxVecBytes 32 on Blackwell
-        # and 16 below (kernels/jit/include/sgl_kernel/utils.cuh:140). Serving pads
-        # the intermediate width only for flashinfer_trtllm
-        # (srt/layers/moe/fused_moe_triton/layer.py:513-524).
+        # and 16 below (kernels/jit/include/sgl_kernel/utils.cuh:140). A SwiGLU with
+        # gemm1_alpha or gemm1_clamp_limit (GPT-OSS) never reaches it: the runner runs
+        # the torch.compile'd swiglu_gpt_oss_sigmoid_alpha /
+        # swiglu_no_interleaved_with_alpha_and_limit / _swiglu_silu_clamp_mul
+        # (fused_moe.py:410-434, 741-760); gelu asserts both are None (:837-838).
+        # local_inter_size is the unpadded width: serving pads it for
+        # flashinfer_trtllm (srt/layers/moe/fused_moe_triton/layer.py:513-524), and
+        # Mxfp4MoEMethod pads its buffers to 64 on the Triton paths
+        # (srt/layers/quantization/mxfp4.py:548-551).
         raise ValueError(
             "FIXME(kernel-limit): SGLang Triton gated BF16 GELU/SiLU (JIT act_and_mul, "
             f"activation.cuh:219) requires local_inter_size to be divisible by {activation_vector_size}, "

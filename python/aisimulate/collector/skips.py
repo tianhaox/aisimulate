@@ -145,10 +145,44 @@ SKIPS: list[dict] = [
     # building the layer rejects every case.
     {"backend": "trtllm", "op": "moe", "dtype": "fp8_block", "sm": [89]},
     {"backend": "trtllm", "op": "moe", "dtype": "w4a16_mxfp4", "sm": [89, 120]},
+    # TRT-LLM cannot serve Llama 4 fp8_block MoE on SM100/103: AUTO resolves
+    # FP8_BLOCK_SCALES to TRTLLM there (ModelConfig.resolve_moe_backend,
+    # _torch/model_config.py), resolution picks TrtllmTrtllmGenFp8BlockScalesImpl
+    # (MoEProblem carries no apply_router_weight_on_input), and create_moe_backend
+    # rejects Llama4MoE's apply_router_weight_on_input=True (moe/fused_moe/create_moe.py;
+    # TRTLLM_GEN_CAPABILITIES, trtllm_gen/identity.py). CUTLASS has no SM100 fp8_block
+    # leaf; only an explicit DEEPGEMM backend serves it. Every case fails at construction.
+    {
+        "backend": "trtllm",
+        "op": "moe",
+        "sm": [100, 103],
+        "dtype": "fp8_block",
+        "model_name": ["meta-llama/Llama-4-Scout-17B-16E-Instruct", "meta-llama/Llama-4-Maverick-17B-128E-Instruct"],
+    },
     # vLLM never splits routed experts by TP and EP together: with EP on it
     # turns the whole TP x DP world into EP, so a case with tp > 1 and ep > 1
     # would time that EP layout under the wrong key.
     {"backend": "vllm", "op": "moe", "parallel": "tp_ep", "sm": [80, 86, 89, 90, 100, 103, 120]},
+    # vLLM serves Llama 4 MoE on SM100/103 on FlashInfer TRT-LLM monolithic kernels
+    # that route from logits (oracle/unquantized.py _get_priority_backends;
+    # experts/trtllm_bf16_moe.py TrtLlmBf16ExpertsMonolithic and trtllm_nvfp4_moe.py
+    # TrtLlmNvFp4ExpertsMonolithic, RoutingMethodType.Llama4). Below 4 tokens FlashInfer
+    # routes Llama 4 in routingIndicesWarpKernel (trtllm_fused_moe_routing_llama4.cu),
+    # which with EP > 1 reserves GEMM tiles for non-local experts but writes
+    # permuted_idx_to_token_idx for local experts only, so FC1 gathers stale token ids.
+    # The illegal memory access at 1 or 2 tokens poisons the CUDA context and ends the
+    # case: almost every EP > 1 Llama 4 case of these dtypes kept only its 1-token row.
+    # Serving runs the same kernel at 1-3 tokens. TP-only cases have no non-local
+    # experts and fp8_block routes in vLLM (top-k ids), so neither is affected. Delete
+    # when the pinned FlashInfer's warp kernel initializes the non-local tiles' rows.
+    {
+        "backend": "vllm",
+        "op": "moe",
+        "sm": [100, 103],
+        "dtype": ["bfloat16", "nvfp4"],
+        "parallel": "ep",
+        "model_name": ["meta-llama/Llama-4-Scout-17B-16E-Instruct", "meta-llama/Llama-4-Maverick-17B-128E-Instruct"],
+    },
     # vLLM serves MXFP4 MoE on SM120 without MXFP8 activations (that backend
     # runs only on explicit request), so these cases would time a path serving
     # does not take.
