@@ -204,7 +204,7 @@ def test_a_gate_campaign_probes_what_each_gate_reads(pd, monkeypatch, capsys):
         gate("floor", "gemm", "org/m", "fp8", no_serving={"sm100": "cannot serve"}),
         gate("lost", "gemm", "org/x", "auto"),
     ]
-    monkeypatch.setattr(gates, "gates_in_scope", lambda fw, sm, op=None: rows)
+    monkeypatch.setattr(gates, "gates_in_scope", lambda fw, sm, op=None, derive=False: rows)
     monkeypatch.setattr(gates, "gate_version", lambda g: "0.31.0" if g["op"] == "gemm" else "0.30.0")
 
     def roster(targets, system, full, backends, only, isl, version):

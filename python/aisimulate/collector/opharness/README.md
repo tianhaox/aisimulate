@@ -27,16 +27,18 @@ used directly, not wrapped.
 | `components/probes/` | in-container probes: in-process for tp1, the real server (`probe_*_server.py`) for tp>1 |
 | `components/dummies.py`, `fetch_inputs.py` | depth-cut, width-true dummy checkpoints from fetched configs |
 | `components/kernel_taxonomy.yaml` | kernel name -> backend label and role, one file for every SM (`sms:` scopes a rule) |
-| `components/gates.yaml` + `gates.py` | the path gates: each names one planned collector case; `gates.py plan` writes the `probe.trace_case` shards the collection pipeline runs, `gates.py grade` grades their kernels against the serving record. `ungated` gives the reason an op has no gate |
+| `components/gates.yaml` + `gates.py` | the path gates: each names one planned collector case; `gates.py plan` writes the `probe.trace_case` shards the collection pipeline runs, `gates.py grade` grades their kernels against the serving record. `ungated` gives the reason an op has no gate; `gates.py paths` reads from the op plans which paths the gates name |
 | `components/path_diff.py` | a collector case's kernels vs the serving record, through the same taxonomy |
 | `components/run_diff.py` | a run's tables against the previous release (`tables`) and its failed tasks per shard (`failures`) |
 | `workflows/` | `upgrade_op`, `onboard_model`, `new_op_collector`: the step tables |
 
 ## Driving a workflow
 
-A workflow is its step table; two commands say whether a step is done:
+A workflow is its step table; one command says what the gates cover and two say
+whether a step is done:
 
 ```
+python3 components/gates.py paths --sm sm100 --op <op>                               # no GPU: each planned path and its gate
 python3 components/gates.py grade --sm sm100 --op <op> --results <job result dirs>   # exit 0: every gate in scope aligned
 python3 components/run_diff.py tables <packaged tables> --base <shipped data>        # leads to explain before integrating
 ```
@@ -83,6 +85,16 @@ pipeline (the `aisim-campaign` skill). Nothing generated is committed.
   It writes the verdicts to `results/pathdiff/<sm>/<backend>-<version>/`. A gate exists on
   an SM where its case is planned; `no_serving` marks an SM where the model cannot be
   served, which gets a `platform-floor` verdict.
+- **Paths.** `gates.py paths --sm <sm> [--fw <fw>] [--op <op>]` lists what the plans
+  collect on that SM as paths: the cases of one op that share a phase, the op plan's dtype
+  fields and its `dispatch`, which is what selects the kernels. Each path shows the gates
+  naming a case on it, the `ungated` reason, the gate that can be derived for it, or `NO
+  GATE`. A source-check finding names a path; if no gate is on it, the gates say nothing
+  about that change. `--derive` (on `plan`, `grade` and `probe_driver.py --gates`) adds a
+  gate for each unnamed path whose cases name a roster checkpoint: the case nearest the
+  probe point (one request of the probe's prompt length, one GPU), graded against that
+  checkpoint at the case's KV dtype. A path whose cases name no model (gemm, attention)
+  needs a row in `gates.yaml`.
 - **Run diff.** `run_diff.py tables <new root> --base <shipped data> [--system S]
   [--backend B] [--family F] [--detail]` reads the packaged layout
   (`<system>/<family>/<backend>/<version>/<table>.parquet`) on both sides and compares

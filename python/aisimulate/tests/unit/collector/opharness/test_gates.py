@@ -222,3 +222,41 @@ def test_a_missing_trace_removes_the_verdict_of_an_earlier_run(gates, tmp_path, 
     monkeypatch.setattr(gates, "gates_in_scope", lambda *a, **k: [gate])
     assert gates.grade("sm100", [tmp_path / "no_results"]) == {("vllm", gate["gate"]): "missing-trace"}
     assert not stale.exists()
+
+
+def test_paths_are_read_from_the_op_plan(gates):
+    """A path is the cases of one op that share a phase, the plan's dtype fields and its
+    dispatch; a gate covers the path its case is on, and nothing else."""
+    rows = gates.paths("sm100", "sglang", "moe,kda")
+    moe = {(r["dtypes"], r["dispatch"]): r for r in rows if r["op"] == "moe"}
+    assert len({dispatch for _dtypes, dispatch in moe}) > 1  # SGLang's MoE plan picks the runner
+    assert all(r["cases"] > 0 for r in rows)
+    gated = [r for r in moe.values() if r["gates"]]
+    assert gated and all("derived" not in r for r in gated)
+    kda = {r["phase"]: r for r in rows if r["op"] == "kda"}
+    assert kda["verify"]["ungated"] and "derived" not in kda["verify"]
+    assert kda["context"]["gates"] and kda["generation"]["gates"]
+
+
+def test_a_derived_gate_names_one_planned_case_of_its_path(gates):
+    """A path no row names gets a gate when its cases name a roster checkpoint: one planned
+    case, on that path, whose filter fits the pipeline; rows are in scope only on request."""
+    from collector.op_plans import OP_PLANS
+
+    rows = gates.paths("sm100", "vllm")
+    derived = [r for r in rows if r.get("derived")]
+    assert derived
+    names = [r["derived"]["gate"] for r in derived]
+    assert len(set(names)) == len(names) and not set(names) & {g["gate"] for g in gates.load()["gates"]}
+    for r in derived:
+        g = r["derived"]
+        (i,) = gates._matching("vllm", g["op"], 100, g["select"])
+        case = gates._planned("vllm", g["op"], 100).cases[i]
+        assert (getattr(case, "phase", None), OP_PLANS[g["op"]].dtypes(case)) == (r["phase"], r["dtypes"])
+        assert g["repo"] in (getattr(case, "model_path", None), getattr(case, "model_name", None))
+        gates.case_filter("vllm", g["op"], g["select"])
+    # a case that names no model has no derived gate: its path needs a row or a reason
+    assert not any(r.get("derived") for r in rows if r["op"] in ("gemm", "attention_context"))
+    in_scope = {g["gate"] for g in gates.gates_in_scope("vllm", "sm100")}
+    with_derived = {g["gate"] for g in gates.gates_in_scope("vllm", "sm100", derive=True)}
+    assert not in_scope & set(names) and with_derived == in_scope | set(names)

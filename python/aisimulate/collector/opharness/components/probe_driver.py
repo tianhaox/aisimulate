@@ -452,10 +452,13 @@ def kv_class(kv) -> str:
     return "fp8" if (kv or "").startswith("fp8") else "unquant"
 
 
-def gate_runs(targets: dict, system: str, backends: list[str], op: str | None = None) -> list[dict]:
+def gate_runs(
+    targets: dict, system: str, backends: list[str], op: str | None = None, derive: bool = False
+) -> list[dict]:
     """The serving runs the path gates in scope read on this system's SM: per gate, its repo
     at its kv class, prompt length (``isl``) and release (gates.gate_version). A gate with no
-    roster run is reported; a ``no_serving`` floor needs none."""
+    roster run is reported; a ``no_serving`` floor needs none. ``derive`` adds the gates
+    derived for the paths no row names (gates.paths)."""
     import copy
 
     sys.path.insert(0, str(_HERE))
@@ -463,7 +466,7 @@ def gate_runs(targets: dict, system: str, backends: list[str], op: str | None = 
 
     sm = system_sm(system)
     need: dict[tuple[str, str, int], dict[tuple[str, str], list[str]]] = {}
-    for g in gates.gates_in_scope(",".join(backends), sm, op=op):
+    for g in gates.gates_in_scope(",".join(backends), sm, op=op, derive=derive):
         if sm in (g.get("no_serving") or {}):
             continue
         key = (g["backend"], gates.gate_version(g), int(g.get("isl", DEFAULT_ISL)))
@@ -1106,6 +1109,7 @@ def main() -> None:
     ap.add_argument("--version", default=None, help="the release probed (default: the framework default)")
     ap.add_argument("--gates", action="store_true", help="the runs the gates in scope read")
     ap.add_argument("--op", default=None, help="with --gates: only the gates of this collector op")
+    ap.add_argument("--derive", action="store_true", help="with --gates: also the gates derived for unnamed paths")
     ap.add_argument("--plan", action="store_true", help="print the runs")
     ap.add_argument("--emit-shards", action="store_true", help="render, bundle and upload; write shard plans")
     ap.add_argument("--url-base", default=None, help="WebDAV directory the probe.serving shards fetch from")
@@ -1129,7 +1133,7 @@ def main() -> None:
         ap.error("--plan and --emit-shards need --system")
     backends = (args.backends or ("sglang,vllm,trtllm" if args.gates else "sglang")).split(",")
     if args.gates:
-        runs = gate_runs(targets, args.system, backends, args.op)
+        runs = gate_runs(targets, args.system, backends, args.op, args.derive)
     else:
         pats = [p.strip() for p in (args.only or "").split(",") if p.strip()]
         # --only scopes the roster derivation too: a single checkpoint needs only its own fetched config

@@ -23,6 +23,17 @@ one op across the frameworks), ``--repo`` or ``--family``.
          platform-floor verdict. The exit code is 0 when every gate in scope is aligned
          or a platform floor.
 
+  paths  --sm <sm> [scope]
+         What the gates prove, read from the op plans: every path a plan collects on that SM
+         (the cases of one op that share a phase, the plan's dtype fields and its dispatch)
+         with the gates naming a case on it, the ``ungated`` reason, the gate that can be
+         derived for it, or NO GATE. No GPU.
+
+``--derive`` (plan, grade; probe_driver --gates) adds a gate for each path no row names
+whose cases name a roster checkpoint: the case nearest the probe point, graded against
+that checkpoint at the case's KV dtype. A path with neither needs a row (a case that
+names no model: gemm, attention) or a reason.
+
 gates.yaml is the one home of the gates and of the reason an op has none (``ungated``);
 ``uncovered`` lists the registry ops with neither, and a unit test keeps that list empty.
 """
@@ -54,15 +65,27 @@ def load(table: Path = TABLE) -> dict:
     return yaml.safe_load(table.read_text())
 
 
-def _matches(backend: str, op: str, sm: int, select: dict) -> bool:
-    """Exactly one planned case of (backend, op) on this SM matches ``select`` (CPU only)."""
+@functools.cache
+def _planned(backend: str, op: str, sm: int | None):
+    """The op plan of (backend, op) on an SM (CPU only)."""
     sys.path.insert(0, str(COLLECTOR.parent))
     from collector.op_plans import plan
-    from collector.probes.trace_case import _matches as case_matches
 
     with open(os.devnull, "w") as quiet, contextlib.redirect_stdout(quiet):  # planning prints model notes
-        cases = plan(op, backend, sm).cases
-    return sum(1 for case in cases if case_matches(case, select)) == 1
+        return plan(op, backend, sm)
+
+
+def _matching(backend: str, op: str, sm: int, select: dict) -> list[int]:
+    """The plan indices of the cases of (backend, op) on this SM that ``select`` matches."""
+    sys.path.insert(0, str(COLLECTOR.parent))
+    from collector.probes.trace_case import _matches as case_matches
+
+    return [i for i, case in enumerate(_planned(backend, op, sm).cases) if case_matches(case, select)]
+
+
+def _matches(backend: str, op: str, sm: int, select: dict) -> bool:
+    """Exactly one planned case of (backend, op) on this SM matches ``select``."""
+    return len(_matching(backend, op, sm, select)) == 1
 
 
 def _ops(gate: dict) -> list[str]:
@@ -70,10 +93,11 @@ def _ops(gate: dict) -> list[str]:
 
 
 def gates_in_scope(
-    fw: str | None = None, sm: str | None = None, table: Path = TABLE, op: str | None = None
+    fw: str | None = None, sm: str | None = None, table: Path = TABLE, op: str | None = None, derive: bool = False
 ) -> list[dict]:
     """The gates of backend ``fw`` and op ``op`` (comma lists; None: every one); with ``sm``
-    ("sm100"), only those planned on that SM."""
+    ("sm100"), only those planned on that SM, and with ``derive`` also the gates derived
+    there for the paths no row names (:func:`derived`)."""
     fws = set(fw.split(",")) if fw else None
     ops = set(op.split(",")) if op else None
     gates = [
@@ -82,7 +106,10 @@ def gates_in_scope(
     if sm is None:
         return gates
     n = int(str(sm).removeprefix("sm"))
-    return [g for g in gates if _matches(g["backend"], g["op"], n, g["select"])]
+    gates = [g for g in gates if _matches(g["backend"], g["op"], n, g["select"])]
+    if derive:
+        gates += [p["derived"] for p in paths(sm, fw, op, table) if p.get("derived")]
+    return gates
 
 
 def registry_ops(backend: str) -> list[str]:
@@ -133,6 +160,102 @@ def uncovered(backend: str, table: Path = TABLE, ops: list[str] | None = None) -
             continue
         missing += [f"{op}:{ph}" for ph in _phases(op, backend) if f"{op}:{ph}" not in named | ungated]
     return missing
+
+
+_MODEL_FIELDS = ("model_path", "model_name")
+
+
+def _probe_point(isl: int) -> dict:
+    """The point a serving record is probed at: one request of ``isl`` tokens on one GPU."""
+    point = {"batch_size": 1, "seq_len": isl, "prefix_len": 0, "tp": 1, "tp_size": 1, "ep": 1}
+    return {**point, "distribution": "balanced"}
+
+
+def _derive(backend: str, op: str, key: tuple, cases: list, runners: list, roster: set[str], isl: int) -> dict | None:
+    """The gate of a path no row names: its case nearest the probe point among those that
+    name a roster checkpoint and run on this dispatch alone, selected by every field it has,
+    graded against that checkpoint at the case's KV dtype. None when no case qualifies or
+    its filter does not fit the pipeline."""
+    point = _probe_point(isl)
+    best = None
+    for order, (case, on) in enumerate(zip(cases, runners, strict=True)):
+        repo = next((getattr(case, f) for f in _MODEL_FIELDS if getattr(case, f, None)), None)
+        if repo not in roster or len(on) != 1:
+            continue
+        off = sum(1 for f, v in point.items() if getattr(case, f, v) != v)
+        rank = (off, -int(getattr(case, "num_heads", 0) or 0), order)
+        if best is None or rank < best[0]:
+            best = (rank, case, repo)
+    if best is None:
+        return None
+    _rank, case, repo = best
+    select = {}
+    for field, value in case._asdict().items():
+        if isinstance(value, tuple):  # a sweep: the probe point's values, or its smallest
+            value = [v for v in value if v in (1, isl)] or [min(value)]
+        if value is not None:
+            select[field] = value
+    try:
+        case_filter(backend, op, select)
+    except ValueError:
+        return None
+    phase, dtypes, dispatch = key
+    name = "_".join(str(part) for part in ("auto", op, phase, *dtypes, dispatch, repo.rsplit("/", 1)[-1]) if part)
+    kv = getattr(case, "kv_cache_dtype", "bfloat16")
+    return {
+        "gate": re.sub(r"[^A-Za-z0-9_.-]+", "-", name),
+        "backend": backend,
+        "op": op,
+        "select": select,
+        "repo": repo,
+        "kv": "auto" if kv == "bfloat16" else kv,
+    }
+
+
+def paths(sm: str, fw: str | None = None, op: str | None = None, table: Path = TABLE) -> list[dict]:
+    """The paths the plans in scope collect on ``sm`` and the gates that name them. A path is
+    the cases of one (backend, op) that share a phase, the op plan's dtype fields and its
+    dispatch: what selects the kernels. Each row carries ``gates`` (the table rows whose case
+    is on the path), or ``derived`` (:func:`_derive`) when none is, or ``ungated`` (the
+    table's reason for the op or its phase)."""
+    sys.path[:0] = [str(HERE), str(COLLECTOR.parent)]
+    import probe_driver
+    from collector.op_plans import OP_PLANS
+
+    n, isl = int(str(sm).removeprefix("sm")), probe_driver.DEFAULT_ISL
+    doc = load(table)
+    ungated = doc.get("ungated") or {}
+    roster = set(probe_driver.roster_repos(probe_driver.load_targets(HARNESS / "targets.yaml")))
+    rows = []
+    for backend in fw.split(",") if fw else ("vllm", "sglang", "trtllm"):
+        for case_op in sorted(set(registry_ops(backend)) & set(OP_PLANS)):
+            if op and case_op not in op.split(","):
+                continue
+            spec, planned = OP_PLANS[case_op], _planned(backend, case_op, n)
+            runners = planned.dispatches or [(None,)] * len(planned.cases)
+            named: dict[int, list[str]] = {}
+            for g in doc["gates"]:
+                selects = [(g["op"], g["select"]), *((a["op"], a["select"]) for a in g.get("also") or [])]
+                if g["backend"] != backend:
+                    continue
+                for i in [i for o, s in selects if o == case_op for i in _matching(backend, o, n, s)]:
+                    named.setdefault(i, []).append(g["gate"])
+            members: dict[tuple, list[int]] = {}
+            for i, (case, on) in enumerate(zip(planned.cases, runners, strict=True)):
+                for dispatch in on:
+                    members.setdefault((getattr(case, "phase", None), spec.dtypes(case), dispatch), []).append(i)
+            for key, idx in members.items():
+                row = {"backend": backend, "op": case_op, "phase": key[0], "dtypes": key[1], "dispatch": key[2]}
+                row["cases"] = len(idx)
+                row["gates"] = sorted({name for i in idx for name in named.get(i, [])})
+                reason = ungated.get(case_op) or ungated.get(f"{case_op}:{key[0]}")
+                if reason:
+                    row["ungated"] = reason
+                elif not row["gates"]:
+                    cases = [planned.cases[i] for i in idx]
+                    row["derived"] = _derive(backend, case_op, key, cases, [runners[i] for i in idx], roster, isl)
+                rows.append(row)
+    return rows
 
 
 @functools.cache
@@ -211,11 +334,12 @@ def shard_plans(
     op: str | None = None,
     repo: str | None = None,
     family: str | None = None,
+    derive: bool = False,
 ) -> dict[tuple[str, str], dict]:
     """{(backend, release): pipeline shard plan} of the gates in scope on ``sm``; ``repo`` /
     ``family`` narrow them to the gates naming a checkpoint or starting with a family."""
     plans: dict[tuple[str, str], dict] = {}
-    for g in gates_in_scope(fw, sm, op=op):
+    for g in gates_in_scope(fw, sm, op=op, derive=derive):
         if (repo and g["repo"] != repo) or (family and not g["gate"].startswith(family)):
             continue
         doc = plans.setdefault((g["backend"], gate_version(g)), {"backend": g["backend"], "shards": []})
@@ -262,7 +386,12 @@ def _trace(results: list[Path], name: str, backend: str, version: str, sm: int |
 
 
 def grade(
-    sm: str, results: list[Path], fw: str | None = None, op: str | None = None, repo: str | None = None
+    sm: str,
+    results: list[Path],
+    fw: str | None = None,
+    op: str | None = None,
+    repo: str | None = None,
+    derive: bool = False,
 ) -> dict[tuple[str, str], str]:
     """Grade every gate in scope; returns {(backend, gate): verdict}."""
     sys.path.insert(0, str(HERE))
@@ -270,7 +399,7 @@ def grade(
     import probe_driver
 
     verdicts = {}
-    for g in gates_in_scope(fw, sm, op=op):
+    for g in gates_in_scope(fw, sm, op=op, derive=derive):
         if repo and g["repo"] != repo:
             continue
         backend, version, key = g["backend"], gate_version(g), (g["backend"], g["gate"])
@@ -312,19 +441,35 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("plan")
     g = sub.add_parser("grade")
-    for parser in (p, g):
+    c = sub.add_parser("paths")
+    for parser in (p, g, c):
         parser.add_argument("--sm", required=True, help="e.g. sm100")
         parser.add_argument("--fw", default=None, help="comma list of backends (default: every backend)")
         parser.add_argument("--op", default=None, help="only the gates of these collector ops (comma list)")
+    for parser in (p, g):
         parser.add_argument("--repo", default=None, help="only the gates that name this checkpoint")
+        parser.add_argument("--derive", action="store_true", help="also the gates derived for unnamed paths")
     p.add_argument("--family", default=None, help="only the gates whose name starts with this family")
     p.add_argument("--out", required=True, type=Path)
     p.add_argument("--serving", default=None, type=Path, help="a probe_driver campaign dir whose shards to add")
     g.add_argument("--results", required=True, nargs="+", type=Path, help="unpacked pipeline result dirs")
     args = ap.parse_args()
+    if args.cmd == "paths":
+        rows = paths(args.sm, args.fw, args.op)
+        for r in rows:
+            d = r.get("derived")
+            how = ", ".join(r["gates"]) or (f"ungated: {r['ungated']}" if "ungated" in r else "")
+            how = how or (f"derivable: {d['repo']} kv={d['kv']}" if d else "NO GATE")
+            path = f"{r['phase'] or '-'} {'/'.join(r['dtypes']) or '-'} {r['dispatch'] or '-'}"
+            print(f"{r['backend']:7} {r['op']:34} {path:44} {r['cases']:6}  {how}")
+        gated = sum(1 for r in rows if r["gates"])
+        derivable = sum(1 for r in rows if r.get("derived"))
+        bare = sum(1 for r in rows if not r["gates"] and "ungated" not in r and not r.get("derived"))
+        print(f"{args.sm}: {len(rows)} paths, {gated} gated, {derivable} derivable, {bare} with no gate")
+        return 0
     if args.cmd == "plan":
         args.out.mkdir(parents=True, exist_ok=True)
-        plans = shard_plans(args.sm, args.fw, args.op, args.repo, args.family)
+        plans = shard_plans(args.sm, args.fw, args.op, args.repo, args.family, args.derive)
         for f in sorted(args.serving.glob("shards/tp*/*.yaml")) if args.serving else []:
             if f.parent.name != "tp1":
                 print(f"{f}: its own job, AISIM_GPU_NUM={f.parent.name.removeprefix('tp')}")
@@ -337,7 +482,7 @@ def main() -> int:
             print(f"{len(doc['shards'])} shards -> {path}")
             print(f"  trigger: --frameworks {backend}:{version} --var AISIM_BACKEND_DOCKER_IMAGE={image}")
         return 0
-    verdicts = grade(args.sm, args.results, args.fw, args.op, args.repo)
+    verdicts = grade(args.sm, args.results, args.fw, args.op, args.repo, args.derive)
     for (backend, gate), verdict in sorted(verdicts.items()):
         print(f"{backend:7} {gate:44} {verdict}")
     return 0 if all(v in ("aligned", "platform-floor") for v in verdicts.values()) else 1
