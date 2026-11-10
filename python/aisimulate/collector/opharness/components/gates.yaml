@@ -11,6 +11,16 @@
 # capture-only switch the collector reads; `isl` grades against a serving record probed at
 # that prompt length (default 4096; a prefill case's length must match it); `row` picks the
 # row serving runs (index in plan order) of a case the plan runs as several.
+# `ungated` gives the reason a registry op (or op:phase) has no gate; every other registry op
+# of a backend needs a gate naming it, one per planned phase (gates.uncovered).
+ungated:
+  compute_scale: deviation note in collector/vllm/collect_computescale.py; no serving instance to gate
+  mhc_module: measures the no-norm mhc_pre by contract (the SDK bills attn_norm); serving fuses the norm
+  dsa_context_module_skip_indexer: the sglang dsa_context_module path without the indexer
+  dsa_generation_module_skip_indexer: the sglang dsa_generation_module path without the indexer
+  dsv4_csa_topk_calib: calibration helper, not a serving op
+  dsv41_module: the native runner times TP ranks in spawned processes; probe.trace_case refuses it
+  kda:verify: the serving probe runs no speculative decoding
 gates:
 - gate: gemm_fp8block_DeepSeek-V3.2
   backend: vllm

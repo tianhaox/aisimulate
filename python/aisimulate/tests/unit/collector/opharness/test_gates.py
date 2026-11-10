@@ -187,3 +187,46 @@ def test_moe_gates_are_timed_at_their_token_points(gates):
     select = {"moe_type": "fp8_block", "tp": 1, "num_tokens": [4096, 1]}
     assert gates.gate_timing("moe", select) == ([1, 4096], 1)
     assert gates.gate_timing("gemm", {"gemm_type": "fp8_block", "m": 4096}) is None
+
+
+def test_every_registry_op_has_a_gate_or_a_reason(gates):
+    """Coverage is read from the registries, not from the table: an op (or a planned phase of
+    it) with no gate needs a reason under ``ungated``."""
+    assert {"gemm", "moe"} <= set(gates.registry_ops("vllm")) and "dsv41_module" in gates.registry_ops("sglang")
+    assert {backend: gates.uncovered(backend) for backend in ("vllm", "sglang", "trtllm")} == {
+        "vllm": [],
+        "sglang": [],
+        "trtllm": [],
+    }
+
+
+def test_an_op_or_phase_without_a_gate_is_uncovered(gates, tmp_path):
+    """A rebuilt gate set once kept 19 of 32 gates (kda decode among the lost) and reported 19/19."""
+    table = tmp_path / "gates.yaml"
+    row = lambda name, op, **select: {"gate": name, "backend": "vllm", "op": op, "select": select}
+    doc = {"ungated": {"compute_scale": "no serving instance", "kda:verify": "no speculative decoding"}}
+    doc["gates"] = [row("gemm_bf16", "gemm"), row("kda_ctx", "kda", phase="context")]
+    table.write_text(yaml.safe_dump(doc))
+    ops = ["gemm", "kda", "compute_scale", "brand_new_op"]
+    assert gates.uncovered("vllm", table, ops) == ["kda:generation", "brand_new_op"]
+    doc["gates"].append(row("kda_gen", "kda", phase="generation"))
+    table.write_text(yaml.safe_dump(doc))
+    assert gates.uncovered("vllm", table, ops) == ["brand_new_op"]
+    # another backend's gates cover nothing here
+    assert gates.uncovered("sglang", table, ["gemm"]) == ["gemm"]
+
+
+def test_a_missing_trace_removes_the_verdict_of_an_earlier_run(gates, tmp_path, monkeypatch):
+    """A gate without a trace is graded missing-trace; the verdict file an earlier run left must
+    not keep saying aligned."""
+    sys.path.insert(0, str(COMPONENTS))
+    import probe_driver
+
+    monkeypatch.setattr(probe_driver, "ROOT", tmp_path)
+    gate = next(g for g in gates.gates_in_scope("vllm", "sm100") if not (g.get("no_serving") or {}).get("sm100"))
+    stale = gates.verdict_dir("sm100", "vllm", gates.gate_version(gate)) / f"{gate['gate']}.json"
+    stale.parent.mkdir(parents=True)
+    stale.write_text(json.dumps({"verdict": "aligned"}))
+    monkeypatch.setattr(gates, "gates_in_scope", lambda *a, **k: [gate])
+    assert gates.grade("sm100", [tmp_path / "no_results"]) == {("vllm", gate["gate"]): "missing-trace"}
+    assert not stale.exists()

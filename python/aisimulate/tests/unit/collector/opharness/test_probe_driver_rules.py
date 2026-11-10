@@ -253,13 +253,6 @@ def test_run_id_carries_the_system_and_kv(pd):
     assert len(ids) == 4 and all(len(i) == 12 for i in ids)
 
 
-def test_attention_identity_uses_taxonomy_backend_labels(pd):
-    """The identity column shows the backend label, not an 80-char cubin name."""
-    assert pd.attn_identity_label("flash::FlashAttnFwdSm90<...>", "sm90") == "fa3"
-    unknown = "some_totally_unknown_kernel_name"
-    assert pd.attn_identity_label(unknown, "sm90") == pd.normalize_kernel(unknown)
-
-
 # --- golden render facts status + dummy adapter guard (sm120 V4.1 re-probe, 2026-10-01) ---
 
 

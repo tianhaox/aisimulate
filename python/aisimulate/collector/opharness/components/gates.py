@@ -20,9 +20,11 @@ one op across the frameworks), ``--repo`` or ``--family``.
          result dirs) against the serving record of its repo, kv, isl and release on the same
          SM (probe_driver campaigns), through path_diff.diff; verdicts land in the workspace,
          results/pathdiff/<sm>/<backend>-<version>/<gate>.json. ``no_serving`` SMs get a
-         platform-floor verdict.
+         platform-floor verdict. The exit code is 0 when every gate in scope is aligned
+         or a platform floor.
 
-The table is the one home of the gates; workflow_check reads it through ``gates_in_scope``.
+gates.yaml is the one home of the gates and of the reason an op has none (``ungated``);
+``uncovered`` lists the registry ops with neither, and a unit test keeps that list empty.
 """
 
 from __future__ import annotations
@@ -81,6 +83,56 @@ def gates_in_scope(
         return gates
     n = int(str(sm).removeprefix("sm"))
     return [g for g in gates if _matches(g["backend"], g["op"], n, g["select"])]
+
+
+def registry_ops(backend: str) -> list[str]:
+    """The ops a backend's collector registry declares (the wide-EP registries are the
+    multi-node plane and are not gated here)."""
+    import importlib
+
+    sys.path.insert(0, str(COLLECTOR.parent))
+    try:
+        registry = importlib.import_module(f"collector.{backend}.registry").REGISTRY
+    except ModuleNotFoundError:
+        return []
+    return sorted({entry.op for entry in registry})
+
+
+def _phases(op: str, backend: str) -> list[str]:
+    """The ``phase`` values an op plans on any SM; [] when its cases carry none."""
+    sys.path.insert(0, str(COLLECTOR.parent))
+    from collector.op_plans import OP_PLANS, plan
+
+    if op not in OP_PLANS or "phase" not in OP_PLANS[op].case_type._fields:
+        return []
+    with open(os.devnull, "w") as quiet, contextlib.redirect_stdout(quiet):
+        return sorted({case.phase for case in plan(op, backend, None).cases})
+
+
+def uncovered(backend: str, table: Path = TABLE, ops: list[str] | None = None) -> list[str]:
+    """Registry ops (``op``, or ``op:phase`` for an op whose cases carry a phase) of a backend
+    that no gate names and ``ungated`` gives no reason for. Coverage is read from the
+    registry, not the table: a rebuilt gate set once kept 19 of 32 gates and still reported
+    every gate aligned (review 2026-09-29)."""
+    doc = load(table)
+    ungated = set(doc.get("ungated") or {})
+    named = set()
+    for g in doc["gates"]:
+        if g["backend"] != backend:
+            continue
+        for op, select in [(g["op"], g["select"]), *((a["op"], a["select"]) for a in g.get("also") or [])]:
+            named.add(op)
+            if "phase" in select:
+                named.add(f"{op}:{select['phase']}")
+    missing = []
+    for op in registry_ops(backend) if ops is None else ops:
+        if op in ungated:
+            continue
+        if op not in named:
+            missing.append(op)
+            continue
+        missing += [f"{op}:{ph}" for ph in _phases(op, backend) if f"{op}:{ph}" not in named | ungated]
+    return missing
 
 
 @functools.cache
@@ -177,7 +229,7 @@ def shard_plans(
     family: str | None = None,
 ) -> dict[tuple[str, str], dict]:
     """{(backend, release): pipeline shard plan} of the gates in scope on ``sm``; ``repo`` /
-    ``family`` narrow them as workflow_check scopes onboard_model / new_op_collector."""
+    ``family`` narrow them to the gates naming a checkpoint or starting with a family."""
     plans: dict[tuple[str, str], dict] = {}
     for g in gates_in_scope(fw, sm, op=op):
         if (repo and g["repo"] != repo) or (family and not g["gate"].startswith(family)):
@@ -249,10 +301,10 @@ def grade(
             verdicts[key] = "platform-floor"
             continue
         files = [_trace(results, name, backend, version, int(sm.removeprefix("sm"))) for name, _ in _cases(g)]
+        out.unlink(missing_ok=True)  # a verdict of an earlier run never stands in for this one
         if not all(files):
             verdicts[key] = "missing-trace"
             continue
-        out.unlink(missing_ok=True)
         roles, phase = gate_target(g["op"], g["select"])
         timed = gate_timing(g["op"], g["select"])
         rc = path_diff.diff(

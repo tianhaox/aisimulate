@@ -5,7 +5,7 @@
 
 A campaign is one system. targets.yaml (the roster overlay) -> golden `cli generate`
 renders for that system -> one ``probe.serving`` shard per run for the collection
-pipeline -> the job's raws -> records -> the per-model matrix. A campaign lives in
+pipeline -> the job's raws -> records. A campaign lives in
 ``<workspace>/campaigns/<name>/`` on the control machine and is never committed:
 
   --plan --system S                     print the runs (--backends, --only, --full, --isl, --version)
@@ -14,11 +14,10 @@ pipeline -> the job's raws -> records -> the per-model matrix. A campaign lives 
   --emit-shards --system S --url-base U render, bundle and upload every run; shard plans in
                                         shards/tp<N>/<backend>-<version>.yaml, one job each
   --import-raws DIR                     file a job result's raws into raw/ (the job must have run this emit)
-  --records                             raw/ -> records.jsonl (kernels labeled with the SM each raw ran on)
-  --matrix                              matrix-<fw>-<version>.yaml: verdict and deployed identity per model
-  --check-coverage                      every repo the collector's case yamls name is in the roster
+  --records                             raw/ -> records.jsonl (kernels labeled with the SM each raw ran on),
+                                        and one line per run: ok, or why it has no serving evidence
 
-Re-emitting a campaign starts it over (its raws, records and matrices are removed).
+Re-emitting a campaign starts it over (its raws and records are removed).
 """
 
 from __future__ import annotations
@@ -77,7 +76,7 @@ def golden_facts_status(render_output: str) -> dict:
     resolution failed; continuing without facts.") and renders with facts=None,
     so the engine args silently lack every model default. Found 2026-10-01: all
     RTX PRO renders (no hardware profile for rtx_pro_6000_server) lost them.
-    The status is recorded on the run, in records and in the matrix cell so a
+    The status is recorded on the run and in its record so a
     render without facts is never mistaken for a golden one."""
     if _FACTS_FAIL_RX.search(render_output or ""):
         m = re.search(r"KeyError: [^\n]*", render_output) or re.search(r"Fact resolution failed[^\n]*", render_output)
@@ -219,7 +218,7 @@ def derived_repos(fam: dict, targets: dict) -> list[str]:
     families, plus probe-only extra_repos."""
     mentioned = collector_mentioned_repos()
     # owner-decided exclusions live in targets.yaml roster.excluded (each entry
-    # carries decided_by/reason); check_coverage holds the floor.
+    # carries decided_by/reason).
     excluded = {e["repo"] for e in (fam.get("excluded") or [])}
     owned_elsewhere = {
         ck["repo"] for f in targets["families"].values() if not f.get("derive") for ck in f.get("checkpoints", [])
@@ -770,25 +769,6 @@ def roster_repos(targets: dict) -> list[str]:
     return sorted(repos)
 
 
-def check_coverage(targets: dict) -> None:
-    """Coverage floor: the collector's declared model roster is a LOWER bound
-    for probe targets (targets may exceed it, never trail it)."""
-    mentioned = collector_mentioned_repos()
-    covered = set(roster_repos(targets))
-    excluded = {e["repo"] for f in targets["families"].values() for e in (f.get("excluded") or [])}
-    missing = sorted(mentioned - covered - excluded)
-    print(
-        f"collector mentions {len(mentioned)} repos; targets cover {len(covered)}; "
-        f"owner-excluded {len(mentioned & excluded)}"
-    )
-    if missing:
-        print("MISSING FROM TARGETS (coverage floor violated):")
-        for r in missing:
-            print("  ", r)
-        raise SystemExit(1)
-    print("coverage floor satisfied")
-
-
 # ---------------------------------------------------------------------------
 # checkpoint quant profile: derived from the checkpoint's own quant metadata,
 # NEVER the repo name
@@ -845,15 +825,6 @@ def derive_profile(repo: str, configs_dir: Path) -> str:
 # ---------------------------------------------------------------------------
 # records: raw probe JSONs -> records.jsonl — kernel normalization, taxonomy labeling
 
-# attention-ish module classes whose forward spans define the attention identity
-ATTN_CLASS_RE = re.compile(
-    r"Attention|Attn|MLA|Mixer|SSM|DeltaRule|GatedDelta|KDA|Mamba|Impl$|Backend$|Flash|Indexer|Compressor|Sparse"
-)
-# linear-attention / SSM kernel families (fla, KDA, mamba2) — identity of hybrid models
-LINEAR_ATTN_KERNEL_RE = re.compile(
-    r"chunk_gated_delta|delta_rule|gdn_decode|gdn_prefill|fused_recurrent|_kda_|kda_|mamba|_chunk_scan|_chunk_state|_state_passing|selective_state|_fwd_recompute_w_u",
-    re.I,
-)
 # kernels that are infrastructure, never op identity
 KERNEL_DENY = re.compile(
     r"Memcpy|Memset|^memcpy\d|^memset\d|Lazy Function Loading|Runtime Triggered Module Loading|"
@@ -936,18 +907,6 @@ def taxonomy(sm: str) -> tuple:
     `sms` names this SM, plus every rule without `sms`, in file order."""
     rules = yaml.safe_load((_HERE / "kernel_taxonomy.yaml").read_text())["rules"]
     return tuple((re.compile(r["match"]), r["backend"], r["role"]) for r in rules if sm in r.get("sms", [sm]))
-
-
-def attn_identity_label(kernel: str, sm: str) -> str:
-    """Identity-column label for an attention kernel: the taxonomy BACKEND label
-    (fa3, trtllm_fmha, triton_mla, flashmla_sparse, ...) when the vocabulary knows
-    the kernel, else the normalized kernel name (a Blackwell FMHA cubin name is an
-    80-char shape blob, never equal across models)."""
-    name = normalize_kernel(kernel)
-    for rx, backend, role in taxonomy(sm):
-        if role in ("attention", "dsa_indexer", "linear_attention") and rx.search(name):
-            return backend
-    return name
 
 
 # Orphan keep-rule (build_ops): unlabeled orphans kept per record, by device time
@@ -1112,35 +1071,6 @@ _RESOLVED_KEEP = re.compile(
 )
 
 
-def _attn_backend(f: dict, sm: str) -> str | None:
-    """sglang exposes the backend object; vllm reveals it through the wrapped attention
-    spans; graph-replayed forwards emit no spans, so the attention kernel family in the
-    device-stream tables is the identity."""
-    named = (f.get("attn_backend") or "").rsplit(".", 1)[-1]
-    if named:
-        return named
-    for s in f.get("api_trace") or {}:
-        # older probes wrapped vllm's CustomOp base, so activations carry attn spans too
-        if "::attn::" in s and ATTN_CLASS_RE.search(s.split("::")[2]):
-            return s.split("::")[2]
-    for k in (f.get("kernels") or []) + (f.get("decode_kernels") or []) + (f.get("prefill_kernels") or []):
-        name = k["kernel"]
-        if (
-            re.search(
-                r"fmha|flash_?attn|flash_fwd|mla_|attention_kernel|paged_kv|sparse_attn_fwd|mqa_logits|"
-                # vllm TRITON_MLA decode (the only MLA decode backend on sm120)
-                r"unified_attention|^_fwd_grouped_kernel_stage1",
-                name,
-                re.I,
-            )
-            and "norm" not in name.lower()
-            # kv-cache insert glue matched `mla_` and posed as the attention identity on sm120
-            and "concat_and_cache" not in name
-        ):
-            return attn_identity_label(name, sm)
-    return None
-
-
 _TIMING_NAME_CAP = 1000
 
 
@@ -1173,7 +1103,6 @@ def build_record(run: dict, f: dict, imported_at: float) -> dict:
     ops, orphans = build_ops(f, sm)
     sa = f.get("server_args_resolved") or f.get("engine_args_resolved") or {}
     sa = {k: v for k, v in sa.items() if _RESOLVED_KEEP.match(k)}
-    kernels = (f.get("kernels") or []) + (f.get("decode_kernels") or []) + (f.get("prefill_kernels") or [])
     rec = {
         "id": run["id"],
         "target": {k: run.get(k) for k in ("repo", "family", "variant", "profile", "aic_registered")},
@@ -1205,11 +1134,6 @@ def build_record(run: dict, f: dict, imported_at: float) -> dict:
         "config_delta": f.get("config_delta") or None,
         "identity": {
             "model_class": f.get("model_class"),
-            "attn_backend": _attn_backend(f, sm),
-            # hybrids: the linear-attention kernel family is part of the identity too
-            "linear_attn_kernel": next(
-                (normalize_kernel(k["kernel"]) for k in kernels if LINEAR_ATTN_KERNEL_RE.search(k["kernel"])), None
-            ),
             "modules": {
                 k.rsplit(".", 1)[-1]: v.get("modules", v.get("examples", []))
                 for k, v in (f.get("quant_methods") or {}).items()
@@ -1234,16 +1158,34 @@ def build_record(run: dict, f: dict, imported_at: float) -> dict:
     return {k: v for k, v in rec.items() if v is not None}
 
 
+def run_status(run: dict, cdir: Path, record: dict | None) -> str:
+    """Why a planned run is, or is not, serving evidence: ``ok``, the probe's own error, the
+    last line of a job that died before writing its raw, or the reason it was never emitted."""
+    if "skip" in run:
+        return f"not emitted: {run['skip'][:160]}"
+    if record is None:
+        tail = cdir / "raw" / f"{run['id']}.tail"
+        if not tail.exists():
+            return "not run"
+        lines = [ln.strip() for ln in tail.read_text(errors="replace").splitlines() if ln.strip()]
+        return f"no raw: {lines[-1][:200] if lines else 'empty log'}"
+    outcome = record["outcome"]
+    return "ok" if outcome.get("status") == "ok" else f"failed at {outcome['stage']}: {outcome['exc'][:200]}"
+
+
 def build_records(cdir: Path) -> Path:
     out = cdir / "records.jsonl"
     n = 0
     with out.open("w") as fh:
         for run in load_plan(cdir):
             raw = cdir / "raw" / f"{run.get('id')}.json"
-            if "skip" in run or not raw.exists():
-                continue
-            fh.write(json.dumps(build_record(run, json.loads(raw.read_text()), raw.stat().st_mtime)) + "\n")
-            n += 1
+            record = None
+            if "skip" not in run and raw.exists():
+                record = build_record(run, json.loads(raw.read_text()), raw.stat().st_mtime)
+                fh.write(json.dumps(record) + "\n")
+                n += 1
+            label = " ".join(str(run.get(k)) for k in ("backend", "version", "repo") if run.get(k))
+            print(f"{run.get('id', '-')} {label} kv={run.get('kv_dtype') or 'auto'}: {run_status(run, cdir, record)}")
     print(f"wrote {out}: {n} records")
     return out
 
@@ -1251,131 +1193,6 @@ def build_records(cdir: Path) -> Path:
 def load_records(cdir: Path) -> dict:
     path = cdir / "records.jsonl"
     return {r["id"]: r for r in map(json.loads, path.open())} if path.exists() else {}
-
-
-# ---------------------------------------------------------------------------
-# matrix: per (checkpoint x backend) of one campaign — can it boot under the rendered
-# command, and what identity did the framework deploy. Two campaigns' matrices for the
-# same models (old pin, new pin) diff into the identity report of an upgrade.
-_SHORT_DTYPE = {
-    "torch.bfloat16": "bf16",
-    "torch.float16": "fp16",
-    "torch.float8_e4m3fn": "fp8_e4m3",
-    "torch.uint8": "fp8(u8)",
-}
-_MOE_RX = re.compile(r"moe|Marlin|marlin|grouped|expert")
-
-
-def _custom_args(targets: dict, sm: str) -> dict:
-    """(repo, backend) -> the PER-CHECKPOINT extra generate args on this SM (pass+custom)."""
-    custom: dict = {}
-    for fam in targets["families"].values():
-        sources = [(ck["repo"], ck.get("cli_extra_args")) for ck in fam.get("checkpoints") or []]
-        sources += [
-            (repo, (o or {}).get("cli_extra_args")) for repo, o in (fam.get("checkpoint_overrides") or {}).items()
-        ]
-        for repo, by_backend in sources:
-            for be, v in (by_backend or {}).items():
-                if _cea(v, sm):
-                    custom[(repo, be)] = " ".join(_cea(v, sm))
-    return custom
-
-
-def _fail_line(text: str) -> str:
-    """The deciding line of a console tail: a native assert beats a Python error line,
-    and the LAST line of a class beats earlier ones (framework warnings mention 'error:')."""
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    for pat in (r"what\(\):", r"Assertion failed", r"(?:Error|Exception)\b[^\n]*:", r"error:"):
-        for ln in reversed(lines):
-            if re.search(pat, ln):
-                return ln[:200]
-    return lines[-1][:200] if lines else ""
-
-
-def matrix_cell(run: dict, cdir: Path, rec: dict | None, custom: dict) -> dict:
-    if "skip" in run:
-        cause = "dummy not built" if run["skip"].startswith(("dummy ", "no dummy")) else "generator rejects"
-        return {"verdict": "fail", "cause": cause, "error": run["skip"][:160]}
-    raw = cdir / "raw" / f"{run['id']}.json"
-    if not raw.exists():
-        tail = cdir / "raw" / f"{run['id']}.tail"
-        cell = {"verdict": "fail", "cause": "no raw (crashed before dump)" if tail.exists() else "not run"}
-        if tail.exists():
-            cell["error"] = _fail_line(tail.read_text(errors="replace"))
-        return cell
-    err = json.loads(raw.read_text()).get("errors") or {}
-    if err:  # the observation is the error itself (observe, don't classify)
-        return {"verdict": "fail", "error": next(iter(err.values())).strip().splitlines()[-1][:200]}
-    extra = custom.get((run["repo"], run["backend"]))
-    cell = {"verdict": "pass+custom" if extra else "pass", **({"extra_args": extra} if extra else {})}
-    if rec and (rec.get("outcome") or {}).get("status") == "ok":
-        ident, res = rec.get("identity") or {}, rec.get("resolved") or {}
-        cell["attention"] = (
-            " + ".join(x for x in (ident.get("attn_backend"), ident.get("linear_attn_kernel")) if x) or None
-        )
-        moe_q = next((k for k in (ident.get("modules") or {}) if "MoE" in k), None)
-        moe_b = set()
-        for op in rec.get("ops") or []:
-            if _MOE_RX.search(" ".join(op.get("kernels") or [])):
-                moe_b |= set(op.get("backends") or [])
-        # framework-mode records (CUDA graphs / compile) carry the MoE kernels as orphans
-        moe_b |= label_kernels([k for k in rec.get("orphan_kernels") or [] if _MOE_RX.search(k)], rec["runtime"]["sm"])[
-            0
-        ]
-        moe_b -= {"cublas", "vllm_kernel", "sgl_kernel", "torch"}
-        if moe_q:
-            cell["moe"] = moe_q.replace("Method", "") + ("->" + "/".join(sorted(moe_b)) if moe_b else "")
-        kvres = ident.get("kv_cache_resolved") or {}
-        kv = (
-            kvres.get("runner_kv_cache_dtype")
-            or kvres.get("pool.dtype")
-            or next((v for k, v in kvres.items() if k.startswith("manager.") and "dtype" in k), None)
-            or res.get("kv_cache_dtype")
-        )
-        cell["kv_allocated"] = _SHORT_DTYPE.get(str(kv), str(kv).replace("DataType.", "").lower()) if kv else None
-        cell["topology"] = f"tp{run.get('tp', 1)}"
-    return cell
-
-
-def build_matrix(targets: dict, cdir: Path) -> list[Path]:
-    """One matrix file per (backend, release) of the campaign. Cells are the RENDERED runs
-    (kv-variant runs are path_diff evidence, not the deployed identity of a model x backend cell)."""
-    runs = load_plan(cdir)
-    recs = load_records(cdir)
-    sm = next((r["sm"] for r in runs if r.get("sm")), None)
-    custom = _custom_args(targets, sm) if sm else {}
-    written = []
-    for be, version in sorted({(r["backend"], r["version"]) for r in runs if r.get("version")}):
-        cells = {}
-        for run in runs:
-            if run.get("backend") != be or run.get("version") != version or run.get("kv_dtype"):
-                continue
-            cell = matrix_cell(run, cdir, recs.get(run.get("id")), custom)
-            if (run.get("golden_facts") or {}).get("applied") is False:
-                cell["golden_facts"] = "not_applied: " + str(run["golden_facts"].get("reason", ""))[:120]
-            cells[run["repo"]] = cell
-        counts = {"pass": 0, "pass+custom": 0, "fail": 0}
-        for cell in cells.values():
-            counts[cell["verdict"]] += 1
-        doc = {
-            "_meta": {
-                "campaign": cdir.name,
-                "system": next((r.get("system") for r in runs if r.get("system")), None),
-                "sm": sm,
-                "framework": be,
-                "version": version,
-                "verdicts": "pass = plain `cli generate` output boots and runs; "
-                "pass+custom = boots with targets.yaml extra generate args; fail = the observed error",
-                "summary": counts,
-                "golden_facts_not_applied": sum(1 for c in cells.values() if c.get("golden_facts")),
-            },
-            "results": dict(sorted(cells.items())),
-        }
-        p = cdir / f"matrix-{be}-{version}.yaml"
-        p.write_text(yaml.safe_dump(doc, width=200, sort_keys=False, allow_unicode=True))
-        print(f"wrote {p} {counts}")
-        written.append(p)
-    return written
 
 
 def main() -> None:
@@ -1396,14 +1213,9 @@ def main() -> None:
     ap.add_argument("--no-upload", action="store_true", help="with --emit-shards: write bundles, do not upload")
     ap.add_argument("--import-raws", type=Path, default=None, metavar="DIR", help="file a job result's raws")
     ap.add_argument("--records", action="store_true", help="raw/ -> records.jsonl")
-    ap.add_argument("--matrix", action="store_true", help="matrix-<fw>-<version>.yaml per backend")
-    ap.add_argument("--check-coverage", action="store_true", help="every repo the case yamls name is a target")
     args = ap.parse_args()
 
     targets = load_targets(args.targets)
-    if args.check_coverage:
-        check_coverage(targets)
-        return
     name = args.campaign or args.system
     if not name:
         ap.error("name the campaign (--campaign) or its system (--system)")
@@ -1412,8 +1224,6 @@ def main() -> None:
         import_raws(args.import_raws, cdir)
     if args.records:
         build_records(cdir)
-    if args.matrix:
-        build_matrix(targets, cdir)
     if not (args.plan or args.emit_shards):
         return
     if not args.system:

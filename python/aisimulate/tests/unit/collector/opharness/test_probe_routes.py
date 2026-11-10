@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """A serving-probe campaign end to end on the collection pipeline: emit (render, bundle,
 spec, shard plan) -> the job's probe.serving shards -> --import-raws (only this emit's
-fingerprint) -> records labeled with the SM the raw ran on -> the per-model matrix."""
+fingerprint) -> records labeled with the SM the raw ran on."""
 
 import importlib.util
 import io
@@ -106,7 +106,7 @@ RAW_SM100 = {
 }
 
 
-def test_import_files_only_this_emit_and_records_label_by_the_raw_sm(pd, tmp_path):
+def test_import_files_only_this_emit_and_records_label_by_the_raw_sm(pd, tmp_path, capsys):
     cdir = pd.campaign_dir("c")
     runs = [
         _run(pd, "vllm"),
@@ -124,21 +124,17 @@ def test_import_files_only_this_emit_and_records_label_by_the_raw_sm(pd, tmp_pat
     assert "no kernel image" in (cdir / "raw" / "dead.tail").read_text()
 
     pd.build_records(cdir)
+    out = capsys.readouterr().out
     (rec,) = pd.load_records(cdir).values()
     assert rec["runtime"]["sm"] == "sm100" and rec["runtime"]["system"] == "b200_sxm"
     # the Blackwell FMHA cubin is labeled by the sm100 rules (the sm90 rules leave it unlabeled)
-    assert rec["identity"]["attn_backend"] == "trtllm_fmha"
-
-    (matrix,) = pd.build_matrix({"families": {}}, cdir)
-    doc = yaml.safe_load(matrix.read_text())
-    assert doc["_meta"]["sm"] == "sm100" and doc["_meta"]["system"] == "b200_sxm"
-    assert doc["results"]["org/m"]["verdict"] == "pass" and doc["results"]["org/m"]["topology"] == "tp1"
-    # a probe that died before its raw: the observation is its own error line
-    assert doc["results"]["org/d"] == {
-        "verdict": "fail",
-        "cause": "no raw (crashed before dump)",
-        "error": "RuntimeError: CUDA error: no kernel image",
-    }
+    assert "trtllm_fmha" in pd.label_kernels(rec["orphan_kernels"], "sm100")[0]
+    assert pd.label_kernels(rec["orphan_kernels"], "sm90")[0] == set()
+    # every planned run says whether it is serving evidence; a probe that died before its raw
+    # shows its own last line
+    assert "vllm_tp1 vllm 1 org/m kv=auto: ok" in out
+    assert "vllm_fp8 vllm 1 org/m kv=fp8: not run" in out
+    assert "dead vllm 1 org/d kv=auto: no raw: RuntimeError: CUDA error: no kernel image" in out
 
 
 def test_a_campaign_prompt_length_reaches_every_probe_and_the_run_id(pd):
