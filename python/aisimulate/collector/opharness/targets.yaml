@@ -54,10 +54,16 @@ families:
         vllm: interleave_pair
       cli_extra_args:
         sglang:
+          # SM90 only. With --moe-runner-backend auto, SGLang's DeepSeek-V4 override picks
+          # flashinfer_trtllm_routed for a checkpoint with NVFP4 expert metadata on every SM
+          # (arg_groups/model_overrides/deepseek_v4.py, _deepseek_v4_overrides), and an explicit
+          # runner turns that rule off: on another SM this override would record Marlin
+          # (weight-only) where serving runs the NVFP4 runner.
+          sms: [sm90]
           args: &id001
           - --generator-set
           - params.agg.moe_backend=marlin
-          fact: 'fp4-experts on SM90: runner=auto crashes, marlin runs'
+          fact: 'NVFP4 experts on SM90: runner=auto (flashinfer_trtllm_routed) crashes, marlin runs (0.5.21 retest)'
         trtllm:
         - args: [--generator-set, params.agg.tokens_per_block=128]
           fact: 'DeepseekV4CacheManager requires tokens_per_block in [128,256] (attention/backends/sparse/deepseek_v4/cache_manager.py); naive renders 32; the model default is 128 on every SM.'
@@ -72,8 +78,9 @@ families:
       aic_registered: false
       cli_extra_args:
         sglang:
+          sms: [sm90]
           args: *id001
-          fact: 'fp4-experts on SM90: runner=auto crashes, marlin runs'
+          fact: 'NVFP4 experts on SM90: runner=auto (flashinfer_trtllm_routed) crashes, marlin runs (0.5.21 retest)'
         trtllm:
         - args: [--generator-set, params.agg.tokens_per_block=128]
           fact: 'DeepseekV4CacheManager requires tokens_per_block in [128,256] (attention/backends/sparse/deepseek_v4/cache_manager.py); naive renders 32; the model default is 128 on every SM.'
@@ -300,8 +307,9 @@ families:
           family: dsv41
         cli_extra_args:
           sglang:
+            sms: [sm90]
             args: *id001
-            fact: 'NVFP4 experts on SM90: sglang refuses runner=auto (see deepseek-ai/DeepSeek-V4.1-Flash above).'
+            fact: 'NVFP4 experts on SM90: sglang refuses runner=auto (see nvidia/DeepSeek-V4-Pro-NVFP4 above).'
       nvidia/Nemotron-H-56B-Base-8K:
         cli_extra_args:
           vllm:

@@ -229,6 +229,29 @@ def test_customization_sms_scope(pd, monkeypatch):
     assert pd._cea(["-b"], "sm120") == ["-b"]
 
 
+def test_the_marlin_rescue_of_nvfp4_deepseek_v4_holds_on_sm90_only(pd):
+    """SGLang picks its NVFP4 runner for these checkpoints only while the runner is auto, on every
+    SM; a forced marlin on SM100 would record weight-only kernels where serving runs NVFP4."""
+    import yaml
+
+    targets = yaml.safe_load((COMPONENTS.parent / "targets.yaml").read_text())
+    entries = {}
+    for fam in targets["families"].values():
+        for ck in fam.get("checkpoints") or []:
+            entries[ck["repo"]] = (ck.get("cli_extra_args") or {}).get("sglang")
+        for repo, override in (fam.get("checkpoint_overrides") or {}).items():
+            entries[repo] = ((override or {}).get("cli_extra_args") or {}).get("sglang")
+    forced = {repo: v for repo, v in entries.items() if v and "marlin" in str(v)}
+    assert set(forced) == {
+        "nvidia/DeepSeek-V4-Pro-NVFP4",
+        "nvidia/DeepSeek-V4-Flash-NVFP4",
+        "nvidia/DeepSeek-V4.1-Flash-NVFP4",
+    }
+    for v in forced.values():
+        assert pd._cea(v, "sm90") == ["--generator-set", "params.agg.moe_backend=marlin"]
+        assert [pd._cea(v, sm) for sm in ("sm89", "sm100", "sm103", "sm120")] == [[], [], [], []]
+
+
 def test_customization_list_scopes_each_entry(pd):
     """A list of entries applies each on its own SMs: DeepSeek-V4's page size holds on
     every SM, its fp8_ds_mla KV only on Hopper (rc2 takes it off Hopper only at 256)."""
