@@ -84,7 +84,7 @@ def test_emit_writes_a_spec_per_run_with_bundle_and_out_paths(pd, backend, tp, s
     assert "dummy_models/m__rep/config.json" in names
     assert all(not a.startswith("/") for a in names)
     plan = json.loads((cdir / "plan.json").read_text())
-    assert plan[0]["exec_fingerprint"]["fingerprint"] == spec["fingerprint"]
+    assert plan[0]["exec_fingerprint"] == spec["fingerprint"]
 
 
 def _job_shard(job: Path, rid: str, fingerprint: str, raw: dict | None, tail: str = "") -> None:
@@ -114,7 +114,7 @@ def test_import_files_only_this_emit_and_records_label_by_the_raw_sm(pd, tmp_pat
         dict(_run(pd, "vllm"), id="dead", repo="org/d"),
     ]
     pd.emit_shards(runs, cdir, "http://share/c", upload=False)
-    fps = {r["id"]: r["exec_fingerprint"]["fingerprint"] for r in json.loads((cdir / "plan.json").read_text())}
+    fps = {r["id"]: r["exec_fingerprint"] for r in json.loads((cdir / "plan.json").read_text())}
     job = tmp_path / "job"
     _job_shard(job, "vllm_tp1", fps["vllm_tp1"], RAW_SM100)
     _job_shard(job, "vllm_fp8", "0" * 12, RAW_SM100)  # ran another emit of this run: not filed

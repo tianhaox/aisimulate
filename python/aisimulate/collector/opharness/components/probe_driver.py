@@ -281,104 +281,29 @@ def _run_id(
 
 
 # ------------------------------------------------------------ execution identity
-# The run id names the CASE. The execution fingerprint names what shaped the run: the
-# engine invocation the probe consumed, the dummy checkpoint's config, the probe code,
-# the image and the kv override. The spec carries it into the job, and --import-raws
-# files a raw only when the job ran this emit's fingerprint.
-# deployment-wrapper / path values: the dynamo benchmark flags and result paths are
-# consumed by the wrapper, the probe strips them before the engine sees argv
-_ENGINE_DROP = {
-    "--model",
-    "--model-path",
-    "--served-model-name",
-    "--dump-config-to",
-    "--benchmark-output-path",
-    "--benchmark-mode",
-    "--tokenizer",
-    "--tokenizer-path",
-}
-
-
-def engine_tokens(backend: str, tokens: list[str]) -> list[str]:
-    """Engine invocation tokens with the deployment-specific values (model
-    path, served name, result paths) removed."""
-    # start at the first flag: the render carries the interpreter and module (python3 -m dynamo.vllm)
-    first = next((i for i, t in enumerate(tokens) if str(t).startswith("--")), 0)
-    out, skip = [], False
-    for t in tokens[first:]:
-        if skip:
-            skip = False
-            continue
-        key = t.split("=", 1)[0]
-        if key in _ENGINE_DROP:
-            skip = "=" not in t
-            continue
-        out.append(t)
-    return out
-
-
-def _run_sh_engine_tokens(text: str) -> list[str]:
-    m = re.search(r"engine_command=\((.*?)\)\n", text, re.S)
-    if not m:
-        m = re.search(r"python3 -m dynamo\.\w+[^\n]*", text)
-        return shlex.split(m.group(0)) if m else []
-    return shlex.split(m.group(1).replace("\\\n", " "))
-
-
-def plan_engine_tokens(run: dict) -> list[str] | None:
-    """The engine invocation the probe will consume, from the render artifact."""
-    be = run["backend"]
-    if be == "vllm" and run.get("run_sh"):
-        return engine_tokens(be, _run_sh_engine_tokens(Path(run["run_sh"]).read_text()))
-    if be == "sglang" and run.get("engine_cli"):
-        return engine_tokens(be, shlex.split(run["engine_cli"]))
-    if be == "trtllm" and run.get("render_artifact"):
-        # yaml compared semantically (canonical json), so formatting never counts
-        return [json.dumps(yaml.safe_load(Path(run["render_artifact"]).read_text()), sort_keys=True)]
-    return None
-
-
-def _local(path_in_bundle: str) -> Path:
-    return ROOT / str(path_in_bundle).replace(f"{WORK}/", "", 1)
-
-
-def dummy_fingerprint(model_dir: str) -> str | None:
-    d = _local(model_dir)
-    parts = [
-        f"{name}:{(d / name).read_text()}" for name in ("config.json", "hf_quant_config.json") if (d / name).exists()
-    ]
-    return _sha(*parts) if parts else None
-
-
+# The run id names the CASE. The fingerprint names what one emit hands the job: the image,
+# the probe script and its arguments, and every input file the bundle carries (the dummy
+# checkpoint and the rendered engine config). The spec carries it into the job, and
+# --import-raws files a raw only when the job ran this emit's fingerprint.
 def probe_script(run: dict) -> str:
     """tp1 runs the in-process probe; sglang and trtllm tp>1 run the real server."""
     server = run["backend"] in ("sglang", "trtllm") and int(run.get("tp", 1)) > 1
     return f"probe_{run['backend']}{'_server' if server else ''}.py"
 
 
-def exec_fingerprint(run: dict) -> dict:
-    """{fingerprint, engine, dummy, probe_code, image, kv}."""
-    toks = plan_engine_tokens(run)
-    eng = _sha(*toks) if toks else None
-    dum = dummy_fingerprint(run.get("model_dir", ""))
-    probe = _HERE / "probes" / probe_script(run)
-    code = _sha(probe.read_text()) if probe.exists() else None
-    fp = _sha(
-        eng or "",
-        dum or "",
-        code or "",
-        str(run.get("image")),
-        str(run.get("kv_dtype")),
-        json.dumps(run.get("cli_extra_args") or [], sort_keys=True),
-    )
-    return {
-        "fingerprint": fp,
-        "engine": eng,
-        "dummy": dum,
-        "probe_code": code,
-        "image": run.get("image"),
-        "kv": run.get("kv_dtype"),
-    }
+def exec_fingerprint(run: dict, bundle_files: list[str]) -> str:
+    """``bundle_files`` are the bundle's input paths relative to the workspace."""
+    h = hashlib.sha1()
+    script = _HERE / "probes" / run["probe_script"]
+    spec = [run.get("image"), run["probe_script"], run["probe_args"], run.get("probe_env")]
+    h.update(json.dumps(spec, sort_keys=True).encode())
+    h.update(script.read_bytes() if script.exists() else b"")
+    for rel in sorted(bundle_files):
+        root = ROOT / rel
+        for f in sorted(p for p in ([root] if root.is_file() else root.rglob("*")) if p.is_file()):
+            h.update(str(f.relative_to(ROOT)).encode())
+            h.update(f.read_bytes())
+    return h.hexdigest()[:12]
 
 
 def select_dummy_dir(
@@ -666,8 +591,8 @@ def emit_shards(runs: list[dict], cdir: Path, url_base: str, upload: bool = True
             continue
         script, argv, env = probe
         run.update(probe_script=script, probe_args=argv, probe_env=env)
-        run["exec_fingerprint"] = exec_fingerprint(run)
         rels = sorted({a[len(WORK) + 1 :] for a in argv if a.startswith(WORK + "/")})
+        run["exec_fingerprint"] = exec_fingerprint(run, rels)
         tgz = cdir / "bundles" / f"{_SHARD_NAME.sub('_', run['id'])}.tgz"
         with tarfile.open(tgz, "w:gz", dereference=True) as tar:
             for rel in rels:
@@ -679,7 +604,7 @@ def emit_shards(runs: list[dict], cdir: Path, url_base: str, upload: bool = True
             "args": argv,
             "env": env,
             "bundle": f"{url_base}/{tgz.name}",
-            "fingerprint": run["exec_fingerprint"]["fingerprint"],
+            "fingerprint": run["exec_fingerprint"],
         }
         spec_file = tgz.with_suffix(".json")
         spec_file.write_text(json.dumps(spec, indent=1))
@@ -730,7 +655,7 @@ def import_raws(result_dir: Path, cdir: Path) -> None:
         if run is None:
             print(f"skip {res_file.parent.name}: run {rid} is not in this campaign", file=sys.stderr)
             continue
-        if res.get("fingerprint") != run["exec_fingerprint"]["fingerprint"]:
+        if res.get("fingerprint") != run["exec_fingerprint"]:
             print(f"skip {rid}: the job ran another emit of this run (fingerprint differs)", file=sys.stderr)
             continue
         raw = res_file.parent / str(res.get("raw"))
@@ -1143,7 +1068,7 @@ def build_record(run: dict, f: dict, imported_at: float) -> dict:
             # what the engine actually allocated (runner / pool / manager dtypes)
             "kv_cache_resolved": f.get("kv_cache_resolved") or None,
         },
-        "exec_fingerprint": (run.get("exec_fingerprint") or {}).get("fingerprint"),
+        "exec_fingerprint": run.get("exec_fingerprint"),
         "golden_facts": run.get("golden_facts"),
         "imported_at": imported_at,
         "ops": ops or None,
