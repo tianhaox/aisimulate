@@ -182,22 +182,6 @@ def gate_target(op: str, select: dict) -> tuple[tuple[str, ...], str | None]:
     return ("attention", "dsa_indexer"), phase
 
 
-# Ops whose gates are timed against serving (path_diff.grade_timing): the swept field whose
-# values are the timed points, matched to serving's bs1 decode step (1) and prefill step (isl).
-# moe first (owner decision 2026-11-08); an op joins once its points match one serving shape.
-_TIMED_SWEEP = {"moe": "num_tokens"}
-
-
-def gate_timing(op: str, select: dict) -> tuple[list, int | None] | None:
-    """(the timed points, the case's tp) of a timed gate; None when the op is not timed."""
-    field = _TIMED_SWEEP.get(op)
-    if field is None or field not in select:
-        return None
-    value = select[field]
-    points = list(value) if isinstance(value, (list, tuple)) else [value]
-    return sorted(int(p) for p in points), select.get("tp")
-
-
 def _value(v) -> str:
     return "+".join(str(x) for x in v) if isinstance(v, (list, tuple)) else str(v)
 
@@ -306,7 +290,6 @@ def grade(
             verdicts[key] = "missing-trace"
             continue
         roles, phase = gate_target(g["op"], g["select"])
-        timed = gate_timing(g["op"], g["select"])
         rc = path_diff.diff(
             [str(f) for f in files],
             g["repo"],
@@ -319,8 +302,6 @@ def grade(
             target_roles=roles,
             phase=phase,
             isl=g.get("isl", probe_driver.DEFAULT_ISL),
-            timing_points=timed[0] if timed else None,
-            timing_tp=timed[1] if timed else None,
         )
         verdicts[key] = "no-serving-record" if rc == 2 else json.loads(out.read_text())["verdict"]
     return verdicts

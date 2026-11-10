@@ -996,31 +996,6 @@ _RESOLVED_KEEP = re.compile(
 )
 
 
-_TIMING_NAME_CAP = 1000
-
-
-def build_kernel_time(facts: dict) -> dict:
-    """phase -> kernel -> {"us": total device time, "launches": n}, from the device-stream
-    tables of one profiled prefill step and one decode step: the serving side of a gate's
-    timing check. Kernels keep their full names (template arguments included, capped): one
-    normalized name can cover several ops (DeepGEMM's fp8_gemm_kernel runs the dense and the
-    grouped MoE GEMMs), and the full name tells them apart."""
-    trace = facts.get("trace") or facts
-    out: dict = {}
-    for tbl, phase in _ORPHAN_TABLES:
-        for k in trace.get(tbl) or []:
-            name = k.get("kernel", "")
-            if not _orphan_table_name_ok(name) or not normalize_kernel(name):
-                continue
-            launches = k.get("launches", k.get("calls"))
-            if not launches:
-                continue
-            slot = out.setdefault(phase, {}).setdefault(name[:_TIMING_NAME_CAP], {"us": 0.0, "launches": 0})
-            slot["us"] = round(slot["us"] + float(k.get("us") or 0.0), 3)
-            slot["launches"] += int(launches)
-    return out
-
-
 def build_record(run: dict, f: dict, imported_at: float) -> dict:
     """One record: the run's target and runtime, the resolved serving config, the
     deployed identity and the kernels by op and phase. The SM is the one the raw ran on."""
@@ -1077,7 +1052,6 @@ def build_record(run: dict, f: dict, imported_at: float) -> dict:
         # attribution is by name across phases, so a kernel both phases launch would otherwise
         # vanish from the phase its span did not cover (sglang decode FA3, 2026-09-25)
         "kernel_phases": build_orphan_phases(f) or None,
-        "kernel_time": build_kernel_time(f) or None,
         "outcome": ({"status": "ok"} if not f.get("errors") else compress_error(*next(iter(f["errors"].items())))),
     }
     return {k: v for k, v in rec.items() if v is not None}
