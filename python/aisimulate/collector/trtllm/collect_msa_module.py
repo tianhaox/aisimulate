@@ -635,6 +635,11 @@ def create_kv_cache_and_metadata(
         # The sparse-attention path serves with block reuse disabled (the
         # curated config examples/configs/curated/minimax-m3-throughput.yaml).
         enable_block_reuse=False,
+        # DIAGNOSTIC (not for merge): no host tier. KV cache manager V2 otherwise sizes one
+        # to the GPU quota (kv_cache_manager_v2.py:1718-1764@v1.4.0rc2) and fills it on a
+        # background thread (kv_cache_manager_v2/storage/core.cpp:392 waitForFill=false,
+        # utils/hostMem.cpp:187-216), which may stall the timed loop of this per-point manager.
+        host_cache_size=0,
     )
     # Capacity is refused before allocation: the manager commits GPU memory for its
     # whole quota when it is built (GpuSlotPool, kv_cache_manager_v2/storage/core.cpp:
