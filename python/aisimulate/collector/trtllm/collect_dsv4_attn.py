@@ -511,6 +511,8 @@ def create_dsv4_kv_cache_and_metadata(
         max_gpu_total_bytes=int(free_bytes * 0.5),
         max_tokens=int(planned_tokens),
         enable_block_reuse=False,
+        # DIAGNOSTIC (not for merge): no host tier, see collect_msa_module.py.
+        host_cache_size=0,
     )
     if get_sm_version() == 90:
         # On Hopper DeepseekV4CacheManager refuses any pool but the packed FP8

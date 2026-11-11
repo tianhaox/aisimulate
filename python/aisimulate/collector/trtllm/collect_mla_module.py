@@ -510,6 +510,8 @@ def create_kv_cache_and_metadata(
     kv_cache_config = KvCacheConfig(
         max_tokens=kv_tokens,
         enable_block_reuse=False,
+        # DIAGNOSTIC (not for merge): no host tier, see collect_msa_module.py.
+        host_cache_size=0,
     )
     # Serving's class: KvCacheConfig.use_kv_cache_manager_v2 defaults to True
     # (llmapi/llm_args.py:5057-5064), so a dense MLA model resolves KVCacheManagerV2
