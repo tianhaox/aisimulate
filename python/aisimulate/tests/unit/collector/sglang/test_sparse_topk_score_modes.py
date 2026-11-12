@@ -17,6 +17,7 @@ pytestmark = pytest.mark.unit
 
 SGLANG_DIR = Path(__file__).resolve().parents[4] / "collector" / "sglang"
 DSV4_SPARSE_SOURCE = SGLANG_DIR / "deepseekv4_sparse_modules.py"
+GLM5_SPARSE_SOURCE = SGLANG_DIR / "glm5_dsa_sparse_modules.py"
 
 
 def _load(source_path: Path, *names: str, namespace: dict | None = None) -> dict:
@@ -103,7 +104,18 @@ def _dsv4_worker(shape_result, written):
     return lambda: worker("model", "topk", 1, 1, [[0, 4096, "v1"]], perf_filename="out.txt")
 
 
-@pytest.mark.parametrize(("make_worker", "mode"), [(_dsv4_worker, "v1_top_last")])
+def _glm5_worker(shape_result, written):
+    worker = _worker(
+        GLM5_SPARSE_SOURCE,
+        "run_glm5_dsa_sparse_kernel_worker",
+        written,
+        _bench_glm5_sparse_kernel_shape=lambda *_args, **_kwargs: ("kernel", shape_result),
+        _glm5_sparse_config=lambda _model: SimpleNamespace(num_attention_heads=64),
+    )
+    return lambda: worker("model", "topk", 1, [[0, 4096]], perf_filename="out.txt")
+
+
+@pytest.mark.parametrize(("make_worker", "mode"), [(_dsv4_worker, "v1_top_last"), (_glm5_worker, "top_last")])
 def test_topk_workers_persist_the_top_last_row_and_reject_a_flat_one(make_worker, mode):
     written = []
     make_worker([(mode, 1.0)], written)()
@@ -116,7 +128,7 @@ def test_topk_workers_persist_the_top_last_row_and_reject_a_flat_one(make_worker
     assert not written
 
 
-@pytest.mark.parametrize("source_path", [DSV4_SPARSE_SOURCE])
+@pytest.mark.parametrize("source_path", [DSV4_SPARSE_SOURCE, GLM5_SPARSE_SOURCE])
 def test_no_flat_score_mode_is_left_to_emit(source_path):
     source = source_path.read_text(encoding="utf-8")
     assert '"flat"' not in source and "_flat" not in source
