@@ -13,7 +13,7 @@ import weakref
 
 import torch
 
-_PREFIXES = (1536, 2048, 3072, 4096, 8192, 32768)
+_PREFIXES = (1536, 2048, 3072, 4096, 6144, 8192, 10240, 16384, 32768)
 _SEQ_LENS = (64, 512, 1024)
 
 
@@ -58,7 +58,7 @@ def run(attn_module, position_ids, hidden_states, attn_metadata, model_config, l
         return
     from tensorrt_llm._torch.utils import get_model_extra_attrs, model_extra_attrs
 
-    indexer = next((m for m in attn_module.modules() if type(m).__name__ == "Indexer"), None)
+    indexer = next((m for m in attn_module.modules() if type(m).__name__.endswith("Indexer")), None)
     if indexer is None:
         print("TOPKDIAG " + json.dumps({"label": label, "error": "no Indexer module"}), flush=True)
         return

@@ -866,6 +866,25 @@ def run_dsv4_attn(
             if tune:
                 _TUNED_NUM_TOKENS[attn_module] = num_tokens
 
+        # Diagnostic only (not for merge): the indexer's top-k inputs and cost at selected points.
+        if is_context and getattr(attn_module, "indexer", None) is not None:
+            try:
+                from collector.trtllm import _topkdiag
+
+                _topkdiag.run(
+                    attn_module,
+                    position_ids,
+                    hidden_states,
+                    attn_metadata,
+                    model_config,
+                    f"dsv4 b={batch_size} s={seq_len} prefix={prefix_len}",
+                    seq_len,
+                    prefix_len,
+                )
+            except Exception as e:
+                print(f"TOPKDIAG failed: {e!r}", flush=True)
+                traceback.print_exc()
+
         _trtllm_utils._model_extra_attrs.attrs = model_config.extra_attrs
         _trtllm_utils._model_extra_attrs.attrs["attention_metadata"] = weakref.ref(attn_metadata)
 
