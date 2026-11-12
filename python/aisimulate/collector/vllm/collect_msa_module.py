@@ -116,6 +116,8 @@ _SAMPLE_CHUNK_ELEMENTS = 1 << 20
 # two to four times at the plan's 524288- and 1048575-token histories, against the
 # thousands of candidate blocks of such a row.
 _HISTORY_TOKENS = 1 << 18
+# The worker's sampled history keys by (device, block size, key width).
+_HISTORY_KEYS: dict = {}
 
 
 def _emulated_kv_heads(num_heads: int) -> int:
@@ -583,15 +585,24 @@ def _write_index_key_history(index_kv_cache) -> None:
     on the scores: the fill changes no timing there.
     """
     num_blocks, _, block_size, index_dim = index_kv_cache.shape
-    distinct = min(num_blocks, max(1, _HISTORY_TOKENS // block_size))
-    chunk = max(1, _SAMPLE_CHUNK_ELEMENTS // (block_size * index_dim))
-    generator = torch.Generator(device="cpu").manual_seed(1234)
-    for start in range(0, distinct, chunk):
-        part = index_kv_cache[start : min(start + chunk, distinct)]
-        part.copy_(torch.randn(part.shape, generator=generator, dtype=torch.float32, device="cpu"))
-    for start in range(distinct, num_blocks, distinct):
+    distinct = max(1, _HISTORY_TOKENS // block_size)
+    # Sampled on the host once per worker and kept on the device: a point then pays one
+    # device copy, where sampling it again would cost a point more than its measurement.
+    memo = (str(index_kv_cache.device), block_size, index_dim)
+    keys = _HISTORY_KEYS.get(memo)
+    if keys is None:
+        keys = torch.empty(
+            (distinct, 1, block_size, index_dim), dtype=index_kv_cache.dtype, device=index_kv_cache.device
+        )
+        chunk = max(1, _SAMPLE_CHUNK_ELEMENTS // (block_size * index_dim))
+        generator = torch.Generator(device="cpu").manual_seed(1234)
+        for start in range(0, distinct, chunk):
+            part = keys[start : start + chunk]
+            part.copy_(torch.randn(part.shape, generator=generator, dtype=torch.float32, device="cpu"))
+        _HISTORY_KEYS[memo] = keys
+    for start in range(0, num_blocks, distinct):
         part = index_kv_cache[start : start + distinct]
-        part.copy_(index_kv_cache[: part.shape[0]])
+        part.copy_(keys[: part.shape[0]])
 
 
 def _rebase_block_table_and_slots(common_attn_metadata, block_size: int):

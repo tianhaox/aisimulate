@@ -116,6 +116,7 @@ def _helpers(*names, **constants):
             generator.rng.integers(low, high, tuple(shape)).astype(dtype).view(_Array)
         ),
         ones=lambda shape, dtype, device: _array(tuple(shape), dtype, 1.0),
+        empty=lambda shape, dtype, device: _array(tuple(shape), dtype),
     )
     namespace = {"torch": fake_torch, **constants}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SRC), "exec"), namespace)
@@ -125,7 +126,7 @@ def _helpers(*names, **constants):
 @pytest.mark.parametrize("num_blocks", [3, 5, 12])
 def test_index_key_history_fills_the_cache_with_one_repeated_block_of_keys(num_blocks):
     # 5 distinct blocks of 4 tokens, drawn 2 blocks at a time.
-    helpers = _helpers("_write_index_key_history", _HISTORY_TOKENS=20, _SAMPLE_CHUNK_ELEMENTS=64)
+    helpers = _helpers("_write_index_key_history", _HISTORY_TOKENS=20, _SAMPLE_CHUNK_ELEMENTS=64, _HISTORY_KEYS={})
     cache = _array((num_blocks, 1, 4, 8), np.float32)
 
     helpers["_write_index_key_history"](cache)
@@ -139,13 +140,19 @@ def test_index_key_history_fills_the_cache_with_one_repeated_block_of_keys(num_b
 
 
 def test_index_key_history_is_seeded():
-    helpers = _helpers("_write_index_key_history", _HISTORY_TOKENS=1 << 18, _SAMPLE_CHUNK_ELEMENTS=1 << 20)
-    first, second = _array((6, 1, 4, 8), np.float32), _array((6, 1, 4, 8), np.float32)
-
+    first, second, third = (_array((6, 1, 4, 8), np.float32) for _ in range(3))
+    helpers = _helpers(
+        "_write_index_key_history", _HISTORY_TOKENS=1 << 18, _SAMPLE_CHUNK_ELEMENTS=1 << 20, _HISTORY_KEYS={}
+    )
     helpers["_write_index_key_history"](first)
-    helpers["_write_index_key_history"](second)
+    helpers["_write_index_key_history"](second)  # the worker's kept block
+    again = _helpers(
+        "_write_index_key_history", _HISTORY_TOKENS=1 << 18, _SAMPLE_CHUNK_ELEMENTS=1 << 20, _HISTORY_KEYS={}
+    )
+    again["_write_index_key_history"](third)  # another worker samples the same keys
 
-    assert np.array_equal(first, second)
+    assert np.array_equal(first, second) and np.array_equal(first, third)
+    assert len(helpers["_HISTORY_KEYS"]) == 1
 
 
 def _projection(weight_dtype, *, packed=False):
