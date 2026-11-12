@@ -447,8 +447,10 @@ def _cached_attention_layer(model_path: str, num_heads: int, use_fp8_kv_cache: b
     return entry
 
 
-# History rows written per scatter call: bounds the temporary of a long history.
-_HISTORY_CHUNK_ROWS = 1 << 18
+# Distinct history rows: a longer history repeats them, so writing it costs one scatter per
+# this many tokens and no further sampling. A row then recurs a handful of times in the
+# longest histories, far below the tie counts the top-k kernels treat specially.
+_HISTORY_ROWS = 1 << 18
 
 
 def _write_indexer_history(indexer, attn_metadata, device: str) -> None:
@@ -461,45 +463,48 @@ def _write_indexer_history(indexer, attn_metadata, device: str) -> None:
     and every other indexed row timed the cheapest top-k). Serving writes a token's index K
     when it computes it: the k_norm output goes through Indexer._prep_q_or_k (fused cat and
     FP8/FP4 quantize) and Indexer._update_k_cache (indexer_k_cache_scatter_op) at the slots
-    Indexer.recompute_slot_mappings derives with _compute_slot_mappings
-    (attention/backends/sparse/dsa/indexer.py). Seeded N(0, 1) rows take the same quantizer and
+    the metadata derives with _compute_slot_mappings (attention/backends/sparse/dsa/indexer.py;
+    on_update_kv_lens, dsa/metadata.py). Seeded N(0, 1) rows take the same quantizer and
     scatter op at the history positions, outside the measurement. They stand for no particular
     checkpoint distribution. Same treatment as the SGLang DSA modules.
     """
     params = type(indexer).build_indexer_params(attn_metadata)
     if params is None:
         return
-    cached = params.cached_kv_tokens.to(torch.int64)
+    cached = params.cached_kv_tokens.to(device=device, dtype=torch.int64)
     total = int(cached.sum())
     if total == 0:
         return
-    requests = torch.repeat_interleave(torch.arange(cached.numel(), dtype=torch.int64), cached)
-    positions = torch.arange(total, dtype=torch.int64) - (torch.cumsum(cached, 0) - cached).repeat_interleave(cached)
-    data_slots, scale_slots = sys.modules[type(indexer).__module__]._compute_slot_mappings(
-        positions,
-        attn_metadata.host_indexer_k_cache_block_offsets,
-        requests,
-        params.head_dim,
-        params.tokens_per_block,
-        params.quant_block_size,
-        data_bytes_per_token=params.data_bytes_per_token,
+    rows = min(total, _HISTORY_ROWS)
+    generator = torch.Generator(device=device).manual_seed(0)
+    k = torch.randn((rows, indexer.head_dim), generator=generator, device=device).to(torch.bfloat16)
+    k_data, k_scale = indexer._prep_q_or_k(*k.split([indexer.rope_dim, indexer.head_dim - indexer.rope_dim], dim=-1))
+    if k_scale.element_size() == 1:
+        k_scale = k_scale.view(torch.int32)
+    # The module of the DSA Indexer, which a DeepSeek-V4 indexer derives from.
+    compute_slot_mappings = next(
+        sys.modules[cls.__module__]._compute_slot_mappings
+        for cls in type(indexer).__mro__
+        if hasattr(sys.modules[cls.__module__], "_compute_slot_mappings")
     )
     slot_dtype = attn_metadata.slot_mapping_fp8.dtype
     k_cache = attn_metadata.kv_cache_manager.get_indexer_k_cache_buffers(indexer.layer_idx)
-    generator = torch.Generator(device=device).manual_seed(0)
-    for start in range(0, total, _HISTORY_CHUNK_ROWS):
-        end = min(start + _HISTORY_CHUNK_ROWS, total)
-        k = torch.randn((end - start, indexer.head_dim), generator=generator, device=device).to(torch.bfloat16)
-        k_data, k_scale = indexer._prep_q_or_k(*k.split([indexer.rope_dim, indexer.head_dim - indexer.rope_dim], dim=-1))
-        if k_scale.element_size() == 1:
-            k_scale = k_scale.view(torch.int32)
+    ends = torch.cumsum(cached, 0)
+    for start in range(0, total, rows):
+        # History tokens in request order: the request and the position in its sequence.
+        token = torch.arange(start, min(start + rows, total), device=device)
+        request = torch.searchsorted(ends, token, right=True)
+        data_slots, scale_slots = compute_slot_mappings(
+            token - (ends - cached)[request],
+            attn_metadata.indexer_k_cache_block_offsets,
+            request,
+            params.head_dim,
+            params.tokens_per_block,
+            params.quant_block_size,
+            data_bytes_per_token=params.data_bytes_per_token,
+        )
         torch.ops.trtllm.indexer_k_cache_scatter_op(
-            k_data,
-            k_scale,
-            k_cache,
-            data_slots[start:end].to(device=device, dtype=slot_dtype),
-            scale_slots[start:end].to(device=device, dtype=slot_dtype),
-            end - start,
+            k_data, k_scale, k_cache, data_slots.to(slot_dtype), scale_slots.to(slot_dtype), token.numel()
         )
 
 

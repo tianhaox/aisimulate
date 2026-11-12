@@ -32,11 +32,11 @@ config head/o_groups counts (num_attention_heads = native // tp,
 o_groups = max(1, o_groups // tp)) in a single process, matching the vllm
 collector; collective latency is therefore excluded, like both references.
 
-Like the vllm collector, weights are dummy, so the CSA indexer top-k selects
-degenerate indices; the SDK's topK DELTA calibration
-(``dsv4_csa_topk_calib``) corrects this at query time when present and is a
-no-op otherwise ((calib or {}).get(...) -> delta 0.0, operations/dsv4.py).
-No trtllm calib table is produced yet — same accepted state as vllm 0.24.0.
+Weights are dummy. The cached history's index K is written before timing
+(collect_mla_module._write_indexer_history), so the CSA indexer top-k selects
+among distinct scores and the rows need no top-k correction: no trtllm
+``dsv4_csa_topk_calib`` table is produced, and the SDK's topK DELTA is then a
+no-op ((calib or {}).get(...) -> delta 0.0, operations/dsv4.py).
 """
 
 from __future__ import annotations
@@ -417,9 +417,9 @@ def create_dsv4_kv_cache_and_metadata(
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
     try:
-        from .collect_mla_module import get_kv_cache_manager_cls
+        from .collect_mla_module import _write_indexer_history, get_kv_cache_manager_cls
     except ImportError:
-        from collect_mla_module import get_kv_cache_manager_cls
+        from collect_mla_module import _write_indexer_history, get_kv_cache_manager_cls
 
     config = model_config.pretrained_config
     mapping = model_config.mapping
@@ -660,6 +660,11 @@ def create_dsv4_kv_cache_and_metadata(
             attn_metadata.indexer = attn_module.indexer
 
         attn_metadata.prepare()
+        # CSA only (HCA builds no indexer): the cached history's index K, which the shared DSA
+        # indexer path scores and selects from. The reason is at _write_indexer_history.
+        if getattr(attn_module, "indexer", None) is not None:
+            with torch.inference_mode():
+                _write_indexer_history(attn_module.indexer, attn_metadata, device)
         return kv_cache_manager, attn_metadata, attention_cls
     except Exception:
         kv_cache_manager.shutdown()
