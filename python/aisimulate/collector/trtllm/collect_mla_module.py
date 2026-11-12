@@ -245,10 +245,12 @@ def _give_index_scores_magnitude(attn_module) -> None:
                 module.weight.fill_(1.0)
                 if getattr(module, "bias", None) is not None:
                     module.bias.zero_()
-            # Only an NVFP4 linear has an alpha parameter.
+            # Only the NVFP4 linear methods give a module an alpha parameter.
             if isinstance(getattr(module, "alpha", None), torch.nn.Parameter):
                 for name in ("input_scale", "inv_input_scale", "alpha"):
-                    getattr(module, name).fill_(1.0)
+                    scalar = getattr(module, name, None)
+                    if isinstance(scalar, torch.nn.Parameter):
+                        scalar.fill_(1.0)
 
 
 def create_attention_layer(
