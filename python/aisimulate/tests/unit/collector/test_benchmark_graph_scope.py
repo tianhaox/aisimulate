@@ -111,7 +111,15 @@ def trace_benchmark(
         events.append(f"{tag}:exit")
 
     profiler = SimpleNamespace(record_function=record_function)
-    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=cuda, profiler=profiler))
+    # Thread-count calls, each with the number of events recorded before it.
+    threads = []
+    fake_torch = SimpleNamespace(
+        cuda=cuda,
+        profiler=profiler,
+        get_num_threads=lambda: 144,
+        set_num_threads=lambda count: threads.append((len(events), count)),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
     if tracing:
         monkeypatch.setenv(TRACE_CHILD_DIR_ENV, "/tmp/children")
     else:
@@ -157,6 +165,7 @@ def trace_benchmark(
         "error": caught,
         "stream": state["stream"],
         "resets": [graph.resets for graph in graphs],
+        "threads": threads,
     }
 
 
@@ -264,6 +273,25 @@ def test_a_minimum_warmup_time_keeps_replaying_before_the_timed_runs(monkeypatch
     assert ev[start - 3] == "synchronize"  # warmup ends synced, then the two timing events
     eager = trace_benchmark(monkeypatch, eager=True, min_warmup_seconds=0.02)
     assert eager["events"].count("kernel") > trace_benchmark(monkeypatch, eager=True)["events"].count("kernel")
+
+
+@pytest.mark.parametrize("eager", [False, True])
+@pytest.mark.parametrize("failure", [None, "timed_replay", "caller"])
+def test_the_timed_runs_use_one_torch_thread_and_the_pool_is_restored(monkeypatch, eager, failure):
+    """Serving parity (vLLM, SGLang) for the timed runs; setup and eager warmups keep the host pool."""
+    observed = trace_benchmark(monkeypatch, eager=eager, failure=failure)
+    (set_at, set_to), (restored_at, restored_to) = observed["threads"]
+    assert (set_to, restored_to) == (1, 144)
+    events = observed["events"]
+    runs = [i for i, event in enumerate(events) if event == ("kernel" if eager else "graph:replay")]
+    timed = runs[-3:] if failure != "timed_replay" or eager else runs
+    assert set_at <= timed[0] and timed[-1] < restored_at
+    if failure == "caller":
+        assert events.index("caller:body") < restored_at
+
+
+def test_a_warmup_that_raises_never_changed_the_thread_count(monkeypatch):
+    assert trace_benchmark(monkeypatch, failure="initial_warmup")["threads"] == []
 
 
 def test_every_measurement_beats_the_stall_watchdog_before_touching_the_kernel(monkeypatch):
