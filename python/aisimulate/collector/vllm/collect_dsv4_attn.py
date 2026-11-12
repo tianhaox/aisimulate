@@ -696,6 +696,11 @@ def _bench_attention_shape(
         )
         positions = common.positions
 
+        # Diagnostic only (not for merge).
+        if is_context and attn_module.indexer is not None:
+            from collector.vllm import _topkdiag
+
+            _topkdiag.arm(f"dsv4 {attn_kind} b={batch_size} s={seq_len} prefix={prefix_len}", seq_len, prefix_len)
         with set_current_vllm_config(vllm_config), set_forward_context(metadata, vllm_config), torch.inference_mode():
             attn_module(positions, hidden_states, None)
             torch.cuda.synchronize()

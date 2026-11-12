@@ -1657,6 +1657,11 @@ def run_mla_module(
         _slot = getattr(common_attn_metadata, "slot_mapping", None)
         _slot_map = dict.fromkeys(attn_metadata_dict, _slot) if _slot is not None else None
         point_stack.enter_context(set_forward_context(attn_metadata_dict, vllm_config, slot_mapping=_slot_map))
+        # Diagnostic only (not for merge).
+        if attn_type == "dsa" and is_context:
+            from collector.vllm import _topkdiag
+
+            _topkdiag.arm(f"dsa b={batch_size} s={seq_len} prefix={prefix_len} gemm={gemm_type}", seq_len, prefix_len)
         if capture_ceiling is not None:
             # The dry run and the timed graph make the capture-dependent choices serving
             # makes for a step of num_tokens tokens: graph-replayed up to the ceiling,
