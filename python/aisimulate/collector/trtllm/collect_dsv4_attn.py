@@ -240,9 +240,13 @@ def create_dsv4_attention_module(
     from tensorrt_llm.models.modeling_utils import QuantConfig
 
     try:
-        from .collect_mla_module import _apply_gemm_type_quant, initialize_dummy_weights
+        from .collect_mla_module import (
+            _apply_gemm_type_quant,
+            _give_index_scores_magnitude,
+            initialize_dummy_weights,
+        )
     except ImportError:
-        from collect_mla_module import _apply_gemm_type_quant, initialize_dummy_weights
+        from collect_mla_module import _apply_gemm_type_quant, _give_index_scores_magnitude, initialize_dummy_weights
 
     compress_ratio = ATTN_KIND_TO_COMPRESS_RATIO[attn_kind]
     config_dir, head_info = _patched_config_dir(model_path, compress_ratio, tp_size)
@@ -356,6 +360,7 @@ def create_dsv4_attention_module(
     attn_module.to(device)
 
     initialize_dummy_weights(attn_module)
+    _give_index_scores_magnitude(attn_module)
     for module in attn_module.modules():
         if hasattr(module, "post_load_weights") and not getattr(module, "_weights_removed", False):
             module.post_load_weights()

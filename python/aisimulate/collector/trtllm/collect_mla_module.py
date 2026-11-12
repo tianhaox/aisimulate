@@ -217,6 +217,30 @@ def _apply_gemm_type_quant(model_config, gemm_type: str, use_fp8_kv_cache: bool)
         raise ValueError(f"Unknown gemm_type: {gemm_type!r}")
 
 
+def _give_index_scores_magnitude(attn_module) -> None:
+    """Bring a sparse module's index scores to the magnitude a trained checkpoint gives them.
+
+    initialize_dummy_weights draws every float parameter from U(-1e-3, 1e-3), normalization
+    gains included, so the indexer's scores came out near 1e-6. Its top-k bins the scores as
+    fp16 first and restarts as an fp32 radix when that pass cannot resolve the threshold bin
+    (processHistogramStep, "Step 0 is the fp16 fast path", cpp/tensorrt_llm/kernels/
+    indexerTopK.cu): scores that small share a few fp16 bins, so every row took the restart,
+    where the same scores at unit magnitude finish in the first pass in a fraction of the
+    time. Unit normalization gains in the attention module and U(-0.1, 0.1) parameters in the
+    indexer put the scores near 1. Values only: no kernel in the module is chosen by them.
+    """
+    indexer = getattr(attn_module, "indexer", None)
+    if indexer is None:
+        return
+    initialize_dummy_weights(indexer, low=-0.1, high=0.1)
+    with torch.no_grad():
+        for module in attn_module.modules():
+            if type(module).__name__ in ("RMSNorm", "LayerNorm"):
+                module.weight.fill_(1.0)
+                if getattr(module, "bias", None) is not None:
+                    module.bias.zero_()
+
+
 def create_attention_layer(
     model_path: str,
     num_heads: int = 128,
@@ -340,6 +364,7 @@ def create_attention_layer(
     layer.to(device)
 
     initialize_dummy_weights(layer)
+    _give_index_scores_magnitude(layer.self_attn)
     for module in layer.modules():
         if hasattr(module, "post_load_weights") and not getattr(module, "_weights_removed", False):
             module.post_load_weights()
