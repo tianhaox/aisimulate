@@ -80,8 +80,16 @@ def run(attn_module, position_ids, hidden_states, attn_metadata, model_config, l
     cur = {}
 
     def mqa(q_data, k_data, k_scale, *args, **kwargs):
-        if cur.get("fill"):
-            cur["filled_rows"], cur["source_rows"] = _fill_prefix_k(k_data, k_scale)
+        if "q" not in cur:
+            qb = q_data.reshape(-1)[:65536].view(torch.uint8)
+            w = args[0] if args else None
+            cur["q"] = {
+                "q_dtype": str(q_data.dtype),
+                "q_nonzero_frac": round(float((qb != 0).float().mean()), 4),
+                "q_unique_bytes": int(torch.unique(qb).numel()),
+                "weights_absmax": None if w is None else float(w.float().abs().max()),
+                "weights_dtype": None if w is None else str(w.dtype),
+            }
         torch.cuda.synchronize()
         t = time.perf_counter()
         out = orig_mqa(q_data, k_data, k_scale, *args, **kwargs)
@@ -103,6 +111,12 @@ def run(attn_module, position_ids, hidden_states, attn_metadata, model_config, l
         return out
 
     def topk(logits, output_indices, *args, **kwargs):
+        if cur.get("fill"):
+            # Passes 3-5: the same scores at unit magnitude (dummy weights give ~1e-6, below fp16's normal range).
+            peak = float(logits[0].float().abs().max())
+            if peak > 0:
+                logits.mul_(1.0 / peak)
+            cur["scaled_by"] = None if peak <= 0 else 1.0 / peak
         torch.cuda.synchronize()
         t = time.perf_counter()
         out = orig_topk(logits, output_indices, *args, **kwargs)
