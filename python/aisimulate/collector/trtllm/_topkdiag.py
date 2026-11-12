@@ -113,10 +113,13 @@ def run(attn_module, position_ids, hidden_states, attn_metadata, model_config, l
     def topk(logits, output_indices, *args, **kwargs):
         if cur.get("fill"):
             # Passes 3-5: the same scores at unit magnitude (dummy weights give ~1e-6, below fp16's normal range).
-            peak = float(logits[0].float().abs().max())
-            if peak > 0:
+            rs, re = kwargs.get("row_starts"), kwargs.get("row_ends")
+            lo = int(rs[0]) if rs is not None else 0
+            hi = int(re[0]) if re is not None else logits.shape[-1]
+            peak = float(logits[0, lo:hi].float().abs().max())
+            if peak > 0 and peak == peak:
                 logits.mul_(1.0 / peak)
-            cur["scaled_by"] = None if peak <= 0 else 1.0 / peak
+            cur["scaled_by"] = 1.0 / peak if peak > 0 and peak == peak else None
         torch.cuda.synchronize()
         t = time.perf_counter()
         out = orig_topk(logits, output_indices, *args, **kwargs)
