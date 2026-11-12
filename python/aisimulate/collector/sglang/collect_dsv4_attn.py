@@ -82,6 +82,7 @@ except ModuleNotFoundError:
     )
 
 try:
+    from collector.sglang import _topkdiag  # diagnostic only, not for merge
     from collector.sglang.runtime_limits import (
         KERNEL_LIMIT,
         kernel_limit_error,
@@ -112,6 +113,7 @@ try:
         temporarily_chunked_alloc_extend as _temporarily_chunked_alloc_extend,
     )
 except ModuleNotFoundError:
+    import _topkdiag  # diagnostic only, not for merge
     from runtime_limits import (
         KERNEL_LIMIT,
         kernel_limit_error,
@@ -1470,6 +1472,8 @@ def run_dsv4_mla_module(
                 _write_index_history(
                     model_runner, attention_module, forward_batch, cur_prefix if is_prefill else seq_len
                 )
+                # Diagnostic only: one written key read back from the pool, once per runner.
+                _topkdiag.readback(model_runner, attention_module, forward_batch, cur_prefix if is_prefill else seq_len)
                 point_clock.mark("index_history")
                 hidden_states, positions = _make_inputs(
                     model_runner,
@@ -1532,6 +1536,16 @@ def run_dsv4_mla_module(
                     step=cur_prefix if is_prefill else None,
                     num_heads=local_attention_heads,
                 )
+                # Diagnostic only, after the row is timed and persisted: one more eager forward
+                # with the indexer's top-k call wrapped for it.
+                if _topkdiag.armed(mode, attn_kind, batch_size, seq_len, cur_prefix):
+                    point_label = {"isl": seq_len, "prefix": cur_prefix} if is_prefill else {"isl": 1, "past": seq_len}
+                    _topkdiag.run_point(
+                        kernel_func,
+                        {"phase": mode, "model": model_path, "gemm": gemm_type, "batch": batch_size, **point_label},
+                        history_keys=(cur_prefix if is_prefill else seq_len) // 4,
+                    )
+                    point_clock.mark("topkdiag")
                 stats.update(
                     {
                         "batch_size": batch_size,
