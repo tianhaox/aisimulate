@@ -447,6 +447,62 @@ def _cached_attention_layer(model_path: str, num_heads: int, use_fp8_kv_cache: b
     return entry
 
 
+# History rows written per scatter call: bounds the temporary of a long history.
+_HISTORY_CHUNK_ROWS = 1 << 18
+
+
+def _write_indexer_history(indexer, attn_metadata, device: str) -> None:
+    """Write the index K of the cached history the DSA indexer scores and selects from.
+
+    add_dummy_requests only assigns blocks. Nothing here runs the forwards that would have
+    written the history, so the indexer K-cache held zeros there: every cached candidate
+    scored exactly 0.0 and the top-k was timed on ties, a case serving does not have (a
+    history of exactly index_topk tokens took several times the top-k time of a longer one,
+    and every other indexed row timed the cheapest top-k). Serving writes a token's index K
+    when it computes it: the k_norm output goes through Indexer._prep_q_or_k (fused cat and
+    FP8/FP4 quantize) and Indexer._update_k_cache (indexer_k_cache_scatter_op) at the slots
+    Indexer.recompute_slot_mappings derives with _compute_slot_mappings
+    (attention/backends/sparse/dsa/indexer.py). Seeded N(0, 1) rows take the same quantizer and
+    scatter op at the history positions, outside the measurement. They stand for no particular
+    checkpoint distribution. Same treatment as the SGLang DSA modules.
+    """
+    params = type(indexer).build_indexer_params(attn_metadata)
+    if params is None:
+        return
+    cached = params.cached_kv_tokens.to(torch.int64)
+    total = int(cached.sum())
+    if total == 0:
+        return
+    requests = torch.repeat_interleave(torch.arange(cached.numel(), dtype=torch.int64), cached)
+    positions = torch.arange(total, dtype=torch.int64) - (torch.cumsum(cached, 0) - cached).repeat_interleave(cached)
+    data_slots, scale_slots = sys.modules[type(indexer).__module__]._compute_slot_mappings(
+        positions,
+        attn_metadata.host_indexer_k_cache_block_offsets,
+        requests,
+        params.head_dim,
+        params.tokens_per_block,
+        params.quant_block_size,
+        data_bytes_per_token=params.data_bytes_per_token,
+    )
+    slot_dtype = attn_metadata.slot_mapping_fp8.dtype
+    k_cache = attn_metadata.kv_cache_manager.get_indexer_k_cache_buffers(indexer.layer_idx)
+    generator = torch.Generator(device=device).manual_seed(0)
+    for start in range(0, total, _HISTORY_CHUNK_ROWS):
+        end = min(start + _HISTORY_CHUNK_ROWS, total)
+        k = torch.randn((end - start, indexer.head_dim), generator=generator, device=device).to(torch.bfloat16)
+        k_data, k_scale = indexer._prep_q_or_k(*k.split([indexer.rope_dim, indexer.head_dim - indexer.rope_dim], dim=-1))
+        if k_scale.element_size() == 1:
+            k_scale = k_scale.view(torch.int32)
+        torch.ops.trtllm.indexer_k_cache_scatter_op(
+            k_data,
+            k_scale,
+            k_cache,
+            data_slots[start:end].to(device=device, dtype=slot_dtype),
+            scale_slots[start:end].to(device=device, dtype=slot_dtype),
+            end - start,
+        )
+
+
 def create_kv_cache_and_metadata(
     model_config: ModelConfig,
     attn_module,
@@ -616,6 +672,14 @@ def create_kv_cache_and_metadata(
         attn_metadata.indexer = attn_module.indexer
 
     attn_metadata.prepare()
+
+    if getattr(attn_module, "indexer", None) is not None:
+        try:
+            with torch.inference_mode():
+                _write_indexer_history(attn_module.indexer, attn_metadata, device)
+        except Exception:
+            kv_cache_manager.shutdown()
+            raise
 
     return kv_cache_manager, attn_metadata
 
