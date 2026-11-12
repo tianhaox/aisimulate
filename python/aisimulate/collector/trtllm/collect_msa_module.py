@@ -1028,6 +1028,10 @@ def run_msa_module_worker(
     )
 
 
+_DIAG_TASKS = 0
+_DIAG_DEFAULT_THREADS = None
+
+
 def run_msa_module_series(
     points,
     batch_size: int,
@@ -1074,6 +1078,19 @@ def run_msa_module_series(
     # Diagnostic only (not for merge): one CPUDIAG line per task; it can never fail the task.
     from collector.trtllm import _cpudiag
 
+    # Diagnostic only: alternate tasks between torch's default intra-op thread count and one thread.
+    global _DIAG_TASKS, _DIAG_DEFAULT_THREADS
+    if _DIAG_DEFAULT_THREADS is None:
+        _DIAG_DEFAULT_THREADS = torch.get_num_threads()
+    intra = 1 if _DIAG_TASKS % 2 == 0 else _DIAG_DEFAULT_THREADS
+    _DIAG_TASKS += 1
+    torch.set_num_threads(intra)
+    print(
+        f"CPUDIAG threads task={_DIAG_TASKS - 1} intra={torch.get_num_threads()} default={_DIAG_DEFAULT_THREADS} "
+        f"interop={torch.get_num_interop_threads()}",
+        flush=True,
+    )
+
     try:
         before = _cpudiag.snapshot()
     except Exception as e:
@@ -1084,7 +1101,7 @@ def run_msa_module_series(
     finally:
         if before is not None:
             try:
-                _cpudiag.report(f"b={batch_size} heads={num_heads} gemm={gemm_type}", before, _cpudiag.snapshot())
+                _cpudiag.report(f"b={batch_size} heads={num_heads} gemm={gemm_type} intra={intra}", before, _cpudiag.snapshot())
             except Exception as e:
                 print(f"CPUDIAG report failed: {e!r}", flush=True)
 
