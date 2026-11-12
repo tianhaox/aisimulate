@@ -228,6 +228,12 @@ def _give_index_scores_magnitude(attn_module) -> None:
     where the same scores at unit magnitude finish in the first pass in a fraction of the
     time. Unit normalization gains in the attention module and U(-0.1, 0.1) parameters in the
     indexer put the scores near 1. Values only: no kernel in the module is chosen by them.
+
+    An NVFP4 projection needs one more thing to produce scores at all: NVFP4LinearMethod
+    creates input_scale, inv_input_scale and alpha with torch.empty (modules/linear.py) and
+    initialize_dummy_weights leaves those names alone, taking their create_weights value for
+    a usable default (its _SKIP_NAME_SUFFIXES note), so they held whatever the allocation
+    did: the index query was zero in most layer builds and not in a few. They are set to 1.
     """
     indexer = getattr(attn_module, "indexer", None)
     if indexer is None:
@@ -239,6 +245,10 @@ def _give_index_scores_magnitude(attn_module) -> None:
                 module.weight.fill_(1.0)
                 if getattr(module, "bias", None) is not None:
                     module.bias.zero_()
+            # Only an NVFP4 linear has an alpha parameter.
+            if isinstance(getattr(module, "alpha", None), torch.nn.Parameter):
+                for name in ("input_scale", "inv_input_scale", "alpha"):
+                    getattr(module, name).fill_(1.0)
 
 
 def create_attention_layer(
