@@ -833,6 +833,27 @@ def run_mla_module(
 
             _mark("dry_run")
 
+        # Diagnostic only (not for merge): the indexer's top-k inputs and cost at selected points.
+        if attn_type == "dsa" and is_context:
+            try:
+                try:
+                    from collector.trtllm import _topkdiag
+                except ImportError:
+                    import _topkdiag
+                _topkdiag.run(
+                    attn_module,
+                    position_ids,
+                    hidden_states,
+                    attn_metadata,
+                    model_config,
+                    f"b={batch_size} s={seq_len} prefix={prefix_len} heads={num_heads} gemm={gemm_type} kv={kv_cache_dtype}",
+                    seq_len,
+                    prefix_len,
+                )
+            except Exception as e:
+                print(f"TOPKDIAG failed: {e!r}", flush=True)
+                traceback.print_exc()
+
         # 5. Benchmark
         import tensorrt_llm._torch.utils as _trtllm_utils
 
