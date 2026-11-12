@@ -1071,7 +1071,22 @@ def run_msa_module_series(
         )
 
     label = f"MSA module series b={batch_size} heads={num_heads} gemm={gemm_type} kv={kv_cache_dtype}"
-    return run_points(points, run_point, label=label)
+    # Diagnostic only (not for merge): one CPUDIAG line per task; it can never fail the task.
+    from collector.trtllm import _cpudiag
+
+    try:
+        before = _cpudiag.snapshot()
+    except Exception as e:
+        before = None
+        print(f"CPUDIAG snapshot failed: {e!r}", flush=True)
+    try:
+        return run_points(points, run_point, label=label)
+    finally:
+        if before is not None:
+            try:
+                _cpudiag.report(f"b={batch_size} heads={num_heads} gemm={gemm_type}", before, _cpudiag.snapshot())
+            except Exception as e:
+                print(f"CPUDIAG report failed: {e!r}", flush=True)
 
 
 def run_msa_module_series_worker(
