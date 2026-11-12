@@ -13,8 +13,26 @@ import weakref
 
 import torch
 
-_PREFIXES = (1536, 2048, 3072, 4096)
+_PREFIXES = (1536, 2048, 3072, 4096, 8192, 32768)
 _SEQ_LENS = (64, 512, 1024)
+
+
+def _fill_prefix_k(k_data, k_scale):
+    """Give the never-written prefix rows of the gathered K (all-zero bytes) distinct valid content: each takes
+    the first half of one written row and the second half of another, and the first one's scale."""
+    kb = k_data.view(torch.uint8).reshape(k_data.shape[0], -1)
+    zero = (kb == 0).all(dim=1)
+    src = (~zero).nonzero().flatten()
+    count = int(zero.sum())
+    if count == 0 or src.numel() == 0:
+        return count, int(src.numel())
+    a = src[torch.randint(src.numel(), (count,), device=kb.device)]
+    b = src[torch.randint(src.numel(), (count,), device=kb.device)]
+    half = kb.shape[1] // 2
+    kb[zero] = torch.cat([kb[a, :half], kb[b, half:]], dim=1)
+    ks = k_scale.reshape(k_scale.shape[0], -1)
+    ks[zero] = ks[a]
+    return count, int(src.numel())
 
 
 def _window_stats(logits, row_starts, row_ends, row):
@@ -62,6 +80,8 @@ def run(attn_module, position_ids, hidden_states, attn_metadata, model_config, l
     cur = {}
 
     def mqa(q_data, k_data, k_scale, *args, **kwargs):
+        if cur.get("fill"):
+            cur["filled_rows"], cur["source_rows"] = _fill_prefix_k(k_data, k_scale)
         torch.cuda.synchronize()
         t = time.perf_counter()
         out = orig_mqa(q_data, k_data, k_scale, *args, **kwargs)
@@ -105,8 +125,10 @@ def run(attn_module, position_ids, hidden_states, attn_metadata, model_config, l
         with model_extra_attrs(model_config.extra_attrs):
             get_model_extra_attrs()["attention_metadata"] = weakref.ref(attn_metadata)
             with torch.inference_mode():
-                for _ in range(3):
+                for i in range(6):
                     cur.clear()
+                    # Passes 0-2 as collected (prefix K never written); passes 3-5 with the prefix K filled.
+                    cur["fill"] = i >= 3
                     torch.cuda.synchronize()
                     t = time.perf_counter()
                     attn_module.forward(position_ids, hidden_states, attn_metadata)
